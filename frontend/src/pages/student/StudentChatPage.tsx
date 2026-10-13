@@ -1344,7 +1344,7 @@ function StudentChatPage() {
               value={noteText}
               onChange={handleNoteChange}
               placeholder="Type your notes here..."
-              maxLength={500}
+              maxLength={5000}
               className="w-full px-3 py-2 rounded-lg resize-none focus:outline-none focus:ring-2 flex-1"
               style={{ 
                 borderWidth: '1px', 
@@ -1385,7 +1385,7 @@ function StudentChatPage() {
               <Stethoscope className="w-5 h-5 mr-2" />
               Physical Assessment
             </Button>
-            {sessionStatus === 'active' && (
+            {(sessionStatus === 'active' && patient.mode !== 'conversation_only') && (
               <Button
                 variant="outline"
                 className="w-full justify-start text-white hover:opacity-90 border-0 whitespace-nowrap"
@@ -1459,10 +1459,17 @@ function StudentChatPage() {
               >
                 <ChevronLeft className="w-5 h-5" />
               </button>
+              
             </div>
+           
           )}
 
           {/* Content Area - Patient info files with inline PDF viewer */}
+          <div className="p-4" style={{ borderTopWidth: '1px', borderTopStyle: 'solid', borderTopColor: UI_COLORS.border.default }}>
+              <div className="flex items-center gap-3 px-4 py-4 rounded-lg" style={{ backgroundColor: UI_COLORS.background.hoverLight }}>
+                <p className="text-xs mt-0.5" style={{ color: UI_COLORS.text.muted }}>Drag the handle on the right of this panel to resize it.</p>
+              </div>
+            </div>
           <div className="flex-1 overflow-y-auto p-4">
             {isPatientInfoSidebarOpen && (
               selectedPatientFile ? (
@@ -1480,6 +1487,19 @@ function StudentChatPage() {
                   <h4 className="font-semibold text-sm mb-2" style={{ color: UI_COLORS.text.heading }}>
                     {selectedPatientFile.filename}
                   </h4>
+                  {selectedPatientFile.url && (
+                      <a
+                        href={selectedPatientFile.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center gap-1 text-sm px-3 py-1 rounded transition-colors no-underline"
+                        style={{ backgroundColor: UI_COLORS.button.secondary, color: UI_COLORS.button.text }}
+                        onMouseEnter={(e) => e.currentTarget.style.backgroundColor = UI_COLORS.button.secondaryHover}
+                        onMouseLeave={(e) => e.currentTarget.style.backgroundColor = UI_COLORS.button.secondary}
+                      >
+                        Open in new tab
+                      </a>
+                    )}
                   {selectedPatientFile.url ? (
                     isImageFile(selectedPatientFile.filename) || isImageFile(selectedPatientFile.url) ? (
                       <ImageViewer url={selectedPatientFile.url} title={selectedPatientFile.filename} />
@@ -1800,7 +1820,11 @@ function StudentChatPage() {
               </div>
             </div>
           )}
-
+          <div className="p-6" style={{ borderTopWidth: '1px', borderTopStyle: 'solid', borderTopColor: UI_COLORS.border.default }}>
+              <div className="flex items-center gap-3 px-4 py-4 rounded-lg" style={{ backgroundColor: UI_COLORS.background.hoverLight }}>
+                <p className="text-xs mt-0.5" style={{ color: UI_COLORS.text.muted }}>Troubleshooting Tips: Choose either voice or text for your interaction. If the your mic or audio becomes unresponsive, click "Back to Patient Dashboard" at the top of the screen, then load back into this interaction.</p>
+              </div>
+            </div>
           {/* Generating Debrief indicator */}
           {sessionStatus === 'generating_debrief' && (
             <div className="p-8 flex items-center justify-center" style={{ borderTopWidth: '1px', borderTopStyle: 'solid', borderTopColor: UI_COLORS.border.default }}>
@@ -1854,6 +1878,11 @@ function StudentChatPage() {
           )}
 
           {/* Content Area */}
+          <div className="p-4" style={{ borderTopWidth: '1px', borderTopStyle: 'solid', borderTopColor: UI_COLORS.border.default }}>
+              <div className="flex items-center gap-3 px-4 py-4 rounded-lg" style={{ backgroundColor: UI_COLORS.background.hoverLight }}>
+                <p className="text-xs mt-0.5" style={{ color: UI_COLORS.text.muted }}>Drag the handle on the left of this panel to resize it.</p>
+              </div>
+            </div>
           <div className="flex-1 overflow-y-auto p-4">
             {contentSidebarType === 'physical-assessment' && (
               <PhysicalAssessmentContent materials={personaMedia} loading={personaMediaLoading} />

@@ -83,6 +83,7 @@ export class ApiServiceStack extends cdk.Stack {
 
     const allowedOrigins = [
       "https://main.d3sunerinpg5un.amplifyapp.com",
+      //"https://genrx.pharmsci.ubc.ca",
       "https://*.amplifyapp.com",
       "http://localhost:5173",
       "http://localhost:5174",
