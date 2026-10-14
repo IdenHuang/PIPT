@@ -34,6 +34,15 @@ if _TESTS_PATH not in sys.path:
 try:
     # Mock unavailable dependencies before importing chat.py
     import types as _types
+    import importlib as _importlib
+
+    def _is_importable(name):
+        try:
+            _importlib.import_module(name)
+            return True
+        except ImportError:
+            return False
+
     _mock_modules = [
         "psycopg", "boto3", "langchain_aws", "langchain_core",
         "langchain_core.prompts", "langchain_core.runnables",
@@ -44,7 +53,9 @@ try:
         "pydantic",
     ]
     for _mod_name in _mock_modules:
-        if _mod_name not in sys.modules:
+        # Only stub modules that genuinely aren't installed; stubbing a real
+        # package (e.g. boto3) hides its submodules and breaks chat.py imports.
+        if _mod_name not in sys.modules and not _is_importable(_mod_name):
             _mock_mod = _types.ModuleType(_mod_name)
             _mock_mod.BaseModel = type("BaseModel", (), {})
             _mock_mod.Field = lambda **kwargs: None

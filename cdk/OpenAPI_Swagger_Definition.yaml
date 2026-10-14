@@ -148,12 +148,6 @@ paths:
             enum: ["true", "false"]
             default: "false"
         - in: query
-          name: stream_callback_url
-          required: false
-          description: URL for the ECS socket server to receive streaming chunks via POST
-          schema:
-            type: string
-        - in: query
           name: mode
           required: false
           description: >
