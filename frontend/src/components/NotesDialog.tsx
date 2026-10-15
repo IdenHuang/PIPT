@@ -123,7 +123,7 @@ function NotesDialog({ isOpen, onClose }: NotesDialogProps) {
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
             placeholder="Write your notes here..."
-            maxLength={500}
+            maxLength={5000}
             className="flex-1 p-4 rounded-lg resize-none focus:outline-none focus:ring-2"
             style={{ 
               color: UI_COLORS.text.heading,

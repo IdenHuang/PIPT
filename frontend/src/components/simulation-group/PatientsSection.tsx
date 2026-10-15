@@ -99,6 +99,14 @@ export function PatientsSection({
                   Interview Practice
                 </span>
               )}
+              {patient.mode === 'conversation_only' && (
+                  <span
+                    className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium"
+                    style={{ backgroundColor: UI_COLORS.badge.interviewPracticeBg, color: UI_COLORS.badge.interviewPracticeText }}
+                  >
+                    Conversation Only
+                  </span>
+                )}
             </div>
             <div className="text-base" style={{ color: UI_COLORS.text.heading }}>
               {patient.age || patient.patient_age}

@@ -20,7 +20,7 @@ interface ConcludeModalProps {
   simulationGroupId: string;
   patientId: string;
   onConcluded: (dtpSubmission: string[], recommendationSubmission: { recommendation: string; rationale: string }[]) => void;
-  mode?: 'interview_practice' | 'full_assessment';
+  mode?: 'interview_practice' | 'full_assessment' | 'conversation_only';
 }
 
 export function ConcludeModal({

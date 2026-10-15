@@ -142,7 +142,7 @@ export function AddPatientSpecificQuestionDialog({
               placeholder="e.g., Assess the characteristics of the patient's chest pain, including onset, duration, severity, quality and radiation."
               className="w-full px-3 py-2 rounded-md border resize-none"
               rows={3}
-              maxLength={500}
+              maxLength={5000}
               style={{
                 borderColor: UI_COLORS.border.default,
                 backgroundColor: UI_COLORS.background.white,
@@ -162,7 +162,7 @@ export function AddPatientSpecificQuestionDialog({
               placeholder="e.g., This question evaluates the student's ability to gather essential details about the chest pain..."
               className="w-full px-3 py-2 rounded-md border resize-none"
               rows={4}
-              maxLength={500}
+              maxLength={5000}
               style={{
                 borderColor: UI_COLORS.border.default,
                 backgroundColor: UI_COLORS.background.white,
@@ -182,7 +182,7 @@ export function AddPatientSpecificQuestionDialog({
               placeholder="e.g., The student attempts to identify at least 3-4 of the following core characteristics..."
               className="w-full px-3 py-2 rounded-md border resize-none"
               rows={5}
-              maxLength={500}
+              maxLength={5000}
               style={{
                 borderColor: UI_COLORS.border.default,
                 backgroundColor: UI_COLORS.background.white,
