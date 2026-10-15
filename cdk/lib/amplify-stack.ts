@@ -124,8 +124,9 @@ applications:
     // Custom domain — maps the verified SES domain to the main branch.
     // Amplify provisions an SSL certificate and creates the required DNS records
     // in Route 53 automatically via the enableAutoSubDomain setting.
+    const skipCustomDomain =  this.node.tryGetContext("AmplifySkipCustomDomain") === "true";
     const domainName = this.node.tryGetContext("SesVerifiedDomain");
-    if (domainName) {
+    if (domainName && !skipCustomDomain) {
       const customDomain = new amplify.CfnDomain(this, `${id}-CustomDomain`, {
         appId: amplifyApp.attrAppId,
         domainName: domainName,

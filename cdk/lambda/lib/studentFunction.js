@@ -255,7 +255,10 @@ exports.handler = async (event, context) => {
                     AND (sgd.persona_id = p.persona_id OR sgd.persona_id IS NULL)) AS has_dtps,
                   (SELECT COUNT(*) > 0 FROM simulation_group_recommendations sgr
                     WHERE sgr.simulation_group_id = ${simulationGroupId}
-                    AND (sgr.persona_id = p.persona_id OR sgr.persona_id IS NULL)) AS has_recommendations
+                    AND (sgr.persona_id = p.persona_id OR sgr.persona_id IS NULL)) AS has_recommendations,
+                  (SELECT COUNT(*) > 0 FROM simulation_group_questions sgq
+                    WHERE sgq.simulation_group_id = ${simulationGroupId}
+                    AND (sgq.persona_id = p.persona_id OR sgq.persona_id IS NULL)) AS has_questions
                 FROM
                   "personas" p
                 LEFT JOIN
@@ -279,13 +282,14 @@ exports.handler = async (event, context) => {
                   );
                 `;
             }
-
             // Enrich each persona with the computed mode
             const enrichedData = data.map(persona => ({
               ...persona,
-              mode: (!persona.has_dtps && !persona.has_recommendations)
-                ? 'interview_practice'
-                : 'full_assessment',
+              mode: (!persona.has_dtps && !persona.has_recommendations && !persona.has_questions)
+                ? 'conversation_only'
+                : (!persona.has_dtps && !persona.has_recommendations)
+                  ? 'interview_practice'
+                  : 'full_assessment',
             }));
 
             response.body = JSON.stringify(enrichedData);
@@ -1658,6 +1662,8 @@ exports.handler = async (event, context) => {
 
           try {
             // Step 0: Determine patient mode by checking DTP/Recommendation assignments.
+            //a person with zero DTPS, recommendations, and questions is treated as 
+            // "conversation_only" — the student only chats and gets key question feedback.
             // A persona with zero DTPs AND zero recommendations assigned is treated as
             // "interview_practice" — the student only chats and gets key question feedback.
             // Any DTP or recommendation assignment makes it "full_assessment" — the student
@@ -1673,9 +1679,16 @@ exports.handler = async (event, context) => {
               WHERE simulation_group_id = ${simulationGroupId}
                 AND (persona_id = ${patientId} OR persona_id IS NULL);
             `;
-            const patientMode = (dtpCount.count === 0 && recCount.count === 0)
-              ? 'interview_practice'
-              : 'full_assessment';
+            const [quesCount] = await sqlConnection`
+              SELECT COUNT(*)::int AS count FROM simulation_group_questions
+              WHERE simulation_group_id = ${simulationGroupId}
+                AND (persona_id = ${patientId} OR persona_id IS NULL);
+            `;
+            const patientMode = (quesCount.count === 0 && dtpCount.count === 0 && recCount.count === 0)
+              ? 'conversation_only'
+              : (quesCount.count > 0 || dtpCount.count > 0 || recCount.count > 0)
+                ? 'full_assessment'
+                : 'interview_practice';
 
             // Validate: full_assessment patients require a recommendation
             if (patientMode === 'full_assessment' && (!recommendation || !recommendation.trim())) {

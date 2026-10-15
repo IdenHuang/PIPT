@@ -976,7 +976,7 @@ function QuestionsTab({
                         patientEditor.setCaseSpecificQuestions(updatedQuestions);
                       }}
                       placeholder="Assess the characteristics of the patient's chest pain..."
-                      maxLength={500}
+                      maxLength={5000}
                       className="w-full px-3 py-3 rounded-lg resize-none focus:outline-none focus:ring-2 text-base"
                       style={{
                         borderWidth: '1px',
@@ -1002,7 +1002,7 @@ function QuestionsTab({
                         patientEditor.setCaseSpecificQuestions(updatedQuestions);
                       }}
                       placeholder="This question evaluates the student's ability..."
-                      maxLength={500}
+                      maxLength={5000}
                       className="w-full px-3 py-3 rounded-lg resize-none focus:outline-none focus:ring-2 text-base"
                       style={{
                         borderWidth: '1px',
@@ -1028,7 +1028,7 @@ function QuestionsTab({
                         patientEditor.setCaseSpecificQuestions(updatedQuestions);
                       }}
                       placeholder="The student attempts to identify at least 3-4 of the following..."
-                      maxLength={500}
+                      maxLength={5000}
                       className="w-full px-3 py-3 rounded-lg resize-none focus:outline-none focus:ring-2 text-base"
                       style={{
                         borderWidth: '1px',
@@ -1735,7 +1735,7 @@ function PatientDTPsTab({
                         value={dtp.expectedDTPText || ''}
                         onChange={(e) => updateEditableDTP(dtp.groupDtpId, { expectedDTPText: e.target.value })}
                         placeholder="Describe the expected drug therapy problem..."
-                        maxLength={500}
+                        maxLength={5000}
                         className="w-full px-3 py-3 rounded-lg resize-none focus:outline-none focus:ring-2 text-base"
                         style={{ borderWidth: '1px', borderStyle: 'solid', borderColor: UI_COLORS.border.default, outlineColor: UI_COLORS.border.medium, minHeight: '100px' }}
                       />
@@ -1748,7 +1748,7 @@ function PatientDTPsTab({
                         value={dtp.clinicalIntent || ''}
                         onChange={(e) => updateEditableDTP(dtp.groupDtpId, { clinicalIntent: e.target.value })}
                         placeholder="Why this DTP matters clinically..."
-                        maxLength={500}
+                        maxLength={5000}
                         className="w-full px-3 py-3 rounded-lg resize-none focus:outline-none focus:ring-2 text-base"
                         style={{ borderWidth: '1px', borderStyle: 'solid', borderColor: UI_COLORS.border.default, outlineColor: UI_COLORS.border.medium, minHeight: '100px' }}
                       />
@@ -1761,7 +1761,7 @@ function PatientDTPsTab({
                         value={dtp.evaluationCriteria || ''}
                         onChange={(e) => updateEditableDTP(dtp.groupDtpId, { evaluationCriteria: e.target.value })}
                         placeholder="How to evaluate the student's identification..."
-                        maxLength={500}
+                        maxLength={5000}
                         className="w-full px-3 py-3 rounded-lg resize-none focus:outline-none focus:ring-2 text-base"
                         style={{ borderWidth: '1px', borderStyle: 'solid', borderColor: UI_COLORS.border.default, outlineColor: UI_COLORS.border.medium, minHeight: '150px' }}
                       />
@@ -2036,7 +2036,7 @@ function PatientRecommendationsTab({
                         value={rec.recommendationText || ''}
                         onChange={(e) => updateEditableRec(rec.groupRecommendationId, { recommendationText: e.target.value })}
                         placeholder="Describe the recommendation..."
-                        maxLength={500}
+                        maxLength={5000}
                         className="w-full px-3 py-3 rounded-lg resize-none focus:outline-none focus:ring-2 text-base"
                         style={{ borderWidth: '1px', borderStyle: 'solid', borderColor: UI_COLORS.border.default, outlineColor: UI_COLORS.border.medium, minHeight: '100px' }}
                       />
@@ -2049,7 +2049,7 @@ function PatientRecommendationsTab({
                         value={rec.evaluationCriteria || ''}
                         onChange={(e) => updateEditableRec(rec.groupRecommendationId, { evaluationCriteria: e.target.value })}
                         placeholder="How to evaluate the student's recommendation..."
-                        maxLength={500}
+                        maxLength={50000}
                         className="w-full px-3 py-3 rounded-lg resize-none focus:outline-none focus:ring-2 text-base"
                         style={{ borderWidth: '1px', borderStyle: 'solid', borderColor: UI_COLORS.border.default, outlineColor: UI_COLORS.border.medium, minHeight: '100px' }}
                       />
@@ -2062,7 +2062,7 @@ function PatientRecommendationsTab({
                         value={rec.rationale || ''}
                         onChange={(e) => updateEditableRec(rec.groupRecommendationId, { rationale: e.target.value })}
                         placeholder="Clinical rationale for this recommendation..."
-                        maxLength={500}
+                        maxLength={5000}
                         className="w-full px-3 py-3 rounded-lg resize-none focus:outline-none focus:ring-2 text-base"
                         style={{ borderWidth: '1px', borderStyle: 'solid', borderColor: UI_COLORS.border.default, outlineColor: UI_COLORS.border.medium, minHeight: '100px' }}
                       />

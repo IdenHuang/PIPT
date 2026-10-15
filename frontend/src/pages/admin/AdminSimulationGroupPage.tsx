@@ -1,6 +1,6 @@
 import { useNavigate, useParams } from 'react-router-dom';
 import { useEffect, useRef, useState, lazy, Suspense } from 'react';
-import { ArrowLeft, BarChart3, Users, UserCog, FileText, Search, Trash2, Plus, Menu, UserPlus, FileCode, HelpCircle, AlertTriangle, Pill, ClipboardList } from 'lucide-react';
+import { ArrowLeft, BarChart3, Users, UserCog, Search, Trash2, Plus, Menu, UserPlus, FileCode, HelpCircle, AlertTriangle, Pill, ClipboardList } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
@@ -848,7 +848,6 @@ function AdminSimulationGroupPage() {
             { id: 'patients', label: `Manage ${aiPersonaLabelPlural}`, icon: <Users className="w-5 h-5" /> },
             { id: 'students', label: `Manage ${userRoleLabel}s`, icon: <UserCog className="w-5 h-5" /> },
             { id: 'instructors', label: 'Manage Instructors', icon: <UserPlus className="w-5 h-5" /> },
-            { id: 'rubric', label: 'Group-Wide Key Questions', icon: <FileText className="w-5 h-5" /> },
             { id: 'questionBank', label: 'Question Bank', icon: <HelpCircle className="w-5 h-5" /> },
             { id: 'dtpBank', label: 'DTP Bank', icon: <Pill className="w-5 h-5" /> },
             { id: 'recommendationsBank', label: 'Recommendations Bank', icon: <ClipboardList className="w-5 h-5" /> },

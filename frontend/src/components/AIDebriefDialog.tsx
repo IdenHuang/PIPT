@@ -16,7 +16,7 @@ interface AIDebriefDialogProps {
   patientId?: string;
   chatId?: string;
   showAnswerKey?: boolean;
-  patientMode?: 'interview_practice' | 'full_assessment';
+  patientMode?: 'conversation_only' |'interview_practice' | 'full_assessment';
 }
 
 /**
@@ -175,8 +175,8 @@ function AIDebriefDialog({ isOpen, onClose, data, updatedDebriefData, simulation
             return null;
           })()}
 
-          <p className="text-base" style={{ color: UI_COLORS.text.body }}>
-            AI generated summary and feedback on your clinical interview. Remember, this is AI generated and should be considered as suggestions. This system will always provide feedback, and it may be incorrect, so you must use your judgement when considering this feedback. If you have questions about the feedback provided to you in this debrief, please reach out to your instructor.
+          <p className="text-xs mt-0.5" style={{ color: UI_COLORS.text.muted }}>
+            AI generated summary and feedback on your clinical interview. Please consider the feedback below as suggestions. This system will always provide feedback, and it may be incorrect, so you must use your judgement when considering this feedback. If you have questions about the feedback provided to you in this debrief, please reach out to your instructor and use the "Was this feedback helpful?" form below if you can.
           </p>
 
           {/* Two-Chunk Layout (when updatedDebriefData is provided) */}

@@ -46,7 +46,7 @@ export interface Patient {
   best_coverage: number | null;  // Best key question coverage % across completed chats
   attempt_count: number;         // Total number of chat sessions
   last_accessed: string | null;  // Last time the student interacted with this patient
-  mode: 'interview_practice' | 'full_assessment'; // Derived from DTP/Recommendation assignments
+  mode: 'interview_practice' | 'full_assessment' | 'conversation_only'; // Derived from DTP/Recommendation assignments
 }
 
 
@@ -100,7 +100,7 @@ export interface PatientDetail {
   sex?: string;
   primaryComplaint?: string;
   avatarUrl?: string;
-  mode?: 'interview_practice' | 'full_assessment';
+  mode?: 'interview_practice' | 'full_assessment' | 'conversation_only';
   max_messages_per_chat?: number | null;
 }
 
@@ -229,7 +229,7 @@ async function fetchPatientDetail(simulationGroupId: string, patientId: string):
       persona_age: number;
       persona_gender: string;
       voice_enabled?: boolean;
-      mode?: 'interview_practice' | 'full_assessment';
+      mode?: 'interview_practice' | 'full_assessment' | 'conversation_only';
       max_messages_per_chat?: number | null;
     }>>(
       `student/simulation_group_page?simulation_group_id=${encodeURIComponent(simulationGroupId)}`
