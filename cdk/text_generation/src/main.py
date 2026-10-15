@@ -10,6 +10,7 @@ from helpers.cohere_embeddings import CohereBedrockEmbeddings
 
 from helpers.chat import get_bedrock_llm, get_initial_student_query, get_student_query, set_stream_callback_url, get_default_system_prompt
 from helpers.seed_prompt import seed_prompt
+from helpers.authz import AuthzDecision, authorize_request
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +38,7 @@ BEDROCK_LLM_PARAM = os.environ["BEDROCK_LLM_PARAM"]
 EMBEDDING_MODEL_PARAM = os.environ["EMBEDDING_MODEL_PARAM"]
 TABLE_NAME_PARAM = os.environ["TABLE_NAME_PARAM"]
 APPSYNC_GRAPHQL_URL = os.environ.get("APPSYNC_GRAPHQL_URL", "")
+STREAM_CALLBACK_URL_PARAM = os.environ.get("STREAM_CALLBACK_URL_PARAM", "")
 
 # AWS Clients
 secrets_manager_client = boto3.client("secretsmanager")
@@ -60,6 +62,7 @@ db_secret = None
 BEDROCK_LLM_ID = None
 EMBEDDING_MODEL_ID = None
 TABLE_NAME = None
+STREAM_CALLBACK_URL = None
 
 # Cached embeddings instance
 embeddings = None
@@ -96,6 +99,26 @@ def get_parameter(param_name, cached_var):
             logger.error(f"Error fetching parameter {param_name}: {e}")
             raise
     return cached_var
+
+def get_stream_callback_url():
+    """
+    Return the trusted socket server callback base URL from SSM, or None.
+
+    The URL is deliberately sourced from deployment config rather than the
+    request: the callback carries the x-callback-token secret, so a
+    caller-chosen URL would leak it (and give blind SSRF from the VPC).
+    Only successful lookups are cached, so a missing parameter (e.g. API stack
+    deployed before EcsSocket) is retried on the next invocation. Returning
+    None makes publish_to_appsync fall back to the AppSync path.
+    """
+    global STREAM_CALLBACK_URL
+    if STREAM_CALLBACK_URL is None and STREAM_CALLBACK_URL_PARAM:
+        try:
+            response = ssm_client.get_parameter(Name=STREAM_CALLBACK_URL_PARAM)
+            STREAM_CALLBACK_URL = response["Parameter"]["Value"].rstrip("/") or None
+        except Exception as e:
+            logger.error(f"Error fetching stream callback URL parameter {STREAM_CALLBACK_URL_PARAM}: {e}")
+    return STREAM_CALLBACK_URL
 
 def initialize_constants():
     global BEDROCK_LLM_ID, EMBEDDING_MODEL_ID, TABLE_NAME, embeddings
@@ -207,6 +230,27 @@ def _safe_cleanup_after_error(cur):
             except Exception:
                 pass
         connection = None
+
+
+def _authorize(mode, caller_email, session_id, persona_id, simulation_group_id):
+    """Run the authorization policy in helpers/authz.py; fail closed on DB errors."""
+    cur = None
+    try:
+        cur = connect_to_db().cursor()
+        decision = authorize_request(
+            cur,
+            mode=mode,
+            email=caller_email,
+            session_id=session_id,
+            persona_id=persona_id,
+            simulation_group_id=simulation_group_id,
+        )
+        cur.close()
+        return decision
+    except Exception as e:
+        logger.error(f"Authorization check failed: {e}")
+        _safe_cleanup_after_error(cur)
+        return AuthzDecision(False, 500, "Authorization check failed")
 
 
 def get_system_prompt(simulation_group_id):
@@ -325,11 +369,12 @@ def handler(event, context):
     persona_id = query_params.get("patient_id", "")
     student_user_id = event.get('requestContext', {}).get('authorizer', {}).get('userId', '')
 
-    # When the ECS socket server calls us, it passes its own URL so we can
-    # POST streaming chunks there instead of going through AppSync.
-    stream_callback_url = query_params.get("stream_callback_url", "")
-    logger.info(f"🔗 stream_callback_url received: '{stream_callback_url}' | All query params: {list(query_params.keys())}")
-    set_stream_callback_url(stream_callback_url or None)
+    # When the ECS socket server calls us with stream=true, POST streaming
+    # chunks to its /stream-callback route instead of going through AppSync.
+    # The destination always comes from SSM config; any caller-supplied
+    # stream_callback_url query parameter is intentionally ignored.
+    wants_socket_stream = query_params.get("stream", "false").lower() == "true"
+    set_stream_callback_url(get_stream_callback_url() if wants_socket_stream else None)
 
     if not simulation_group_id or not session_id or not persona_id:
         return {
@@ -348,8 +393,31 @@ def handler(event, context):
     # =========================================================================
     # TODO(refactor): Extract mode branching into a helper function that dispatches to mode-specific handlers
     mode = query_params.get("mode", "chat")
+    # TODO(refactor): Extract mode branching into a helper function that dispatches to mode-specific handlers
+    mode = query_params.get("mode", "chat")
 
-    # TODO(refactor): Extract CORS header construction into a helper function to eliminate repetition
+    # =========================================================================
+    # AUTHORIZATION — the API Gateway authorizer only authenticates the JWT.
+    # Verify the caller may act on this session/persona/group before any mode
+    # reads history, writes messages/debriefs, or publishes stream events.
+    # =========================================================================
+    caller_email = event.get('requestContext', {}).get('authorizer', {}).get('email', '')
+    decision = _authorize(mode, caller_email, session_id, persona_id, simulation_group_id)
+    if not decision.allowed:
+        logger.warning(
+            f"Authorization denied: mode={mode} status={decision.status_code} "
+            f"reason={decision.reason} session={session_id} user={student_user_id}"
+        )
+        return {
+            'statusCode': decision.status_code,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Origin": _get_cors_origin(event),
+                "Access-Control-Allow-Methods": "*",
+            },
+            'body': json.dumps({"error": decision.reason}),
+        }
     if mode == "debrief":
         # TODO(refactor): Extract debrief mode handling into a helper function
         logger.info(f"📋 DEBRIEF MODE — generating debrief for session={session_id}")

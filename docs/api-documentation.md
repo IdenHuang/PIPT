@@ -743,14 +743,20 @@ Generate a response from the LLM. Supports multiple modes: chat, debrief, questi
 
 **Endpoint:** `POST /student/text_generation`
 
+**Authorization** (enforced in the Lambda, `helpers/authz.py`; the API Gateway authorizer only validates the JWT):
+
+- `chat`, `match`, `debrief`: the caller must own `session_id` (admins bypass ownership). The session must belong to `patient_id` and `simulation_group_id`.
+- `test_debrief`: the caller must be an instructor of `simulation_group_id` or an admin, and the session must belong to that persona and group.
+- `test_system_prompt`: the caller must be an instructor of `simulation_group_id` or an admin. `patient_id` must belong to the group, and `session_id` must be a playground scratch ID prefixed with `test-`.
+- Denials return `401` (no caller identity), `400` (malformed IDs) or `403` (not permitted).
+
 **Query Parameters:**
 
 - `simulation_group_id` (string, required): ID of the group
 - `session_id` (string, required): ID of the session
 - `patient_id` (string, required): ID of the patient
 - `session_name` (string, optional): Name of the session
-- `stream` (string, optional): Enable streaming response (`"true"` or `"false"`, default `"false"`)
-- `stream_callback_url` (string, optional): URL for ECS socket server to receive streaming chunks
+- `stream` (string, optional): Enable streaming response (`"true"` or `"false"`, default `"false"`). When `"true"`, chunks are POSTed to the ECS socket server's `/stream-callback` route at the URL stored in SSM (`/{StackPrefix}/socket-callback-url`); the destination is never taken from the request.
 - `mode` (string, optional): Operation mode — `"chat"` (default), `"debrief"`, `"match"`, `"test_debrief"`
 
 **Request Body:**

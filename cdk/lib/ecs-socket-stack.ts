@@ -16,6 +16,15 @@ import { TurnServerStack } from "./turn-server-stack";
 /** SSM parameter name where the socket URL is published for other stacks to read. */
 export const getSocketUrlSsmParam = (stackPrefix: string) => `/${stackPrefix}/socket-url`;
 
+/**
+ * SSM parameter name holding the VPC-internal base URL the text-generation
+ * Lambda POSTs streaming chunks to (`{url}/stream-callback`). The Lambda reads
+ * this at runtime instead of accepting a caller-supplied URL, so the
+ * x-callback-token secret is only ever sent to the socket server's NLB.
+ */
+export const getSocketCallbackUrlSsmParam = (stackPrefix: string) =>
+  `/${stackPrefix}/socket-callback-url`;
+
 export class EcsSocketStack extends Stack {
   public readonly socketUrl: string;
 
@@ -153,7 +162,7 @@ export class EcsSocketStack extends Stack {
       executionRole: taskRole, // ← should be a separate, minimal execution role
     });
 
-    // 3) Network Load Balancer on TCP 80 (created before container so SELF_URL can reference it)
+    // 3) Network Load Balancer on TCP 80
     // CloudFront VPC Origin requires the NLB to have a security group.
     const nlbSg = new ec2.SecurityGroup(this, "SocketNLBSG", {
       vpc,
@@ -178,7 +187,6 @@ export class EcsSocketStack extends Stack {
       }),
       environment: {
         NODE_ENV: "production",
-        SELF_URL: `http://${nlb.loadBalancerDnsName}`,
         SM_DB_CREDENTIALS: db.secretPathUser.secretName,
         SM_COGNITO_CREDENTIALS: apiServiceStack.secret.secretName,
         RDS_PROXY_ENDPOINT: db.rdsProxyEndpoint,
@@ -260,7 +268,37 @@ export class EcsSocketStack extends Stack {
       },
     });
 
+    // 6.1) Publish the VPC-internal callback URL for the text-generation Lambda.
+    // The Lambda runs in the same VPC and reaches the internal NLB directly,
+    // so /stream-callback traffic never needs to traverse CloudFront.
+    new ssm.StringParameter(this, "SocketCallbackUrlParam", {
+      parameterName: getSocketCallbackUrlSsmParam(stackPrefix),
+      stringValue: `http://${nlb.loadBalancerDnsName}`,
+      description: "VPC-internal socket server URL for text-gen Lambda stream callbacks",
+    });
+
     // 7) CloudFront distribution in front of the NLB
+    // Block internal-only routes at the edge. /stream-callback is meant to be
+    // called only by the text-gen Lambda from inside the VPC; exposing it via
+    // CloudFront lets anyone holding the callback token inject stream events.
+    // The URI is decoded, lowercased and slash-collapsed first because Express
+    // routes case-insensitively and tolerates trailing slashes.
+    const blockInternalRoutesFn = new cloudfront.Function(this, "BlockInternalRoutesFn", {
+      runtime: cloudfront.FunctionRuntime.JS_2_0,
+      comment: "Return 403 for internal-only socket server routes",
+      code: cloudfront.FunctionCode.fromInline(`
+function handler(event) {
+  var uri = event.request.uri;
+  try { uri = decodeURIComponent(uri); } catch (e) { /* malformed encoding: inspect raw URI */ }
+  uri = uri.toLowerCase().replace(/\\/{2,}/g, "/");
+  if (uri.indexOf("/stream-callback") !== -1) {
+    return { statusCode: 403, statusDescription: "Forbidden" };
+  }
+  return event.request;
+}
+`),
+    });
+
     const distro = new cloudfront.Distribution(this, "SocketDistro", {
       defaultBehavior: {
         origin: origins.VpcOrigin.withNetworkLoadBalancer(nlb, {
@@ -271,6 +309,12 @@ export class EcsSocketStack extends Stack {
         cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
         originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER,
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        functionAssociations: [
+          {
+            function: blockInternalRoutesFn,
+            eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+          },
+        ],
       },
       webAclId: cloudFrontWafArn,
     });

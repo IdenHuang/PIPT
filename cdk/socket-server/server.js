@@ -688,15 +688,14 @@ io.on("connection", (socket) => {
       }
     }
 
-    // Register this socket so /stream-callback can find it
+    // Register this socket so /stream-callback can find it. With stream=true the
+    // Lambda POSTs chunks back to this server's internal NLB URL, which it reads
+    // from SSM — the callback destination is never sent in the request.
     textStreamSockets.set(sessionId, socket);
-
-    // Build the self URL so the Lambda can POST chunks back to us
-    const selfUrl = process.env.SELF_URL || `http://localhost:${PORT}`;
 
     try {
       const response = await fetch(
-        `${process.env.TEXT_GENERATION_ENDPOINT}/student/text_generation?simulation_group_id=${encodeURIComponent(data.simulation_group_id)}&session_id=${encodeURIComponent(sessionId)}&patient_id=${encodeURIComponent(data.patient_id)}&session_name=${encodeURIComponent(data.session_name || "")}&stream=true&stream_callback_url=${encodeURIComponent(selfUrl)}`,
+        `${process.env.TEXT_GENERATION_ENDPOINT}/student/text_generation?simulation_group_id=${encodeURIComponent(data.simulation_group_id)}&session_id=${encodeURIComponent(sessionId)}&patient_id=${encodeURIComponent(data.patient_id)}&session_name=${encodeURIComponent(data.session_name || "")}&stream=true`,
         {
           method: "POST",
           headers: {
