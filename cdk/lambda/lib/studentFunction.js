@@ -1661,6 +1661,38 @@ exports.handler = async (event, context) => {
           const recommendationSubmission = body.recommendationSubmission || null;
 
           try {
+            // Authorization: verify session ownership (admins bypass), matching the
+            // other /student session routes. Without it any student could overwrite
+            // and conclude another student's graded chat.
+            const isAdminUserConclude = await isAdmin(sqlConnection, userEmailAttribute);
+            if (!isAdminUserConclude) {
+              const ownership = await verifySessionOwnership(sqlConnection, sessionId, userEmailAttribute);
+              if (!ownership.authorized) {
+                response.statusCode = 403;
+                response.body = JSON.stringify({ error: "Forbidden" });
+                break;
+              }
+            }
+
+            // The chat must also belong to the patient and group named in the query
+            // (admins included). Those IDs drive the mode check below, the engagement
+            // log and the debrief payload, so a mismatched pair could otherwise skip
+            // the recommendation requirement or log against another group.
+            const sessionBinding = await sqlConnection`
+              SELECT 1
+              FROM "chats" c
+              JOIN "student_interactions" si ON si.student_interaction_id = c.student_interaction_id
+              JOIN "enrollments" e ON e.enrollment_id = si.enrollment_id
+              WHERE c.chat_id = ${sessionId}
+                AND si.persona_id = ${patientId}
+                AND e.simulation_group_id = ${simulationGroupId};
+            `;
+            if (sessionBinding.length === 0) {
+              response.statusCode = 403;
+              response.body = JSON.stringify({ error: "Forbidden" });
+              break;
+            }
+
             // Step 0: Determine patient mode by checking DTP/Recommendation assignments.
             //a person with zero DTPS, recommendations, and questions is treated as 
             // "conversation_only" — the student only chats and gets key question feedback.
@@ -1684,11 +1716,14 @@ exports.handler = async (event, context) => {
               WHERE simulation_group_id = ${simulationGroupId}
                 AND (persona_id = ${patientId} OR persona_id IS NULL);
             `;
+            // Must match the mode computed by GET /student/simulation_group_page and
+            // GET /instructor/view_patients, or the UI and this check disagree on
+            // whether a recommendation is required.
             const patientMode = (quesCount.count === 0 && dtpCount.count === 0 && recCount.count === 0)
               ? 'conversation_only'
-              : (quesCount.count > 0 || dtpCount.count > 0 || recCount.count > 0)
-                ? 'full_assessment'
-                : 'interview_practice';
+              : (dtpCount.count === 0 && recCount.count === 0)
+                ? 'interview_practice'
+                : 'full_assessment';
 
             // Validate: full_assessment patients require a recommendation
             if (patientMode === 'full_assessment' && (!recommendation || !recommendation.trim())) {

@@ -3,6 +3,7 @@ const path = require("path");
 const { initializeConnection } = require("./lib.js");
 const { getCorsHeaders } = require("./cors.js");
 const { authorizeInstructorRequest } = require("./instructorRoutePolicy.js");
+const { verifyBankItemsInGroupOrganization } = require("./authz.js");
 const { validateTagsField, normalizeCreateFields } = require("./questionBankFields.js");
 const {
   BANK_DESCRIPTORS,
@@ -2915,6 +2916,17 @@ exports.handler = async (event, context) => {
             break;
           }
 
+          // The DTP bank is org-scoped: every item must belong to this group's
+          // organization, checked before any row is inserted.
+          const dtpOrgCheck = await verifyBankItemsInGroupOrganization(
+            sqlConnection, "dtp", dtpIds, simulation_group_id
+          );
+          if (!dtpOrgCheck.authorized) {
+            response.statusCode = 403;
+            response.body = JSON.stringify({ error: "Forbidden: DTP is not in this group's organization" });
+            break;
+          }
+
           try {
             // Resolve the instructor's user_id for added_by
             const userResult = await sqlConnection`
@@ -3123,6 +3135,17 @@ exports.handler = async (event, context) => {
           if (recIds.length === 0) {
             response.statusCode = 400;
             response.body = JSON.stringify({ error: "recommendation_id is required in request body" });
+            break;
+          }
+
+          // The recommendations bank is org-scoped: every item must belong to this
+          // group's organization, checked before any row is inserted.
+          const recOrgCheck = await verifyBankItemsInGroupOrganization(
+            sqlConnection, "recommendation", recIds, simulation_group_id
+          );
+          if (!recOrgCheck.authorized) {
+            response.statusCode = 403;
+            response.body = JSON.stringify({ error: "Forbidden: recommendation is not in this group's organization" });
             break;
           }
 

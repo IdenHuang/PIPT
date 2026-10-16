@@ -10,17 +10,24 @@ verifyGroupOwnership, isAdmin) so both runtimes enforce the same rules.
 Every query is parameterized and every check fails closed: any error or
 missing row results in a denial.
 """
+import hashlib
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
 # Prompt Playground chats use client-generated scratch IDs with this prefix
-# (frontend SystemPromptPlayground.tsx). They never correspond to a real
-# chats.chat_id (always a UUID), so requiring the prefix keeps the playground
-# from reading or appending another session's DynamoDB history.
+# (frontend SystemPromptPlayground.tsx: `test-${Date.now()}-${6 base36 chars}`).
+# They never correspond to a real chats.chat_id (always a UUID), so requiring
+# the prefix keeps the playground away from real student chat history.
 PLAYGROUND_SESSION_PREFIX = "test-"
+
+# The prefix alone does not stop one instructor replaying another instructor's
+# playground ID. playground_history_key() therefore namespaces the history key
+# by caller, and the client ID is limited to a short, key-safe charset.
+_PLAYGROUND_SESSION_RE = re.compile(r"^test-[A-Za-z0-9-]{1,64}$")
 
 # Modes restricted to instructors of the group (or admins).
 INSTRUCTOR_MODES = {"test_debrief", "test_system_prompt"}
@@ -48,6 +55,24 @@ def is_valid_uuid(value) -> bool:
         return str(uuid.UUID(value)) == value.lower()
     except (ValueError, AttributeError):
         return False
+
+
+def is_valid_playground_session_id(value) -> bool:
+    """True if value looks like a client-generated playground scratch ID."""
+    return isinstance(value, str) and _PLAYGROUND_SESSION_RE.fullmatch(value) is not None
+
+
+def playground_history_key(email: str, session_id: str) -> str:
+    """
+    Server-side chat-history key for a playground session, bound to the caller.
+
+    The client-supplied ID is kept as a suffix so one instructor can run several
+    playground chats, but the key is prefixed with a hash of the caller's email.
+    Another instructor sending the same session_id gets a different key and can
+    neither read nor append to this history. Emails compare case-insensitively.
+    """
+    owner = hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:32]
+    return f"{PLAYGROUND_SESSION_PREFIX}{owner}-{session_id[len(PLAYGROUND_SESSION_PREFIX):]}"
 
 
 def is_admin(cur, email: str) -> bool:
@@ -141,7 +166,8 @@ def authorize_request(cur, *, mode: str, email: str, session_id: str,
         session must belong to the persona and group.
       - test_system_prompt: caller must instruct the group (or be admin);
         the persona must belong to the group; session_id must be a
-        playground scratch ID, never a real chat.
+        playground scratch ID, never a real chat. The handler must then key
+        history with playground_history_key() so it is bound to the caller.
     """
     if not email:
         return _deny(401, "Missing caller identity")
@@ -153,7 +179,7 @@ def authorize_request(cur, *, mode: str, email: str, session_id: str,
             return _deny(403, "Instructor access required")
 
         if mode == "test_system_prompt":
-            if not session_id.startswith(PLAYGROUND_SESSION_PREFIX):
+            if not is_valid_playground_session_id(session_id):
                 return _deny(400, "Invalid playground session_id")
             if not persona_in_group(cur, persona_id, simulation_group_id):
                 return _deny(403, "Access denied")

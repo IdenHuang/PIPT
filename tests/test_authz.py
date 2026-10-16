@@ -14,7 +14,12 @@ sys.path.insert(
     0,
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cdk", "text_generation", "src", "helpers"),
 )
-from authz import authorize_request, is_valid_uuid  # noqa: E402
+from authz import (  # noqa: E402
+    authorize_request,
+    is_valid_playground_session_id,
+    is_valid_uuid,
+    playground_history_key,
+)
 
 GROUP = "11111111-1111-4111-8111-111111111111"
 OTHER_GROUP = "22222222-2222-4222-8222-222222222222"
@@ -194,6 +199,60 @@ def test_playground_rejects_real_chat_id():
 def test_playground_persona_must_belong_to_group():
     d = decide(mode="test_system_prompt", email=INSTRUCTOR, session="test-1-a", persona=OTHER_PERSONA)
     assert not d.allowed and d.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "session",
+    ["test-", "test-a b", "test-a/../b", "test-" + "a" * 65, "test-1\n", "TEST-1-abc"],
+)
+def test_playground_rejects_malformed_scratch_ids(session):
+    d = decide(mode="test_system_prompt", email=INSTRUCTOR, session=session)
+    assert not d.allowed and d.status_code == 400
+
+
+# ── Playground history binding ──────────────────────────────────────────────
+
+PLAYGROUND_ID = "test-1700000000000-ab12cd"
+OTHER_INSTRUCTOR = "instructor2@example.edu"
+
+
+def test_playground_key_differs_per_caller_for_same_client_id():
+    """Replaying another instructor's playground ID must not reach their history."""
+    mine = playground_history_key(INSTRUCTOR, PLAYGROUND_ID)
+    theirs = playground_history_key(OTHER_INSTRUCTOR, PLAYGROUND_ID)
+    assert mine != theirs
+
+
+def test_playground_key_is_stable_and_case_insensitive_for_owner():
+    assert playground_history_key(INSTRUCTOR, PLAYGROUND_ID) == playground_history_key(
+        f"  {INSTRUCTOR.upper()} ", PLAYGROUND_ID
+    )
+
+
+def test_playground_key_keeps_client_suffix_and_prefix():
+    key = playground_history_key(INSTRUCTOR, PLAYGROUND_ID)
+    assert key.startswith("test-")
+    assert key.endswith("-1700000000000-ab12cd")
+    assert INSTRUCTOR not in key  # the email itself is not exposed in the key
+    assert not is_valid_uuid(key)  # can never collide with a real chats.chat_id
+
+
+def test_playground_key_separates_sessions_of_same_caller():
+    assert playground_history_key(INSTRUCTOR, "test-1-a") != playground_history_key(INSTRUCTOR, "test-1-b")
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (PLAYGROUND_ID, True),
+        ("test-1-a", True),
+        ("test-", False),
+        (CHAT, False),
+        (None, False),
+    ],
+)
+def test_is_valid_playground_session_id(value, expected):
+    assert is_valid_playground_session_id(value) is expected
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

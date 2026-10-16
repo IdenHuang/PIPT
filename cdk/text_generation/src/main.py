@@ -10,7 +10,7 @@ from helpers.cohere_embeddings import CohereBedrockEmbeddings
 
 from helpers.chat import get_bedrock_llm, get_initial_student_query, get_student_query, set_stream_callback_url, get_default_system_prompt
 from helpers.seed_prompt import seed_prompt
-from helpers.authz import AuthzDecision, authorize_request
+from helpers.authz import AuthzDecision, authorize_request, playground_history_key
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO)
@@ -418,6 +418,10 @@ def handler(event, context):
             },
             'body': json.dumps({"error": decision.reason}),
         }
+    if mode == "test_system_prompt":
+        # Bind playground history to the caller. The client ID is only a suffix,
+        # so another instructor replaying it lands on a different DynamoDB key.
+        session_id = playground_history_key(caller_email, session_id)
     if mode == "debrief":
         # TODO(refactor): Extract debrief mode handling into a helper function
         logger.info(f"📋 DEBRIEF MODE — generating debrief for session={session_id}")

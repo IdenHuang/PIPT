@@ -116,7 +116,10 @@ const INSTRUCTOR_ROUTE_POLICY = Object.freeze({
   "GET /instructor/question_interactions": [group(), persona("persona_id", { optional: true })],
   "GET /instructor/simulation_group_dtps": [group(), persona("persona_id", { optional: true })],
   "GET /instructor/simulation_group_recommendations": [group(), persona("persona_id", { optional: true })],
-  // Bank bindings carry an optional persona_id in the body.
+  // Bank bindings carry an optional persona_id in the body. The DTP and
+  // recommendation handlers also call verifyBankItemsInGroupOrganization on the
+  // body-supplied bank IDs (those banks are org-scoped). Question IDs are not
+  // org-checked because the question bank is global (see GET above).
   "POST /instructor/simulation_group_questions": [group(), persona("persona_id", { source: "body", optional: true })],
   "POST /instructor/simulation_group_dtps": [group(), persona("persona_id", { source: "body", optional: true })],
   "POST /instructor/simulation_group_recommendations": [group(), persona("persona_id", { source: "body", optional: true })],

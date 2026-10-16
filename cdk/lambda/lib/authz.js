@@ -298,6 +298,66 @@ async function resolveParentId(sqlConnection, kind, childId) {
 }
 
 /**
+ * Bank kinds that are tenant-scoped by organization, mapped to the fixed query
+ * that returns how many of the given item IDs belong to the group's organization.
+ * No table or column names are built from input.
+ *
+ * The question bank is intentionally absent: it is global by product design
+ * (GET /instructor/question_bank lists every organization's questions).
+ */
+const ORG_SCOPED_BANK_QUERIES = Object.freeze({
+  dtp: (sqlConnection, itemId, simulationGroupId) => sqlConnection`
+    SELECT 1
+    FROM dtp_bank b
+    JOIN simulation_groups sg ON sg.organization_id = b.organization_id
+    WHERE b.dtp_id = ${itemId}
+      AND sg.simulation_group_id = ${simulationGroupId};
+  `,
+  recommendation: (sqlConnection, itemId, simulationGroupId) => sqlConnection`
+    SELECT 1
+    FROM recommendations_bank b
+    JOIN simulation_groups sg ON sg.organization_id = b.organization_id
+    WHERE b.recommendation_id = ${itemId}
+      AND sg.simulation_group_id = ${simulationGroupId};
+  `,
+});
+
+/**
+ * Verify that every bank item ID belongs to the same organization as the
+ * simulation group it is being attached to. Without this, an instructor could
+ * attach another organization's DTP/recommendation to their own group and read
+ * its text back through the group-scoped GET, which JOINs the bank table.
+ *
+ * Fail-closed: an unknown kind, a non-string or empty ID, a group or item with
+ * no organization (NULL never matches), a missing row, or any database error
+ * returns { authorized: false }.
+ *
+ * @param {object} sqlConnection - postgres tagged template connection
+ * @param {"dtp"|"recommendation"} kind - Which bank the IDs come from
+ * @param {string[]} itemIds - Bank item primary keys supplied by the caller
+ * @param {string} simulationGroupId - The (already authorized) target group
+ * @returns {Promise<{authorized: boolean}>}
+ */
+async function verifyBankItemsInGroupOrganization(sqlConnection, kind, itemIds, simulationGroupId) {
+  const query = ORG_SCOPED_BANK_QUERIES[kind];
+  if (!query || !Array.isArray(itemIds) || itemIds.length === 0) {
+    return { authorized: false };
+  }
+  if (!itemIds.every((id) => typeof id === "string" && id.length > 0)) {
+    return { authorized: false };
+  }
+  try {
+    for (const itemId of new Set(itemIds)) {
+      const rows = await query(sqlConnection, itemId, simulationGroupId);
+      if (rows.length === 0) return { authorized: false };
+    }
+    return { authorized: true };
+  } catch (error) {
+    return { authorized: false };
+  }
+}
+
+/**
  * Check if the authenticated user has the 'admin' role.
  *
  * @param {object} sqlConnection - postgres tagged template connection
@@ -328,5 +388,6 @@ module.exports = {
   verifyPersonaOwnership,
   verifyOrganizationMembership,
   resolveParentId,
+  verifyBankItemsInGroupOrganization,
   isAdmin,
 };
