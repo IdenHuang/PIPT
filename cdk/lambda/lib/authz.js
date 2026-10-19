@@ -107,6 +107,67 @@ async function verifyEnrollment(sqlConnection, simulationGroupId, userEmail) {
 }
 
 /**
+ * Verify that the authenticated user is enrolled (any enrollment type) in the
+ * simulation group that owns the given persona. Used by /student routes that
+ * receive only a persona_id, so the group is derived server-side and cannot be
+ * mismatched by the caller.
+ *
+ * @param {object} sqlConnection - postgres tagged template connection
+ * @param {string} personaId - The persona_id being accessed
+ * @param {string} userEmail - The authenticated user's email
+ * @returns {Promise<{authorized: boolean}>}
+ */
+async function verifyPersonaEnrollment(sqlConnection, personaId, userEmail) {
+  try {
+    const result = await sqlConnection`
+      SELECT 1
+      FROM personas p
+      JOIN enrollments e ON e.simulation_group_id = p.simulation_group_id
+      JOIN users u ON u.user_id = e.user_id
+      WHERE p.persona_id = ${personaId}
+        AND u.user_email = ${userEmail};
+    `;
+
+    return { authorized: result.length > 0 };
+  } catch (error) {
+    return { authorized: false };
+  }
+}
+
+/**
+ * Verify that the authenticated user owns the chat AND that the chat belongs to
+ * the given persona and simulation group. Use this when a request carries all
+ * three IDs, so a caller cannot pair their own chat with another group's
+ * persona (or vice versa).
+ *
+ * @param {object} sqlConnection - postgres tagged template connection
+ * @param {string} sessionId - The chat_id
+ * @param {string} personaId - The persona_id the chat must belong to
+ * @param {string} simulationGroupId - The simulation_group_id the chat must belong to
+ * @param {string} userEmail - The authenticated user's email
+ * @returns {Promise<{authorized: boolean}>}
+ */
+async function verifySessionScope(sqlConnection, sessionId, personaId, simulationGroupId, userEmail) {
+  try {
+    const result = await sqlConnection`
+      SELECT 1
+      FROM chats c
+      JOIN student_interactions si ON si.student_interaction_id = c.student_interaction_id
+      JOIN enrollments e ON e.enrollment_id = si.enrollment_id
+      JOIN users u ON u.user_id = e.user_id
+      WHERE c.chat_id = ${sessionId}
+        AND si.persona_id = ${personaId}
+        AND e.simulation_group_id = ${simulationGroupId}
+        AND u.user_email = ${userEmail};
+    `;
+
+    return { authorized: result.length > 0 };
+  } catch (error) {
+    return { authorized: false };
+  }
+}
+
+/**
  * Verify that the authenticated instructor owns or is assigned to the group
  * that the given persona belongs to.
  * Joins personas → simulation_groups and checks created_by or group_instructors.
@@ -455,6 +516,8 @@ module.exports = {
   verifySessionOwnership,
   verifyGroupOwnership,
   verifyEnrollment,
+  verifyPersonaEnrollment,
+  verifySessionScope,
   verifyPersonaOwnership,
   verifyOrganizationMembership,
   resolveParentId,

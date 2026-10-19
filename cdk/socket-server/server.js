@@ -5,7 +5,8 @@ const { Server } = require("socket.io");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
 const { verifyToken, getStsCredentials } = require("./auth");
-const { verifySessionOwnership } = require("./session-auth");
+const { verifySessionScope } = require("./session-auth");
+const { authorizeSessionRequest } = require("./session-guard");
 const logger = require("./logger");
 const { SignatureV4 } = require("@smithy/signature-v4");
 const { HttpRequest } = require("@smithy/protocol-http");
@@ -281,20 +282,28 @@ io.on("connection", (socket) => {
     lastNovaSonicStart = now;
     console.log("🚀 Starting Nova Sonic session for client:", socket.id);
 
-    // ── Session ownership verification ────────────────────────────────────
+    // ── Session authorization (fail closed; see session-guard.js) ─────────
+    // The caller must own the chat and it must belong to the patient/group in
+    // the config, since those IDs drive which persona context is loaded.
     const sessionId = config.session_id;
-    if (sessionId && socket.userEmail) {
-      const ownership = await verifySessionOwnership(sessionId, socket.userEmail);
-      if (!ownership.authorized) {
-        logger.warn("Session ownership denied for start-nova-sonic", {
-          component: "server",
-          operation: "start-nova-sonic",
-          userEmail: socket.userEmail,
-          sessionId,
-        });
-        socket.emit("nova-error", { error: "Access denied: you do not own this session" });
-        return;
-      }
+    const novaAuthz = await authorizeSessionRequest(
+      {
+        userEmail: socket.userEmail,
+        sessionId,
+        patientId: config.patient_id,
+        simulationGroupId: config.simulation_group_id,
+      },
+      verifySessionScope,
+    );
+    if (!novaAuthz.allowed) {
+      logger.warn("Session authorization denied for start-nova-sonic", {
+        component: "server",
+        operation: "start-nova-sonic",
+        userEmail: socket.userEmail,
+        sessionId,
+      });
+      socket.emit("nova-error", { error: novaAuthz.error });
+      return;
     }
 
     audioStarted = false;
@@ -339,7 +348,7 @@ io.on("connection", (socket) => {
         const effectiveVoicePrompt = patientContext.voice_persona_prompt || patientContext.persona_prompt || config.patient_prompt || "";
 
         const agentWs = await connectToVoiceAgent({
-          session_id: config.session_id || "default",
+          session_id: sessionId,
           voice_id: config.voice_id || "",
           user_id: socket.userId || "anonymous",
           patient_name: patientContext.patient_name || config.patient_name || "",
@@ -454,7 +463,7 @@ io.on("connection", (socket) => {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
           ...process.env,
-          SESSION_ID: config.session_id || "default",
+          SESSION_ID: sessionId,
           VOICE_ID: config.voice_id || "",
           USER_ID: socket.userId || "anonymous",
           AWS_ACCESS_KEY_ID: stsCredentials.AccessKeyId,
@@ -572,7 +581,7 @@ io.on("connection", (socket) => {
             stdio: ["pipe", "pipe", "pipe"],
             env: {
               ...process.env,
-              SESSION_ID: config.session_id || "default",
+              SESSION_ID: sessionId,
               VOICE_ID: config.voice_id || "",
               USER_ID: socket.userId || "anonymous",
               AWS_ACCESS_KEY_ID: stsCredentials.AccessKeyId,
@@ -669,23 +678,29 @@ io.on("connection", (socket) => {
 
     const sessionId = data.session_id;
 
-    // ── Session ownership verification ────────────────────────────────────
-    if (sessionId && socket.userEmail) {
-      const ownership = await verifySessionOwnership(sessionId, socket.userEmail);
-      if (!ownership.authorized) {
-        logger.warn("Session ownership denied for text-generation", {
-          component: "server",
-          operation: "text-generation",
-          userEmail: socket.userEmail,
-          sessionId,
-        });
-        socket.emit("text-stream", {
-          type: "error",
-          content: "Access denied: you do not own this session",
-        });
-        textGenInFlight = false;
-        return;
-      }
+    // ── Session authorization (fail closed; see session-guard.js) ─────────
+    const textAuthz = await authorizeSessionRequest(
+      {
+        userEmail: socket.userEmail,
+        sessionId,
+        patientId: data && data.patient_id,
+        simulationGroupId: data && data.simulation_group_id,
+      },
+      verifySessionScope,
+    );
+    if (!textAuthz.allowed) {
+      logger.warn("Session authorization denied for text-generation", {
+        component: "server",
+        operation: "text-generation",
+        userEmail: socket.userEmail,
+        sessionId,
+      });
+      socket.emit("text-stream", {
+        type: "error",
+        content: textAuthz.error,
+      });
+      textGenInFlight = false;
+      return;
     }
 
     // Register this socket so /stream-callback can find it. With stream=true the

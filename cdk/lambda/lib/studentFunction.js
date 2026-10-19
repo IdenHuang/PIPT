@@ -1,7 +1,13 @@
 const { initializeConnection } = require("./lib.js");
 const { getCorsHeaders } = require("./cors.js");
 const logger = require("./logger");
-const { verifySessionOwnership, verifyEnrollment, isAdmin } = require("./authz.js");
+const {
+  verifySessionOwnership,
+  verifyEnrollment,
+  verifyPersonaEnrollment,
+  verifySessionScope,
+  isAdmin,
+} = require("./authz.js");
 let { SM_DB_CREDENTIALS, RDS_PROXY_ENDPOINT } = process.env;
 
 // SQL conneciton from global variable at lib.js
@@ -1070,35 +1076,6 @@ exports.handler = async (event, context) => {
           });
         }
         break;
-      case "GET /session/messages":
-        if (
-          event.queryStringParameters != null &&
-          event.queryStringParameters.session_id
-        ) {
-          try {
-            const sessionId = event.queryStringParameters.session_id;
-
-            // Fetch all messages in the specified session
-            const messages = await sqlConnection`
-                      SELECT *
-                      FROM "messages"
-                      WHERE "chat_id" = ${sessionId}
-                      ORDER BY "sent_at" ASC;
-                  `;
-
-            response.body = JSON.stringify(messages);
-          } catch (err) {
-            logger.error("Operation failed", { error: err.message, stack: err.stack });
-            response.statusCode = 500;
-            response.body = JSON.stringify({ error: "Internal server error" });
-          }
-        } else {
-          response.statusCode = 400;
-          response.body = JSON.stringify({
-            error: "session_id query parameter is required",
-          });
-        }
-        break;
       case "POST /student/update_persona_score":
         if (
           event.queryStringParameters != null &&
@@ -1253,6 +1230,17 @@ exports.handler = async (event, context) => {
           const patientId = event.queryStringParameters.patient_id;
 
           try {
+            // Authorization: caller must be enrolled in the persona's group (admins bypass)
+            const isAdminUserVoice = await isAdmin(sqlConnection, userEmailAttribute);
+            if (!isAdminUserVoice) {
+              const access = await verifyPersonaEnrollment(sqlConnection, patientId, userEmailAttribute);
+              if (!access.authorized) {
+                response.statusCode = 403;
+                response.body = JSON.stringify({ error: "Forbidden" });
+                break;
+              }
+            }
+
             // Query to get the patient voice ID
             const voiceData = await sqlConnection`
                     SELECT voice_id 
@@ -1403,11 +1391,14 @@ exports.handler = async (event, context) => {
               WHERE simulation_group_id = ${simulation_group_id}
             `;
 
-            // Get patient details
+            // Get patient details. The persona must belong to the group that was
+            // authorized above, or an enrolled student could read another group's
+            // persona prompts by pairing their own group with a foreign patient_id.
             const patientResult = await sqlConnection`
               SELECT persona_name, persona_age, persona_prompt, voice_persona_prompt, llm_completion
               FROM "personas" 
               WHERE persona_id = ${patient_id}
+                AND simulation_group_id = ${simulation_group_id}
             `;
 
             if (systemPromptResult.length === 0 || patientResult.length === 0) {
@@ -1449,6 +1440,17 @@ exports.handler = async (event, context) => {
           const { simulation_group_id } = event.queryStringParameters;
 
           try {
+            // Authorization: verify enrollment in simulation group (admins bypass)
+            const isAdminUserVoiceCfg = await isAdmin(sqlConnection, userEmailAttribute);
+            if (!isAdminUserVoiceCfg) {
+              const enrollment = await verifyEnrollment(sqlConnection, simulation_group_id, userEmailAttribute);
+              if (!enrollment.authorized) {
+                response.statusCode = 403;
+                response.body = JSON.stringify({ error: "Forbidden" });
+                break;
+              }
+            }
+
             // Get voice settings for the simulation group
             const voiceResult = await sqlConnection`
               SELECT admin_voice_enabled, instructor_voice_enabled 
@@ -1875,6 +1877,18 @@ exports.handler = async (event, context) => {
         ) {
           try {
             const { persona_id } = event.queryStringParameters;
+
+            // Authorization: caller must be enrolled in the persona's group (admins bypass)
+            const isAdminUserMedia = await isAdmin(sqlConnection, userEmailAttribute);
+            if (!isAdminUserMedia) {
+              const access = await verifyPersonaEnrollment(sqlConnection, persona_id, userEmailAttribute);
+              if (!access.authorized) {
+                response.statusCode = 403;
+                response.body = JSON.stringify({ error: "Forbidden" });
+                break;
+              }
+            }
+
             const data = await sqlConnection`
               SELECT media_id, persona_id, media_type, url, title, description, created_at
               FROM "persona_media"
@@ -1915,6 +1929,18 @@ exports.handler = async (event, context) => {
           if (typeof is_helpful !== "boolean") {
             response.statusCode = 400;
             response.body = JSON.stringify({ error: "is_helpful must be a boolean" });
+            break;
+          }
+
+          // Authorization: the chat must be the caller's own and belong to the
+          // persona and group in the body, so feedback can't be attached to
+          // another student's chat or a mismatched persona/group.
+          const feedbackScope = await verifySessionScope(
+            sqlConnection, chat_id, persona_id, simulation_group_id, userEmailAttribute
+          );
+          if (!feedbackScope.authorized) {
+            response.statusCode = 403;
+            response.body = JSON.stringify({ error: "Forbidden" });
             break;
           }
 
@@ -1978,6 +2004,17 @@ exports.handler = async (event, context) => {
           if (!Array.isArray(issue_categories) || issue_categories.length === 0) {
             response.statusCode = 400;
             response.body = JSON.stringify({ error: "issue_categories must be a non-empty array" });
+            break;
+          }
+
+          // Authorization: the chat must be the caller's own and belong to the
+          // persona and group in the body (same rule as debrief_feedback).
+          const reportScope = await verifySessionScope(
+            sqlConnection, chat_id, persona_id, simulation_group_id, userEmailAttribute
+          );
+          if (!reportScope.authorized) {
+            response.statusCode = 403;
+            response.body = JSON.stringify({ error: "Forbidden" });
             break;
           }
 
