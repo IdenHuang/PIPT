@@ -1479,7 +1479,8 @@ export class ApiServiceStack extends cdk.Stack {
         securityGroups: [apiLambdaSg],
         functionName: `${id}-TextGenLambdaDockerFunction`,
         environment: {
-          SM_DB_CREDENTIALS: db.secretPathAdminName,
+          // Least-privilege app_rw user (DML only), not the RDS master credential.
+          SM_DB_CREDENTIALS: db.secretPathUser.secretName,
           RDS_PROXY_ENDPOINT: db.rdsProxyEndpoint,
           REGION: this.region,
           BEDROCK_LLM_PARAM: bedrockLLMParameter.parameterName,
@@ -1551,17 +1552,13 @@ export class ApiServiceStack extends cdk.Stack {
     // Attach the custom Bedrock policy to Lambda function
     textGenLambdaDockerFunc.addToRolePolicy(bedrockPolicyStatement);
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: only the app_rw DB credential. The stream
+    // callback secret is granted above via streamCallbackSecret.grantRead().
     textGenLambdaDockerFunc.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathUser.secretArn],
       })
     );
 

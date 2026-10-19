@@ -607,7 +607,7 @@ def get_cognito_token():
     """Get the current user's Cognito JWT token from the Lambda event context."""
     token = getattr(get_cognito_token, 'current_token', None)
     if token:
-        logger.info(f"✅ Found Cognito JWT token: {token[:20]}...")
+        logger.info("✅ Found Cognito JWT token")
         return token
     else:
         logger.error("❌ No Cognito token available in context")
