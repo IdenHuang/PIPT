@@ -3,7 +3,7 @@ const path = require("path");
 const { initializeConnection } = require("./lib.js");
 const { getCorsHeaders } = require("./cors.js");
 const { authorizeInstructorRequest } = require("./instructorRoutePolicy.js");
-const { verifyBankItemsInGroupOrganization } = require("./authz.js");
+const { verifyBankItemsInGroupOrganization, verifyQuestionsAttachableToGroup } = require("./authz.js");
 const { validateTagsField, normalizeCreateFields } = require("./questionBankFields.js");
 const {
   BANK_DESCRIPTORS,
@@ -1839,9 +1839,52 @@ exports.handler = async (event, context) => {
         break;
       case "GET /instructor/question_bank":
         try {
-          const data = await sqlConnection`
-            SELECT * FROM "question_bank" ORDER BY created_at DESC;
-          `;
+          // Tenant-scoped read. instructorRoutePolicy.js has already verified
+          // membership of a supplied organization_id (authorizedScope.organizationId).
+          // Without one, list only organizations the caller belongs to, using the
+          // same membership rule as verifyOrganizationMembership; admins see all.
+          const requestedOrgId = authorizedScope.organizationId;
+          let data;
+          if (requestedOrgId) {
+            data = await sqlConnection`
+              SELECT * FROM "question_bank"
+              WHERE organization_id = ${requestedOrgId}
+              ORDER BY created_at DESC;
+            `;
+          } else if (userRoles.includes("admin")) {
+            data = await sqlConnection`
+              SELECT * FROM "question_bank" ORDER BY created_at DESC;
+            `;
+          } else {
+            data = await sqlConnection`
+              SELECT qb.* FROM "question_bank" qb
+              WHERE qb.organization_id IN (
+                SELECT u.organization_id FROM "users" u
+                WHERE u.user_email = ${userEmailAttribute}
+                  AND u.organization_id IS NOT NULL
+                UNION
+                SELECT sg.organization_id
+                FROM "simulation_groups" sg
+                JOIN "users" u ON u.user_email = ${userEmailAttribute}
+                WHERE sg.organization_id IS NOT NULL
+                  AND (
+                    sg.created_by = u.user_id
+                    OR EXISTS (
+                      SELECT 1 FROM "group_instructors" gi
+                      WHERE gi.simulation_group_id = sg.simulation_group_id
+                        AND gi.user_id = u.user_id
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM "enrollments" e
+                      WHERE e.simulation_group_id = sg.simulation_group_id
+                        AND e.user_id = u.user_id
+                        AND e.enrollment_type = 'instructor'
+                    )
+                  )
+              )
+              ORDER BY qb.created_at DESC;
+            `;
+          }
           response.statusCode = 200;
           response.body = JSON.stringify(data);
         } catch (err) {
@@ -2023,6 +2066,18 @@ exports.handler = async (event, context) => {
           if (questionIds.length === 0) {
             response.statusCode = 400;
             response.body = JSON.stringify({ error: "question_id or question_ids is required in request body" });
+            break;
+          }
+
+          // The question bank is org-scoped: every question must belong to this
+          // group's organization (or, for an org-less group, to an organization
+          // the caller belongs to), checked before any row is inserted.
+          const questionOrgCheck = await verifyQuestionsAttachableToGroup(
+            sqlConnection, questionIds, simulation_group_id, userEmailAttribute, userRoles.includes("admin")
+          );
+          if (!questionOrgCheck.authorized) {
+            response.statusCode = 403;
+            response.body = JSON.stringify({ error: "Forbidden: question is not in this group's organization" });
             break;
           }
 

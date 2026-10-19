@@ -74,9 +74,10 @@ const INSTRUCTOR_ROUTE_POLICY = Object.freeze({
   "GET /instructor/get_default_debrief_prompt": CALLER_SCOPED,
   "GET /instructor/get_default_system_prompt": CALLER_SCOPED,
   "GET /instructor/get_default_persona_prompt": CALLER_SCOPED,
-  // Intentionally unscoped: the question bank list is global by product design
-  // (see frontend/src/hooks/useInstructorQuestionBank.ts). Writes are scoped below.
-  "GET /instructor/question_bank": CALLER_SCOPED,
+  // Optional organization_id narrows the list to one organization the caller
+  // belongs to. Without it the handler lists only the caller's organizations
+  // (admins: all), so the read is tenant-scoped either way.
+  "GET /instructor/question_bank": [organization("organization_id", { optional: true })],
 
   // ── Group-scoped ──────────────────────────────────────────────────────────
   "GET /instructor/analytics": [group()],
@@ -116,10 +117,11 @@ const INSTRUCTOR_ROUTE_POLICY = Object.freeze({
   "GET /instructor/question_interactions": [group(), persona("persona_id", { optional: true })],
   "GET /instructor/simulation_group_dtps": [group(), persona("persona_id", { optional: true })],
   "GET /instructor/simulation_group_recommendations": [group(), persona("persona_id", { optional: true })],
-  // Bank bindings carry an optional persona_id in the body. The DTP and
-  // recommendation handlers also call verifyBankItemsInGroupOrganization on the
-  // body-supplied bank IDs (those banks are org-scoped). Question IDs are not
-  // org-checked because the question bank is global (see GET above).
+  // Bank bindings carry an optional persona_id in the body. The handlers also
+  // org-check the body-supplied bank IDs: DTP and recommendation via
+  // verifyBankItemsInGroupOrganization, questions via
+  // verifyQuestionsAttachableToGroup (which allows org-less groups when the
+  // caller belongs to the question's organization).
   "POST /instructor/simulation_group_questions": [group(), persona("persona_id", { source: "body", optional: true })],
   "POST /instructor/simulation_group_dtps": [group(), persona("persona_id", { source: "body", optional: true })],
   "POST /instructor/simulation_group_recommendations": [group(), persona("persona_id", { source: "body", optional: true })],
@@ -183,7 +185,9 @@ const deny = (statusCode, error) => ({ allowed: false, statusCode, error });
  * @param {boolean} params.isAdmin - Whether the caller holds the admin role
  * @returns {Promise<{allowed: true, scope: object} | {allowed: false, statusCode: number, error: string}>}
  *   `scope` holds the authorized simulationGroupId / personaId / organizationId so
- *   handlers can bind child-record SQL to the parent that was checked.
+ *   handlers can bind child-record SQL to the parent that was checked. A skipped
+ *   optional check leaves its key absent, so handlers can tell "not supplied"
+ *   (undefined) apart from "authorized" (a string).
  */
 async function authorizeInstructorRequest({
   sqlConnection,

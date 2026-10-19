@@ -302,8 +302,9 @@ async function resolveParentId(sqlConnection, kind, childId) {
  * that returns how many of the given item IDs belong to the group's organization.
  * No table or column names are built from input.
  *
- * The question bank is intentionally absent: it is global by product design
- * (GET /instructor/question_bank lists every organization's questions).
+ * The question bank is absent because instructor-created simulation groups have
+ * no organization, so it needs a membership fallback; see
+ * verifyQuestionsAttachableToGroup.
  */
 const ORG_SCOPED_BANK_QUERIES = Object.freeze({
   dtp: (sqlConnection, itemId, simulationGroupId) => sqlConnection`
@@ -358,6 +359,75 @@ async function verifyBankItemsInGroupOrganization(sqlConnection, kind, itemIds, 
 }
 
 /**
+ * Verify that every question bank ID may be attached to the given simulation
+ * group. Without this, an instructor could attach another organization's
+ * question to their own group and read its text and evaluation criteria back
+ * through GET /instructor/simulation_group_questions, which JOINs question_bank.
+ *
+ * A question is attachable when:
+ *   - the group has an organization and the question belongs to that same
+ *     organization, or
+ *   - the group has no organization (instructor-created groups are inserted
+ *     without one) and the caller is an admin or a member of the question's
+ *     organization (verifyOrganizationMembership).
+ *
+ * Fail-closed: a non-array, empty, or non-string ID list, a missing question
+ * or group, or any database error returns { authorized: false }.
+ *
+ * @param {object} sqlConnection - postgres tagged template connection
+ * @param {string[]} questionIds - question_bank primary keys supplied by the caller
+ * @param {string} simulationGroupId - The (already authorized) target group
+ * @param {string} userEmail - The authenticated user's email
+ * @param {boolean} callerIsAdmin - Whether the caller holds the admin role
+ * @returns {Promise<{authorized: boolean}>}
+ */
+async function verifyQuestionsAttachableToGroup(
+  sqlConnection,
+  questionIds,
+  simulationGroupId,
+  userEmail,
+  callerIsAdmin
+) {
+  if (!Array.isArray(questionIds) || questionIds.length === 0) {
+    return { authorized: false };
+  }
+  if (!questionIds.every((id) => typeof id === "string" && id.length > 0)) {
+    return { authorized: false };
+  }
+  try {
+    // Organizations already confirmed for an org-less group, so a batch of
+    // questions from the same organization costs one membership lookup.
+    const memberOrgs = new Set();
+    for (const questionId of new Set(questionIds)) {
+      const rows = await sqlConnection`
+        SELECT q.organization_id AS question_org, sg.organization_id AS group_org
+        FROM question_bank q
+        CROSS JOIN simulation_groups sg
+        WHERE q.question_id = ${questionId}
+          AND sg.simulation_group_id = ${simulationGroupId};
+      `;
+      if (rows.length === 0) return { authorized: false };
+
+      const { question_org: questionOrg, group_org: groupOrg } = rows[0];
+      if (!questionOrg) return { authorized: false };
+
+      if (groupOrg) {
+        if (groupOrg !== questionOrg) return { authorized: false };
+        continue;
+      }
+
+      if (callerIsAdmin === true || memberOrgs.has(questionOrg)) continue;
+      const membership = await verifyOrganizationMembership(sqlConnection, questionOrg, userEmail);
+      if (!membership.authorized) return { authorized: false };
+      memberOrgs.add(questionOrg);
+    }
+    return { authorized: true };
+  } catch (error) {
+    return { authorized: false };
+  }
+}
+
+/**
  * Check if the authenticated user has the 'admin' role.
  *
  * @param {object} sqlConnection - postgres tagged template connection
@@ -389,5 +459,6 @@ module.exports = {
   verifyOrganizationMembership,
   resolveParentId,
   verifyBankItemsInGroupOrganization,
+  verifyQuestionsAttachableToGroup,
   isAdmin,
 };
