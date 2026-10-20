@@ -707,7 +707,10 @@ def handler(event, context):
                 embeddings_model=embeddings,
                 ddb_table_name=TABLE_NAME,
                 raw_prompt_mode=True,
-                is_initial_prompt=is_playground_initial
+                is_initial_prompt=is_playground_initial,
+                # Playground IDs are "test-..." scratch keys, not chat UUIDs:
+                # never write them to the graded "messages" table.
+                persist_messages=False,
             )
 
             return {

@@ -292,9 +292,17 @@ def get_response(
     raw_prompt_mode: bool = False,
     is_initial_prompt: bool = False,
     key_question_threshold: float = DEFAULT_MATCH_THRESHOLD,
+    persist_messages: bool = True,
 ) -> dict:
     """
     Generates a response to a query using the LLM and a history-aware retriever for context.
+
+    persist_messages=False skips the PostgreSQL "messages" writes (and the
+    question matching that depends on them). The Prompt Playground uses this:
+    its session IDs are "test-..." scratch keys, not chats.chat_id UUIDs, so
+    the rows could never be stored and each attempt would cost a Secrets
+    Manager read, a DB connection and an error log. Conversation history
+    still lives in DynamoDB under the caller-bound playground key.
     """
     logger.info(f"🔍 GET_RESPONSE CALLED - Stream: {stream}, Query: '{query[:50]}...'")
     
@@ -318,7 +326,7 @@ def get_response(
     # kicks off the AI patient — it is not a real student message and should
     # never appear in debrief suggested rewrites.
     student_message_id = None
-    if not stream and not is_initial_prompt:
+    if persist_messages and not stream and not is_initial_prompt:
         student_message_id = save_message_to_db(session_id, student_user_id, 'student', query)
         if student_message_id is not None and embeddings_model is not None and query.strip():
             run_matching_async(
@@ -433,6 +441,7 @@ Use the documents provided as your knowledge base. Be subtle and realistic — s
                 is_initial_prompt=is_initial_prompt,
                 bedrock_llm_id=llm.model_id if hasattr(llm, 'model_id') else "",
                 key_question_threshold=key_question_threshold,
+                persist_messages=persist_messages,
             )
         else:
             response = generate_response(
@@ -457,7 +466,8 @@ Use the documents provided as your knowledge base. Be subtle and realistic — s
     
     result = get_llm_output(response, llm_completion)
     
-    ai_message_id = save_message_to_db(session_id, persona_id, 'ai', result["llm_output"])
+    if persist_messages:
+        save_message_to_db(session_id, persona_id, 'ai', result["llm_output"])
 
     # Ensure matching threads complete before we return — Lambda freezes
     # the execution environment on return, killing daemon threads.
@@ -489,9 +499,12 @@ def generate_streaming_response(
     is_initial_prompt: bool = False,
     bedrock_llm_id: str = "",
     key_question_threshold: float = DEFAULT_MATCH_THRESHOLD,
+    persist_messages: bool = True,
 ) -> str:
     """
     Streams an answer via AppSync as fast as possible.
+
+    persist_messages=False skips the PostgreSQL "messages" writes; see get_response.
     """
     # TODO(refactor): Extract streaming chunk iteration into a helper function
     # TODO(refactor): Extract fallback-to-invoke logic into a helper function
@@ -531,7 +544,7 @@ def generate_streaming_response(
         # Empathy evaluation disabled
         # Skip saving and matching for the initial system-generated prompt —
         # it is not a real student message.
-        if not is_initial_prompt:
+        if persist_messages and not is_initial_prompt:
             student_message_id = save_message_to_db(session_id, student_user_id, 'student', query)
             if student_message_id is not None and embeddings_model is not None and query.strip():
                 run_matching_async(
@@ -585,7 +598,8 @@ def generate_streaming_response(
                 time.sleep(0.005)
 
         publish_to_appsync(session_id, {"type": "end", "content": full_response})
-        ai_message_id = save_message_to_db(session_id, persona_id, 'ai', full_response)
+        if persist_messages:
+            save_message_to_db(session_id, persona_id, 'ai', full_response)
 
         # Ensure matching threads complete before we return — Lambda freezes
         # the execution environment on return, killing daemon threads before
