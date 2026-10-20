@@ -20,6 +20,7 @@ COPY server.js ./
 COPY auth.js ./
 COPY media-bridge.js ./
 COPY session-auth.js ./
+COPY session-guard.js ./
 COPY logger.js ./
 
 ENV AWS_DEFAULT_REGION=us-east-1

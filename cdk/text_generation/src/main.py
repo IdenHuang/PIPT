@@ -1,6 +1,7 @@
 # Force CodePipeline rebuild - cohere embed v4 region fix
 import os
 import json
+import time
 import boto3
 import logging
 import psycopg
@@ -10,6 +11,7 @@ from helpers.cohere_embeddings import CohereBedrockEmbeddings
 
 from helpers.chat import get_bedrock_llm, get_initial_student_query, get_student_query, set_stream_callback_url, get_default_system_prompt
 from helpers.seed_prompt import seed_prompt
+from helpers.authz import AuthzDecision, authorize_request, playground_history_key
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +39,7 @@ BEDROCK_LLM_PARAM = os.environ["BEDROCK_LLM_PARAM"]
 EMBEDDING_MODEL_PARAM = os.environ["EMBEDDING_MODEL_PARAM"]
 TABLE_NAME_PARAM = os.environ["TABLE_NAME_PARAM"]
 APPSYNC_GRAPHQL_URL = os.environ.get("APPSYNC_GRAPHQL_URL", "")
+STREAM_CALLBACK_URL_PARAM = os.environ.get("STREAM_CALLBACK_URL_PARAM", "")
 
 # AWS Clients
 secrets_manager_client = boto3.client("secretsmanager")
@@ -57,9 +60,14 @@ bedrock_embedding_client = boto3.client(
 # Cached resources
 connection = None
 db_secret = None
+db_secret_loaded_at = 0.0
+# The app_rw password in SM_DB_CREDENTIALS is rotated by the db_setup Lambda on
+# every deploy, so the cached secret is re-read periodically and on auth failure.
+DB_SECRET_TTL_SECONDS = 300
 BEDROCK_LLM_ID = None
 EMBEDDING_MODEL_ID = None
 TABLE_NAME = None
+STREAM_CALLBACK_URL = None
 
 # Cached embeddings instance
 embeddings = None
@@ -69,12 +77,19 @@ DEFAULT_SYSTEM_PROMPT = get_default_system_prompt("{patient_name}")
 
 DEFAULT_PERSONA_PROMPT = """You are a patient visiting a pharmacy. Use ONLY the information provided in your uploaded case documents to describe your symptoms, medical history, and concerns. Do not invent or fabricate any symptoms, medications, diagnoses, or history beyond what is in the documents. If asked about something not covered in the documents, respond as a patient who genuinely does not know or has not experienced that issue."""
 
-def get_secret(secret_name, expect_json=True):
-    global db_secret
-    if db_secret is None:
+def get_secret(secret_name, expect_json=True, force_refresh=False):
+    """Return the DB secret, cached for DB_SECRET_TTL_SECONDS.
+
+    force_refresh=True re-reads it immediately (used after an authentication
+    failure, i.e. the password was rotated since it was cached).
+    """
+    global db_secret, db_secret_loaded_at
+    expired = (time.monotonic() - db_secret_loaded_at) > DB_SECRET_TTL_SECONDS
+    if db_secret is None or force_refresh or expired:
         try:
             response = secrets_manager_client.get_secret_value(SecretId=secret_name)["SecretString"]
             db_secret = json.loads(response) if expect_json else response
+            db_secret_loaded_at = time.monotonic()
         except json.JSONDecodeError as e:
             logger.error(f"Failed to decode JSON for secret {secret_name}: {e}")
             raise ValueError(f"Secret {secret_name} is not properly formatted as JSON.")
@@ -96,6 +111,26 @@ def get_parameter(param_name, cached_var):
             logger.error(f"Error fetching parameter {param_name}: {e}")
             raise
     return cached_var
+
+def get_stream_callback_url():
+    """
+    Return the trusted socket server callback base URL from SSM, or None.
+
+    The URL is deliberately sourced from deployment config rather than the
+    request: the callback carries the x-callback-token secret, so a
+    caller-chosen URL would leak it (and give blind SSRF from the VPC).
+    Only successful lookups are cached, so a missing parameter (e.g. API stack
+    deployed before EcsSocket) is retried on the next invocation. Returning
+    None makes publish_to_appsync fall back to the AppSync path.
+    """
+    global STREAM_CALLBACK_URL
+    if STREAM_CALLBACK_URL is None and STREAM_CALLBACK_URL_PARAM:
+        try:
+            response = ssm_client.get_parameter(Name=STREAM_CALLBACK_URL_PARAM)
+            STREAM_CALLBACK_URL = response["Parameter"]["Value"].rstrip("/") or None
+        except Exception as e:
+            logger.error(f"Error fetching stream callback URL parameter {STREAM_CALLBACK_URL_PARAM}: {e}")
+    return STREAM_CALLBACK_URL
 
 def initialize_constants():
     global BEDROCK_LLM_ID, EMBEDDING_MODEL_ID, TABLE_NAME, embeddings
@@ -129,19 +164,71 @@ def _open_connection():
     database (or RDS proxy) eventually terminated that idle-in-transaction
     session, and the next reuse failed with "the connection is lost".
     autocommit=True means no open transaction lingers between invocations.
+
+    On an authentication failure (app_rw password rotated by db_setup since
+    the secret was cached) the secret is re-read and the connect retried once.
     """
-    secret = get_secret(DB_SECRET_NAME)
-    conn = psycopg.connect(
-        host=RDS_PROXY_ENDPOINT,
-        port=secret["port"],
-        dbname=secret["dbname"],
-        user=secret["username"],
-        password=secret["password"],
-        autocommit=True,
-        sslmode="require",
-    )
+    def _connect(secret):
+        return psycopg.connect(
+            host=RDS_PROXY_ENDPOINT,
+            port=secret["port"],
+            dbname=secret["dbname"],
+            user=secret["username"],
+            password=secret["password"],
+            autocommit=True,
+            sslmode="require",
+        )
+
+    try:
+        conn = _connect(get_secret(DB_SECRET_NAME))
+    except psycopg.OperationalError as e:
+        if not _is_auth_error(e):
+            raise
+        logger.warning("DB authentication failed; re-reading rotated credentials and retrying once")
+        conn = _connect(get_secret(DB_SECRET_NAME, force_refresh=True))
     logger.info("Connected to the database!")
     return conn
+
+
+def _is_auth_error(error):
+    """True for a wrong/rotated password (SQLSTATE 28P01/28000, or RDS Proxy's message)."""
+    if getattr(error, "sqlstate", None) in ("28P01", "28000"):
+        return True
+    msg = str(error).lower()
+    return "password" in msg and ("authentication failed" in msg or "wrong" in msg)
+
+
+def _vectorstore_config(persona_id, force_refresh=False):
+    """PGVector connection settings for a persona's collection."""
+    secret = get_secret(DB_SECRET_NAME, force_refresh=force_refresh)
+    return {
+        'collection_name': persona_id,
+        'dbname': secret["dbname"],
+        'user': secret["username"],
+        'password': secret["password"],
+        'host': RDS_PROXY_ENDPOINT,
+        'port': secret["port"],
+    }
+
+
+def _get_history_aware_retriever(llm, persona_id):
+    """Build the RAG retriever, retrying once with a freshly read DB secret.
+
+    PGVector opens its own connection, so a rotated app_rw password surfaces
+    here rather than in connect_to_db(); the retry picks up the new password.
+    """
+    from helpers.vectorstore import get_vectorstore_retriever
+    try:
+        return get_vectorstore_retriever(
+            llm=llm, vectorstore_config_dict=_vectorstore_config(persona_id), embeddings=embeddings
+        )
+    except Exception as e:
+        logger.warning(f"Vector store setup failed; retrying with refreshed DB credentials: {type(e).__name__}")
+        return get_vectorstore_retriever(
+            llm=llm,
+            vectorstore_config_dict=_vectorstore_config(persona_id, force_refresh=True),
+            embeddings=embeddings,
+        )
 
 
 def _connection_is_alive(conn):
@@ -207,6 +294,27 @@ def _safe_cleanup_after_error(cur):
             except Exception:
                 pass
         connection = None
+
+
+def _authorize(mode, caller_email, session_id, persona_id, simulation_group_id):
+    """Run the authorization policy in helpers/authz.py; fail closed on DB errors."""
+    cur = None
+    try:
+        cur = connect_to_db().cursor()
+        decision = authorize_request(
+            cur,
+            mode=mode,
+            email=caller_email,
+            session_id=session_id,
+            persona_id=persona_id,
+            simulation_group_id=simulation_group_id,
+        )
+        cur.close()
+        return decision
+    except Exception as e:
+        logger.error(f"Authorization check failed: {e}")
+        _safe_cleanup_after_error(cur)
+        return AuthzDecision(False, 500, "Authorization check failed")
 
 
 def get_system_prompt(simulation_group_id):
@@ -290,33 +398,28 @@ def get_persona_details(persona_id):
 
 def handler(event, context):
     # Version: 2024-01-15-empathy-fix-v2 - Force new deployment
+    # Never log the raw event or headers: they carry the caller's Cognito JWT
+    # (Authorization) and the request body (student messages).
     logger.info("🚀 STREAMING FUNCTION STARTED - Text Generation Lambda function is called!")
-    logger.info(f"� Event headers: {event.get('headers', {})}")
-    logger.info(f"🔍 FULL EVENT: {json.dumps(event, default=str)}")
     initialize_constants()
-    
+
     # TODO(refactor): Extract auth token extraction and JWT parsing into a helper function
     # Extract the user's Cognito token from the API Gateway event
-    auth_token = None
-    if 'headers' in event:
-        headers = event['headers']
-        auth_token = headers.get('Authorization') or headers.get('authorization')
-        logger.info(f"🔍 Found headers: {list(headers.keys())}")
-    
+    from helpers.chat import get_cognito_token
+    # Clear any token left over from a previous warm invocation so a request
+    # without one can never publish with another user's token.
+    get_cognito_token.current_token = None
+    headers = event.get('headers') or {}
+    auth_token = headers.get('Authorization') or headers.get('authorization')
+
     if auth_token:
-        logger.info(f"🎫 Raw auth token: {auth_token[:30]}...")
         # Extract JWT token from Bearer format if present
-        if auth_token.startswith('Bearer '):
-            jwt_token = auth_token[7:]  # Remove 'Bearer ' prefix
-        else:
-            jwt_token = auth_token
-        
+        jwt_token = auth_token[7:] if auth_token.startswith('Bearer ') else auth_token
         # Store the JWT token for AppSync authentication
-        from helpers.chat import get_cognito_token
         get_cognito_token.current_token = f"Bearer {jwt_token}"
-        logger.info(f"✅ Cognito JWT token extracted and stored: Bearer {jwt_token[:20]}...")
+        logger.info("Cognito JWT present for AppSync authentication")
     else:
-        logger.warning(f"❌ No Authorization header found. Available headers: {list(headers.keys()) if 'headers' in locals() else 'No headers'}")
+        logger.warning("No Authorization header found")
 
     # TODO(refactor): Extract parameter extraction and validation into a helper function
     query_params = event.get("queryStringParameters", {})
@@ -325,11 +428,12 @@ def handler(event, context):
     persona_id = query_params.get("patient_id", "")
     student_user_id = event.get('requestContext', {}).get('authorizer', {}).get('userId', '')
 
-    # When the ECS socket server calls us, it passes its own URL so we can
-    # POST streaming chunks there instead of going through AppSync.
-    stream_callback_url = query_params.get("stream_callback_url", "")
-    logger.info(f"🔗 stream_callback_url received: '{stream_callback_url}' | All query params: {list(query_params.keys())}")
-    set_stream_callback_url(stream_callback_url or None)
+    # When the ECS socket server calls us with stream=true, POST streaming
+    # chunks to its /stream-callback route instead of going through AppSync.
+    # The destination always comes from SSM config; any caller-supplied
+    # stream_callback_url query parameter is intentionally ignored.
+    wants_socket_stream = query_params.get("stream", "false").lower() == "true"
+    set_stream_callback_url(get_stream_callback_url() if wants_socket_stream else None)
 
     if not simulation_group_id or not session_id or not persona_id:
         return {
@@ -348,8 +452,35 @@ def handler(event, context):
     # =========================================================================
     # TODO(refactor): Extract mode branching into a helper function that dispatches to mode-specific handlers
     mode = query_params.get("mode", "chat")
+    # TODO(refactor): Extract mode branching into a helper function that dispatches to mode-specific handlers
+    mode = query_params.get("mode", "chat")
 
-    # TODO(refactor): Extract CORS header construction into a helper function to eliminate repetition
+    # =========================================================================
+    # AUTHORIZATION — the API Gateway authorizer only authenticates the JWT.
+    # Verify the caller may act on this session/persona/group before any mode
+    # reads history, writes messages/debriefs, or publishes stream events.
+    # =========================================================================
+    caller_email = event.get('requestContext', {}).get('authorizer', {}).get('email', '')
+    decision = _authorize(mode, caller_email, session_id, persona_id, simulation_group_id)
+    if not decision.allowed:
+        logger.warning(
+            f"Authorization denied: mode={mode} status={decision.status_code} "
+            f"reason={decision.reason} session={session_id} user={student_user_id}"
+        )
+        return {
+            'statusCode': decision.status_code,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Origin": _get_cors_origin(event),
+                "Access-Control-Allow-Methods": "*",
+            },
+            'body': json.dumps({"error": decision.reason}),
+        }
+    if mode == "test_system_prompt":
+        # Bind playground history to the caller. The client ID is only a suffix,
+        # so another instructor replaying it lands on a different DynamoDB key.
+        session_id = playground_history_key(caller_email, session_id)
     if mode == "debrief":
         # TODO(refactor): Extract debrief mode handling into a helper function
         logger.info(f"📋 DEBRIEF MODE — generating debrief for session={session_id}")
@@ -521,7 +652,6 @@ def handler(event, context):
 
     if mode == "test_system_prompt":
         logger.info(f"🧪 TEST SYSTEM PROMPT MODE — chat with custom system prompt for persona={persona_id}")
-        from helpers.vectorstore import get_vectorstore_retriever
         from helpers.chat import get_response
         try:
             body = json.loads(event.get("body") or "{}")
@@ -558,21 +688,7 @@ def handler(event, context):
 
             llm = get_bedrock_llm(bedrock_llm_id=BEDROCK_LLM_ID, streaming=False)
 
-            db_secret = get_secret(DB_SECRET_NAME)
-            vectorstore_config_dict = {
-                'collection_name': persona_id,
-                'dbname': db_secret["dbname"],
-                'user': db_secret["username"],
-                'password': db_secret["password"],
-                'host': RDS_PROXY_ENDPOINT,
-                'port': db_secret["port"]
-            }
-
-            history_aware_retriever = get_vectorstore_retriever(
-                llm=llm,
-                vectorstore_config_dict=vectorstore_config_dict,
-                embeddings=embeddings
-            )
+            history_aware_retriever = _get_history_aware_retriever(llm, persona_id)
 
             response = get_response(
                 query=student_query,
@@ -625,7 +741,6 @@ def handler(event, context):
     # =========================================================================
 
     # Lazy imports for chat mode
-    from helpers.vectorstore import get_vectorstore_retriever
     from helpers.chat import get_response, cache_key_questions, fetch_org_thresholds
 
     # Fetch org-level thresholds once per request for key question matching
@@ -663,9 +778,7 @@ def handler(event, context):
     body = {} if event.get("body") is None else json.loads(event.get("body"))
     question = body.get("message_content", "")
     
-    logger.info(f"🔍 RAW BODY: {event.get('body')}")
-    logger.info(f"🔍 PARSED BODY: {body}")
-    logger.info(f"🔍 QUESTION: '{question}'")
+    logger.info(f"Received message ({len(question)} chars)")
 
     if not question:
         logger.info(f"Start of conversation. Creating conversation history table in DynamoDB.")
@@ -751,39 +864,9 @@ def handler(event, context):
             'body': json.dumps('Error getting LLM from Bedrock')
         }
 
-    # TODO(refactor): Extract vectorstore config assembly into a helper function
-    try:
-        logger.info("Retrieving vectorstore config.")
-        db_secret = get_secret(DB_SECRET_NAME)
-        vectorstore_config_dict = {
-            'collection_name': persona_id,
-            'dbname': db_secret["dbname"],
-            'user': db_secret["username"],
-            'password': db_secret["password"],
-            'host': RDS_PROXY_ENDPOINT,
-            'port': db_secret["port"]
-        }
-    except Exception as e:
-        logger.error(f"Error retrieving vectorstore config: {e}")
-        return {
-            'statusCode': 500,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Headers": "*",
-                "Access-Control-Allow-Origin": _get_cors_origin(event),
-                "Access-Control-Allow-Methods": "*",
-            },
-            'body': json.dumps('Error retrieving vectorstore config')
-        }
-
     try:
         logger.info("Creating history-aware retriever.")
-
-        history_aware_retriever = get_vectorstore_retriever(
-            llm=llm,
-            vectorstore_config_dict=vectorstore_config_dict,
-            embeddings=embeddings
-        )
+        history_aware_retriever = _get_history_aware_retriever(llm, persona_id)
     except Exception as e:
         logger.error(f"Error creating history-aware retriever: {e}")
         return {

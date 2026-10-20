@@ -26,8 +26,10 @@ DEFAULT_MATCH_THRESHOLD = 0.55
 _MODERATE_TIER_OFFSET = 0.10
 _LOW_TIER_OFFSET = 0.25
 
-# Stream callback URL — when set, publish_stream_event() POSTs chunks here
-# instead of AppSync. Set by main.py from the stream_callback_url query param.
+# Stream callback URL — when set, publish_to_appsync() POSTs chunks here
+# instead of AppSync. Set by main.py per request from the SSM-configured
+# socket server URL. Never set this from request input: the POST carries
+# the x-callback-token secret.
 _stream_callback_url: str | None = None
 
 def set_stream_callback_url(url: str | None):
@@ -605,7 +607,7 @@ def get_cognito_token():
     """Get the current user's Cognito JWT token from the Lambda event context."""
     token = getattr(get_cognito_token, 'current_token', None)
     if token:
-        logger.info(f"✅ Found Cognito JWT token: {token[:20]}...")
+        logger.info("✅ Found Cognito JWT token")
         return token
     else:
         logger.error("❌ No Cognito token available in context")
@@ -614,8 +616,9 @@ def get_cognito_token():
 def publish_to_appsync(session_id: str, data: dict):
     """Publish a streaming event to the frontend.
 
-    When a stream callback URL is configured (ECS Socket.IO server), POST the
-    event there — this is a fast, VPC-internal call with no auth overhead.
+    When a stream callback URL is configured (ECS Socket.IO server, from SSM),
+    POST the event there — a fast, VPC-internal call authenticated with the
+    shared x-callback-token header.
     Otherwise fall back to the legacy AppSync GraphQL mutation path.
     """
     import requests
@@ -2452,10 +2455,14 @@ def match_message_to_questions(
             db_matches = [{k: v for k, v in m.items() if k != "matched_intent"} for m in matches]
             conn = _get_db_connection()
             cursor = conn.cursor()
+            # Scope to the session so a caller authorized for one chat can't
+            # overwrite matches on a message in another chat by message_id.
             cursor.execute(
-                'UPDATE "messages" SET matched_question_ids = %s WHERE message_id = %s',
-                (json.dumps(db_matches), message_id),
+                'UPDATE "messages" SET matched_question_ids = %s WHERE message_id = %s AND chat_id = %s',
+                (json.dumps(db_matches), message_id, session_id),
             )
+            if cursor.rowcount == 0:
+                logger.warning(f"No message updated: message_id={message_id} not in session={session_id}")
             conn.commit()
             cursor.close()
             conn.close()

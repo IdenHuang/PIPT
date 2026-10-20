@@ -161,33 +161,66 @@ def get_file_metadata_from_db(persona_id, file_name, file_type):
         connection.rollback()
         return None, None, None
 
-def verify_enrollment(user_email, simulation_group_id):
-    """Verify the requesting user is enrolled in the simulation group or is an admin/instructor."""
+def get_file_access(user_email, simulation_group_id, persona_id):
+    """
+    Decide whether the caller may list this persona's files, and whether they
+    see them as staff (answer keys included) or as a student.
+
+    Mirrors cdk/lambda/lib/authz.js:
+      - staff  = admin role, or instructor OF THIS GROUP (creator, group_instructors,
+                 or an 'instructor' enrollment) — same rule as verifyGroupOwnership.
+                 A global 'instructor' role alone is not enough.
+      - student = any enrollment in this group.
+    The persona must belong to the group, so a caller cannot pair a group they
+    can access with another group's persona_id.
+
+    Returns {"is_staff": bool} when allowed, or None to deny. Fails closed.
+    """
+    if not user_email:
+        return None
     conn = connect_to_db()
     cur = conn.cursor()
     try:
         cur.execute(
-            """SELECT u.roles FROM "users" u
-               WHERE u.user_email = %s
-               AND (
-                 'admin' = ANY(u.roles)
-                 OR 'instructor' = ANY(u.roles)
-                 OR EXISTS (
-                   SELECT 1 FROM "enrollments" e
-                   WHERE e.user_id = u.user_id AND e.simulation_group_id = %s
-                 )
-               )""",
-            (user_email, simulation_group_id)
+            """SELECT
+                 'admin' = ANY(u.roles) AS is_admin,
+                 (
+                   EXISTS (SELECT 1 FROM "simulation_groups" sg
+                           WHERE sg.simulation_group_id = %s AND sg.created_by = u.user_id)
+                   OR EXISTS (SELECT 1 FROM "group_instructors" gi
+                              WHERE gi.simulation_group_id = %s AND gi.user_id = u.user_id)
+                   OR EXISTS (SELECT 1 FROM "enrollments" e
+                              WHERE e.simulation_group_id = %s AND e.user_id = u.user_id
+                                AND e.enrollment_type = 'instructor')
+                 ) AS is_group_instructor,
+                 EXISTS (SELECT 1 FROM "enrollments" e
+                         WHERE e.simulation_group_id = %s AND e.user_id = u.user_id) AS is_enrolled,
+                 EXISTS (SELECT 1 FROM "personas" p
+                         WHERE p.persona_id = %s AND p.simulation_group_id = %s) AS persona_in_group
+               FROM "users" u
+               WHERE u.user_email = %s""",
+            (
+                simulation_group_id, simulation_group_id, simulation_group_id,
+                simulation_group_id, persona_id, simulation_group_id, user_email,
+            ),
         )
-        result = cur.fetchone()
+        row = cur.fetchone()
         cur.close()
-        if result is None:
-            return None
-        return result[0]  # Return the roles array
     except Exception as e:
         cur.close()
-        logger.error(f"Error verifying enrollment: {e}")
+        conn.rollback()
+        logger.error(f"Error verifying file access: {e}")
         return None
+
+    if row is None:
+        return None
+    is_admin, is_group_instructor, is_enrolled, persona_in_group = (bool(v) for v in row)
+    if not persona_in_group:
+        return None
+    is_staff = is_admin or is_group_instructor
+    if not (is_staff or is_enrolled):
+        return None
+    return {"is_staff": is_staff}
 
 
 @logger.inject_lambda_context
@@ -211,21 +244,22 @@ def lambda_handler(event, context):
             'body': json.dumps('Missing required parameters: simulation_group_id or persona_id')
         }
 
-    # Verify enrollment/authorization
-    user_roles = verify_enrollment(user_email, simulation_group_id)
-    if user_roles is None:
+    # Verify the caller may access this group's persona (see get_file_access)
+    access = get_file_access(user_email, simulation_group_id, persona_id)
+    if access is None:
         logger.warning("Unauthorized access attempt to getFiles", extra={
             "user_email": user_email,
-            "simulation_group_id": simulation_group_id
+            "simulation_group_id": simulation_group_id,
+            "persona_id": persona_id,
         })
         return {
             'statusCode': 403,
             "headers": get_cors_headers(event),
-            'body': json.dumps('Forbidden: You are not enrolled in this simulation group')
+            'body': json.dumps('Forbidden: You do not have access to this simulation group')
         }
 
-    # Determine if caller is a student (not admin or instructor)
-    is_student = 'admin' not in user_roles and 'instructor' not in user_roles
+    # Answer keys are only returned to admins and instructors of this group
+    is_student = not access["is_staff"]
 
     try:
         document_prefix = f"{simulation_group_id}/{persona_id}/documents/"

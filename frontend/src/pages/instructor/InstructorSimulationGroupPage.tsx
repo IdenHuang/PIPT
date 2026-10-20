@@ -132,18 +132,21 @@ function InstructorSimulationGroupPage() {
 
   // ── Load question bank data ──
   useEffect(() => {
-    if (activeSection !== 'questionBank') return;
+    // Wait for the group so the list is fetched once, already scoped to its organization.
+    if (activeSection !== 'questionBank' || !simulationGroup) return;
     (async () => {
       try {
         setQuestionBankLoading(true); setQuestionBankError(null);
-        const questions = await instructorService.getGlobalQuestionBank();
+        // Narrow to this group's organization so only attachable questions are listed;
+        // org-less groups fall back to every organization the caller belongs to.
+        const questions = await instructorService.getGlobalQuestionBank(simulationGroup.organization_id || undefined);
         setGlobalBankQuestions(questions.filter(q => !q.tags?.includes('patient_specific')));
         setPatientSpecificBankQuestions(questions.filter(q => q.tags?.includes('patient_specific')));
       } catch (err) {
         setQuestionBankError(err instanceof Error ? err.message : 'Failed to load question bank');
       } finally { setQuestionBankLoading(false); }
     })();
-  }, [activeSection]);
+  }, [activeSection, simulationGroup?.simulation_group_id, simulationGroup?.organization_id]);
 
   // ── Load assigned questions ──
   useEffect(() => {
@@ -516,7 +519,7 @@ function InstructorSimulationGroupPage() {
         evaluation_criteria: question.evaluationCriteria,
         is_mandatory: question.required,
       });
-      const questions = await instructorService.getGlobalQuestionBank();
+      const questions = await instructorService.getGlobalQuestionBank(orgId);
       setGlobalBankQuestions(questions.filter(q => !q.tags?.includes('patient_specific')));
       showNotification({ message: 'Question added to bank successfully.', type: 'success' });
     } catch (error) {

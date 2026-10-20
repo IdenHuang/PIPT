@@ -242,4 +242,51 @@ async function verifySessionOwnership(sessionId, userEmail) {
   }
 }
 
-module.exports = { verifySessionOwnership, getDbConnection, refreshDbConnection, runWithAuthRetry };
+/**
+ * Verify that the authenticated user owns the chat AND that the chat belongs to
+ * the given persona and simulation group (mirror of authz.js verifySessionScope).
+ * Binding all three IDs stops a caller pairing their own session with another
+ * group's persona, whose prompts and context would otherwise be loaded.
+ *
+ * @param {string} sessionId - The chat_id
+ * @param {string} personaId - The persona_id the chat must belong to
+ * @param {string} simulationGroupId - The simulation_group_id the chat must belong to
+ * @param {string} userEmail - The authenticated user's email
+ * @returns {Promise<{authorized: boolean}>}
+ */
+async function verifySessionScope(sessionId, personaId, simulationGroupId, userEmail) {
+  const runQuery = (sql) => sql`
+    SELECT 1
+    FROM chats c
+    JOIN student_interactions si ON si.student_interaction_id = c.student_interaction_id
+    JOIN enrollments e ON e.enrollment_id = si.enrollment_id
+    JOIN users u ON u.user_id = e.user_id
+    WHERE c.chat_id = ${sessionId}
+      AND si.persona_id = ${personaId}
+      AND e.simulation_group_id = ${simulationGroupId}
+      AND u.user_email = ${userEmail};
+  `;
+
+  try {
+    const result = await runWithAuthRetry(runQuery, "session scope check");
+    return { authorized: result.length > 0 };
+  } catch (error) {
+    logger.error("Session scope verification error", {
+      component: "session-auth",
+      operation: "verifySessionScope",
+      sessionId,
+      authErrorAfterRetry: isAuthError(error),
+      errorCode: error.code || error.routine,
+      error: error.message,
+    });
+    return { authorized: false };
+  }
+}
+
+module.exports = {
+  verifySessionOwnership,
+  verifySessionScope,
+  getDbConnection,
+  refreshDbConnection,
+  runWithAuthRetry,
+};

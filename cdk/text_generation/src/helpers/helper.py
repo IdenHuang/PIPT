@@ -38,11 +38,15 @@ def get_vectorstore(
         )
 
         logger.info("Initializing the VectorStore")
+        # create_extension=False: the vector extension is created by the db_setup
+        # baseline migration, and this Lambda connects as the least-privilege
+        # app_rw user, which should not issue DDL.
         vectorstore = PGVector(
             embeddings=embeddings,
             collection_name=collection_name,
             connection=connection_string,
-            use_jsonb=True
+            use_jsonb=True,
+            create_extension=False,
         )
 
         logger.info("VectorStore initialized")

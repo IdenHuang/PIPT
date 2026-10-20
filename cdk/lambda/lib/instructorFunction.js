@@ -2,7 +2,8 @@ const fs = require("fs");
 const path = require("path");
 const { initializeConnection } = require("./lib.js");
 const { getCorsHeaders } = require("./cors.js");
-const { verifyGroupOwnership, verifyPersonaOwnership, isAdmin } = require("./authz.js");
+const { authorizeInstructorRequest } = require("./instructorRoutePolicy.js");
+const { verifyBankItemsInGroupOrganization, verifyQuestionsAttachableToGroup } = require("./authz.js");
 const { validateTagsField, normalizeCreateFields } = require("./questionBankFields.js");
 const {
   BANK_DESCRIPTORS,
@@ -73,6 +74,33 @@ exports.handler = async (event, context) => {
     };
   }
 
+  // --- Object-level authorization: caller must own the targeted group/persona/org ---
+  // Every route is listed in instructorRoutePolicy.js; unlisted routes are rejected.
+  // `authorizedScope` carries the parent IDs that were checked so handlers that act
+  // on child records by primary key can bind their SQL to that parent.
+  const pathData = event.httpMethod + " " + event.resource;
+  const authzResult = await authorizeInstructorRequest({
+    sqlConnection,
+    routeKey: pathData,
+    queryStringParameters: event.queryStringParameters,
+    body: event.body,
+    userEmail: userEmailAttribute,
+    isAdmin: userRoles.includes("admin"),
+  });
+  if (!authzResult.allowed) {
+    logger.warn("Object-level authorization denied", {
+      route: pathData,
+      statusCode: authzResult.statusCode,
+      userEmailAttribute,
+    });
+    return {
+      statusCode: authzResult.statusCode,
+      headers: getCorsHeaders(event),
+      body: JSON.stringify({ error: authzResult.error }),
+    };
+  }
+  const authorizedScope = authzResult.scope;
+
   function generateAccessCode() {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let code = "";
@@ -83,7 +111,6 @@ exports.handler = async (event, context) => {
   }
 
   try {
-    const pathData = event.httpMethod + " " + event.resource;
     switch (pathData) {
       case "GET /instructor/student_group":
         {
@@ -724,17 +751,6 @@ exports.handler = async (event, context) => {
             const instructor_email = userEmailAttribute || event.queryStringParameters.instructor_email;
             const { prompt } = JSON.parse(event.body);
 
-            // Authorization: verify group ownership (admin bypasses)
-            if (!userRoles.includes("admin")) {
-              const groupAuthz = await verifyGroupOwnership(sqlConnection, simulation_group_id, userEmailAttribute);
-              if (!groupAuthz.authorized) {
-                logger.warn("Forbidden: instructor does not own group", { simulation_group_id, userEmailAttribute });
-                response.statusCode = 403;
-                response.body = JSON.stringify({ error: "Forbidden: you do not own this resource" });
-                break;
-              }
-            }
-
             // Retrieve the current system prompt
             const currentPromptResult = await sqlConnection`
               SELECT system_prompt
@@ -966,17 +982,6 @@ exports.handler = async (event, context) => {
           const personaId = event.queryStringParameters.persona_id;
 
           try {
-            // Authorization: verify persona ownership (admin bypasses)
-            if (!userRoles.includes("admin")) {
-              const personaAuthz = await verifyPersonaOwnership(sqlConnection, personaId, userEmailAttribute);
-              if (!personaAuthz.authorized) {
-                logger.warn("Forbidden: instructor does not own persona", { personaId, userEmailAttribute });
-                response.statusCode = 403;
-                response.body = JSON.stringify({ error: "Forbidden: you do not own this resource" });
-                break;
-              }
-            }
-
             // Delete the patient from the patients table
             await sqlConnection`
                     DELETE FROM "personas"
@@ -1349,17 +1354,6 @@ exports.handler = async (event, context) => {
             event.queryStringParameters.simulation_group_id;
 
           try {
-            // Authorization: verify group ownership (admin bypasses)
-            if (!userRoles.includes("admin")) {
-              const groupAuthz = await verifyGroupOwnership(sqlConnection, simulationGroupId, userEmailAttribute);
-              if (!groupAuthz.authorized) {
-                logger.warn("Forbidden: instructor does not own group", { simulationGroupId, userEmailAttribute });
-                response.statusCode = 403;
-                response.body = JSON.stringify({ error: "Forbidden: you do not own this resource" });
-                break;
-              }
-            }
-
             // Query to get the access code
             const accessCode = await sqlConnection`
               SELECT group_access_code
@@ -1573,11 +1567,17 @@ exports.handler = async (event, context) => {
           event.queryStringParameters.student_interaction_id
         ) {
           const { student_interaction_id } = event.queryStringParameters;
+          // Group the interaction was resolved to and authorized against (instructorRoutePolicy.js)
+          const interactionGroupId = authorizedScope.simulationGroupId;
 
           try {
-            // Get the current completion status
+            // Get the current completion status (bound to the authorized group)
             const result = await sqlConnection`
-              SELECT is_completed FROM "student_interactions" WHERE student_interaction_id = ${student_interaction_id};
+              SELECT is_completed FROM "student_interactions"
+              WHERE student_interaction_id = ${student_interaction_id}
+                AND enrollment_id IN (
+                  SELECT enrollment_id FROM "enrollments" WHERE simulation_group_id = ${interactionGroupId}
+                );
             `;
 
             if (result.length > 0) {
@@ -1587,7 +1587,10 @@ exports.handler = async (event, context) => {
               await sqlConnection`
                 UPDATE "student_interactions"
                 SET is_completed = ${newStatus}
-                WHERE student_interaction_id = ${student_interaction_id};
+                WHERE student_interaction_id = ${student_interaction_id}
+                  AND enrollment_id IN (
+                    SELECT enrollment_id FROM "enrollments" WHERE simulation_group_id = ${interactionGroupId}
+                  );
               `;
 
               response.statusCode = 200;
@@ -1836,9 +1839,52 @@ exports.handler = async (event, context) => {
         break;
       case "GET /instructor/question_bank":
         try {
-          const data = await sqlConnection`
-            SELECT * FROM "question_bank" ORDER BY created_at DESC;
-          `;
+          // Tenant-scoped read. instructorRoutePolicy.js has already verified
+          // membership of a supplied organization_id (authorizedScope.organizationId).
+          // Without one, list only organizations the caller belongs to, using the
+          // same membership rule as verifyOrganizationMembership; admins see all.
+          const requestedOrgId = authorizedScope.organizationId;
+          let data;
+          if (requestedOrgId) {
+            data = await sqlConnection`
+              SELECT * FROM "question_bank"
+              WHERE organization_id = ${requestedOrgId}
+              ORDER BY created_at DESC;
+            `;
+          } else if (userRoles.includes("admin")) {
+            data = await sqlConnection`
+              SELECT * FROM "question_bank" ORDER BY created_at DESC;
+            `;
+          } else {
+            data = await sqlConnection`
+              SELECT qb.* FROM "question_bank" qb
+              WHERE qb.organization_id IN (
+                SELECT u.organization_id FROM "users" u
+                WHERE u.user_email = ${userEmailAttribute}
+                  AND u.organization_id IS NOT NULL
+                UNION
+                SELECT sg.organization_id
+                FROM "simulation_groups" sg
+                JOIN "users" u ON u.user_email = ${userEmailAttribute}
+                WHERE sg.organization_id IS NOT NULL
+                  AND (
+                    sg.created_by = u.user_id
+                    OR EXISTS (
+                      SELECT 1 FROM "group_instructors" gi
+                      WHERE gi.simulation_group_id = sg.simulation_group_id
+                        AND gi.user_id = u.user_id
+                    )
+                    OR EXISTS (
+                      SELECT 1 FROM "enrollments" e
+                      WHERE e.simulation_group_id = sg.simulation_group_id
+                        AND e.user_id = u.user_id
+                        AND e.enrollment_type = 'instructor'
+                    )
+                  )
+              )
+              ORDER BY qb.created_at DESC;
+            `;
+          }
           response.statusCode = 200;
           response.body = JSON.stringify(data);
         } catch (err) {
@@ -1941,6 +1987,7 @@ exports.handler = async (event, context) => {
                 is_mandatory = COALESCE(${is_mandatory !== undefined ? is_mandatory : null}, is_mandatory),
                 tags = COALESCE(${tags !== undefined ? tags : null}, tags)
               WHERE question_id = ${question_id}
+                AND organization_id = ${authorizedScope.organizationId}
               RETURNING *;
             `;
 
@@ -2022,6 +2069,18 @@ exports.handler = async (event, context) => {
             break;
           }
 
+          // The question bank is org-scoped: every question must belong to this
+          // group's organization (or, for an org-less group, to an organization
+          // the caller belongs to), checked before any row is inserted.
+          const questionOrgCheck = await verifyQuestionsAttachableToGroup(
+            sqlConnection, questionIds, simulation_group_id, userEmailAttribute, userRoles.includes("admin")
+          );
+          if (!questionOrgCheck.authorized) {
+            response.statusCode = 403;
+            response.body = JSON.stringify({ error: "Forbidden: question is not in this group's organization" });
+            break;
+          }
+
           try {
             // Resolve the instructor's user_id for added_by
             const userResult = await sqlConnection`
@@ -2082,11 +2141,13 @@ exports.handler = async (event, context) => {
         ) {
           const { group_question_id } =
             event.queryStringParameters;
+          const assignmentGroupId = authorizedScope.simulationGroupId;
 
           try {
             const existing = await sqlConnection`
               SELECT group_question_id FROM "simulation_group_questions"
-              WHERE group_question_id = ${group_question_id};
+              WHERE group_question_id = ${group_question_id}
+                AND simulation_group_id = ${assignmentGroupId};
             `;
 
             if (existing.length === 0) {
@@ -2099,7 +2160,8 @@ exports.handler = async (event, context) => {
 
             await sqlConnection`
               DELETE FROM "simulation_group_questions"
-              WHERE group_question_id = ${group_question_id};
+              WHERE group_question_id = ${group_question_id}
+                AND simulation_group_id = ${assignmentGroupId};
             `;
 
             response.statusCode = 200;
@@ -2126,11 +2188,13 @@ exports.handler = async (event, context) => {
           const { group_question_id } =
             event.queryStringParameters;
           const body = event.body ? JSON.parse(event.body) : {};
+          const assignmentGroupId = authorizedScope.simulationGroupId;
 
           try {
             const existing = await sqlConnection`
               SELECT group_question_id FROM "simulation_group_questions"
-              WHERE group_question_id = ${group_question_id};
+              WHERE group_question_id = ${group_question_id}
+                AND simulation_group_id = ${assignmentGroupId};
             `;
 
             if (existing.length === 0) {
@@ -2148,6 +2212,7 @@ exports.handler = async (event, context) => {
                 max_score_override = COALESCE(${body.max_score_override ?? null}, max_score_override),
                 "order" = COALESCE(${body.order ?? null}, "order")
               WHERE group_question_id = ${group_question_id}
+                AND simulation_group_id = ${assignmentGroupId}
               RETURNING *;
             `;
 
@@ -2751,6 +2816,7 @@ exports.handler = async (event, context) => {
                 media_type = COALESCE(${media_type || null}, media_type),
                 url = COALESCE(${url || null}, url)
               WHERE media_id = ${media_id}
+                AND persona_id = ${authorizedScope.personaId}
               RETURNING *;
             `;
 
@@ -2782,6 +2848,7 @@ exports.handler = async (event, context) => {
             const deleted = await sqlConnection`
               DELETE FROM "persona_media"
               WHERE media_id = ${media_id}
+                AND persona_id = ${authorizedScope.personaId}
               RETURNING media_id;
             `;
 
@@ -2904,6 +2971,17 @@ exports.handler = async (event, context) => {
             break;
           }
 
+          // The DTP bank is org-scoped: every item must belong to this group's
+          // organization, checked before any row is inserted.
+          const dtpOrgCheck = await verifyBankItemsInGroupOrganization(
+            sqlConnection, "dtp", dtpIds, simulation_group_id
+          );
+          if (!dtpOrgCheck.authorized) {
+            response.statusCode = 403;
+            response.body = JSON.stringify({ error: "Forbidden: DTP is not in this group's organization" });
+            break;
+          }
+
           try {
             // Resolve the instructor's user_id for added_by
             const userResult = await sqlConnection`
@@ -3011,11 +3089,13 @@ exports.handler = async (event, context) => {
           event.queryStringParameters.group_dtp_id
         ) {
           const { group_dtp_id } = event.queryStringParameters;
+          const assignmentGroupId = authorizedScope.simulationGroupId;
 
           try {
             const existing = await sqlConnection`
               SELECT group_dtp_id FROM "simulation_group_dtps"
-              WHERE group_dtp_id = ${group_dtp_id};
+              WHERE group_dtp_id = ${group_dtp_id}
+                AND simulation_group_id = ${assignmentGroupId};
             `;
 
             if (existing.length === 0) {
@@ -3028,7 +3108,8 @@ exports.handler = async (event, context) => {
 
             await sqlConnection`
               DELETE FROM "simulation_group_dtps"
-              WHERE group_dtp_id = ${group_dtp_id};
+              WHERE group_dtp_id = ${group_dtp_id}
+                AND simulation_group_id = ${assignmentGroupId};
             `;
 
             response.statusCode = 200;
@@ -3109,6 +3190,17 @@ exports.handler = async (event, context) => {
           if (recIds.length === 0) {
             response.statusCode = 400;
             response.body = JSON.stringify({ error: "recommendation_id is required in request body" });
+            break;
+          }
+
+          // The recommendations bank is org-scoped: every item must belong to this
+          // group's organization, checked before any row is inserted.
+          const recOrgCheck = await verifyBankItemsInGroupOrganization(
+            sqlConnection, "recommendation", recIds, simulation_group_id
+          );
+          if (!recOrgCheck.authorized) {
+            response.statusCode = 403;
+            response.body = JSON.stringify({ error: "Forbidden: recommendation is not in this group's organization" });
             break;
           }
 
@@ -3219,11 +3311,13 @@ exports.handler = async (event, context) => {
           event.queryStringParameters.group_recommendation_id
         ) {
           const { group_recommendation_id } = event.queryStringParameters;
+          const assignmentGroupId = authorizedScope.simulationGroupId;
 
           try {
             const existing = await sqlConnection`
               SELECT group_recommendation_id FROM "simulation_group_recommendations"
-              WHERE group_recommendation_id = ${group_recommendation_id};
+              WHERE group_recommendation_id = ${group_recommendation_id}
+                AND simulation_group_id = ${assignmentGroupId};
             `;
 
             if (existing.length === 0) {
@@ -3236,7 +3330,8 @@ exports.handler = async (event, context) => {
 
             await sqlConnection`
               DELETE FROM "simulation_group_recommendations"
-              WHERE group_recommendation_id = ${group_recommendation_id};
+              WHERE group_recommendation_id = ${group_recommendation_id}
+                AND simulation_group_id = ${assignmentGroupId};
             `;
 
             response.statusCode = 200;
@@ -3384,6 +3479,7 @@ exports.handler = async (event, context) => {
                 tags = COALESCE(${tags !== undefined ? tags : null}, tags),
                 is_required = COALESCE(${is_required !== undefined ? is_required : null}, is_required)
               WHERE dtp_id = ${dtp_id}
+                AND organization_id = ${authorizedScope.organizationId}
               RETURNING *;
             `;
 
@@ -3531,6 +3627,7 @@ exports.handler = async (event, context) => {
                 rationale = COALESCE(${rationale !== undefined ? rationale : null}, rationale),
                 tags = COALESCE(${tags !== undefined ? tags : null}, tags)
               WHERE recommendation_id = ${recommendation_id}
+                AND organization_id = ${authorizedScope.organizationId}
               RETURNING *;
             `;
 

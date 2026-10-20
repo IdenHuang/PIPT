@@ -65,9 +65,9 @@ export interface UseInstructorQuestionBankReturn {
  * state, organization resolution, and the create/update calls. All derivations
  * delegate to the pure helpers in `@/lib/questionBankUtils` and `@/lib/bankUtils`.
  *
- * Reads are never scoped by organization — `GET instructor/question_bank` returns
- * every row the instructor may see. The resolved organization is a write-side
- * concern only: it is the `organization_id` a newly created item is filed under.
+ * `GET instructor/question_bank` is tenant-scoped on the server: it returns items
+ * from every organization the instructor belongs to (admins: all). The resolved
+ * organization is the `organization_id` a newly created item is filed under.
  */
 export function useInstructorQuestionBank(): UseInstructorQuestionBankReturn {
   // Loaded data

@@ -156,6 +156,25 @@ def verify_instructor_ownership(user_email, simulation_group_id):
         return False
 
 
+def persona_in_group(persona_id, simulation_group_id):
+    """True if the persona belongs to the simulation group. Fails closed."""
+    conn = connect_to_db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            'SELECT 1 FROM "personas" WHERE persona_id = %s AND simulation_group_id = %s',
+            (persona_id, simulation_group_id)
+        )
+        result = cur.fetchone()
+        cur.close()
+        return result is not None
+    except Exception as e:
+        cur.close()
+        conn.rollback()
+        logger.error(f"Error verifying persona/group binding: {e}")
+        return False
+
+
 @logger.inject_lambda_context
 def lambda_handler(event, context):
     # Extract user identity from authorizer context
@@ -193,6 +212,21 @@ def lambda_handler(event, context):
             'statusCode': 403,
             "headers": get_cors_headers(event),
             'body': json.dumps('Forbidden: You are not an instructor of this simulation group')
+        }
+
+    # The persona must belong to the verified group. persona_data rows are keyed
+    # by persona_id only, so without this an instructor of group A could pass a
+    # group-B persona_id and delete group B's file records.
+    if not persona_in_group(persona_id, simulation_group_id):
+        logger.warning("Persona does not belong to simulation group", extra={
+            "user_email": user_email,
+            "simulation_group_id": simulation_group_id,
+            "persona_id": persona_id,
+        })
+        return {
+            'statusCode': 403,
+            "headers": get_cors_headers(event),
+            'body': json.dumps('Forbidden: Patient does not belong to this simulation group')
         }
 
     # Validate file_name to prevent path traversal and special character issues

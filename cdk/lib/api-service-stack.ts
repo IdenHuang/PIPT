@@ -16,6 +16,7 @@ import {
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import { VpcStack } from "./vpc-stack";
 import { DatabaseStack } from "./database-stack";
+import { getSocketCallbackUrlSsmParam } from "./ecs-socket-stack";
 import { Fn } from "aws-cdk-lib";
 import { Asset } from "aws-cdk-lib/aws-s3-assets";
 import * as s3 from "aws-cdk-lib/aws-s3";
@@ -1478,7 +1479,8 @@ export class ApiServiceStack extends cdk.Stack {
         securityGroups: [apiLambdaSg],
         functionName: `${id}-TextGenLambdaDockerFunction`,
         environment: {
-          SM_DB_CREDENTIALS: db.secretPathAdminName,
+          // Least-privilege app_rw user (DML only), not the RDS master credential.
+          SM_DB_CREDENTIALS: db.secretPathUser.secretName,
           RDS_PROXY_ENDPOINT: db.rdsProxyEndpoint,
           REGION: this.region,
           BEDROCK_LLM_PARAM: bedrockLLMParameter.parameterName,
@@ -1489,6 +1491,9 @@ export class ApiServiceStack extends cdk.Stack {
           APPSYNC_API_ID: this.appSyncApi.apiId,
           EMBEDDING_STORAGE_BUCKET: embeddingStorageBucket.bucketName,
           SM_STREAM_CALLBACK_SECRET: this.streamCallbackSecret.secretName,
+          // Stream callback destination is read from SSM (written by EcsSocket),
+          // never from the request, so the callback token can't be redirected.
+          STREAM_CALLBACK_URL_PARAM: getSocketCallbackUrlSsmParam(stackPrefix),
           ALLOWED_ORIGINS: allowedOriginsEnv,
         },
       }
@@ -1547,17 +1552,13 @@ export class ApiServiceStack extends cdk.Stack {
     // Attach the custom Bedrock policy to Lambda function
     textGenLambdaDockerFunc.addToRolePolicy(bedrockPolicyStatement);
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: only the app_rw DB credential. The stream
+    // callback secret is granted above via streamCallbackSecret.grantRead().
     textGenLambdaDockerFunc.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathUser.secretArn],
       })
     );
 
@@ -1584,6 +1585,9 @@ export class ApiServiceStack extends cdk.Stack {
           bedrockLLMParameter.parameterArn,
           embeddingModelParameter.parameterArn,
           tableNameParameter.parameterArn,
+          // Parameter is owned by EcsSocket; referenced by name to avoid a
+          // dependency cycle (EcsSocket already depends on this stack).
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${getSocketCallbackUrlSsmParam(stackPrefix)}`,
         ],
       })
     );

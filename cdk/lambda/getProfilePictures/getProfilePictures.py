@@ -129,9 +129,46 @@ def generate_presigned_url(bucket, key):
         logger.exception(f"Error generating CloudFront signed URL for {key}: {e}")
         return None
 
+def has_group_access(user_email, simulation_group_id):
+    """
+    True if the caller is an admin, an instructor of this group (creator,
+    group_instructors, or 'instructor' enrollment — same rule as authz.js
+    verifyGroupOwnership), or enrolled in the group. Fails closed.
+    """
+    if not user_email:
+        return False
+    conn = connect_to_db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """SELECT 1 FROM "users" u
+               WHERE u.user_email = %s
+                 AND (
+                   'admin' = ANY(u.roles)
+                   OR EXISTS (SELECT 1 FROM "simulation_groups" sg
+                              WHERE sg.simulation_group_id = %s AND sg.created_by = u.user_id)
+                   OR EXISTS (SELECT 1 FROM "group_instructors" gi
+                              WHERE gi.simulation_group_id = %s AND gi.user_id = u.user_id)
+                   OR EXISTS (SELECT 1 FROM "enrollments" e
+                              WHERE e.simulation_group_id = %s AND e.user_id = u.user_id)
+                 )""",
+            (user_email, simulation_group_id, simulation_group_id, simulation_group_id),
+        )
+        allowed = cur.fetchone() is not None
+        cur.close()
+        return allowed
+    except Exception as e:
+        cur.close()
+        conn.rollback()
+        logger.error(f"Error verifying group access: {e}")
+        return False
+
+
 @logger.inject_lambda_context
 def lambda_handler(event, context):
-    query_params = event.get("queryStringParameters", {})
+    # Caller identity from the API Gateway authorizer context
+    user_email = (event.get("requestContext") or {}).get("authorizer", {}).get("email", "")
+    query_params = event.get("queryStringParameters") or {}
     simulation_group_id = query_params.get("simulation_group_id")
 
     if not simulation_group_id:
@@ -139,6 +176,17 @@ def lambda_handler(event, context):
             'statusCode': 400,
             "headers": get_cors_headers(event),
             'body': json.dumps("Missing required parameter: simulation_group_id"),
+        }
+
+    if not has_group_access(user_email, simulation_group_id):
+        logger.warning("Unauthorized access attempt to getProfilePictures", extra={
+            "user_email": user_email,
+            "simulation_group_id": simulation_group_id,
+        })
+        return {
+            'statusCode': 403,
+            "headers": get_cors_headers(event),
+            'body': json.dumps("Forbidden: You do not have access to this simulation group"),
         }
 
     # Get persona_ids from database
