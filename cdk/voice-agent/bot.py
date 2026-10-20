@@ -17,7 +17,7 @@ Flow:
 
 import logging
 from bedrock_agentcore import BedrockAgentCoreApp
-from nova_sonic import NovaSonic
+from nova_sonic import NovaSonic, require_session_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,14 +63,25 @@ async def websocket_handler(websocket, context):
             await websocket.close()
             return
 
+        # session_id is the sole conversation-history partition key. Reject a
+        # missing/invalid one instead of falling back to a shared key; the
+        # socket server has already verified the caller owns this chat.
+        try:
+            session_id = require_session_id(init_msg.get("session_id"))
+        except ValueError as e:
+            logger.warning("Rejected init message: %s", e)
+            await websocket.send_json({"type": "error", "text": str(e)})
+            await websocket.close()
+            return
+
         logger.info("Session init: session_id=%s, patient=%s",
-                     init_msg.get("session_id"), init_msg.get("patient_name"))
+                     session_id, init_msg.get("patient_name"))
 
         # 2. Create NovaSonic client with config from init message
         nova = NovaSonic(
             websocket=websocket,
             voice_id=init_msg.get("voice_id"),
-            session_id=init_msg.get("session_id", "default"),
+            session_id=session_id,
             patient_name=init_msg.get("patient_name", ""),
             patient_prompt=init_msg.get("patient_prompt", ""),
             patient_id=init_msg.get("patient_id", ""),
