@@ -195,7 +195,7 @@ export interface ManageablePatient {
   interaction_mode?: string;            // Interaction mode (interaction_mode in DB)
   llm_completion: boolean;              // Whether LLM evaluation is enabled (derived from settings)
   photo_url?: string;                   // Optional patient photo URL (stored separately or in media)
-  mode?: 'interview_practice' | 'full_assessment'; // Derived from DTP/Recommendation assignments
+  mode?: 'interview_practice' | 'full_assessment' | 'conversation_only'; // Derived from Key Questions/DTP/Recommendation assignments
 }
 
 /**

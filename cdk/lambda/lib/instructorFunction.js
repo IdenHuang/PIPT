@@ -925,7 +925,10 @@ exports.handler = async (event, context) => {
                         AND (sgd.persona_id = p.persona_id OR sgd.persona_id IS NULL)) AS has_dtps,
                       (SELECT COUNT(*) > 0 FROM simulation_group_recommendations sgr
                         WHERE sgr.simulation_group_id = ${simulation_group_id}
-                        AND (sgr.persona_id = p.persona_id OR sgr.persona_id IS NULL)) AS has_recommendations
+                        AND (sgr.persona_id = p.persona_id OR sgr.persona_id IS NULL)) AS has_recommendations,
+                      (SELECT COUNT(*) > 0 FROM simulation_group_questions sgq
+                        WHERE sgq.simulation_group_id = ${simulation_group_id}
+                        AND (sgq.persona_id = p.persona_id OR sgq.persona_id IS NULL)) AS has_questions
                     FROM "personas" p
                     WHERE p.simulation_group_id = ${simulation_group_id}
                     ORDER BY p.persona_name ASC;
@@ -934,9 +937,11 @@ exports.handler = async (event, context) => {
             // Enrich with computed mode
             const enrichedPatients = simulationPatients.map(patient => ({
               ...patient,
-              mode: (!patient.has_dtps && !patient.has_recommendations)
-                ? 'interview_practice'
-                : 'full_assessment',
+              mode: (!patient.has_dtps && !patient.has_recommendations && !patient.has_questions)
+                ? 'conversation_only'
+                : (!patient.has_dtps && !patient.has_recommendations)
+                  ? 'interview_practice'
+                  : 'full_assessment',
             }));
 
             response.statusCode = 200;

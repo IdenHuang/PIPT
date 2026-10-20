@@ -1,6 +1,6 @@
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useEffect, useRef, useState, lazy, Suspense } from 'react';
-import { ArrowLeft, BarChart3, Users, UserCog, FileText, Menu, HelpCircle, Pill, ClipboardList, FileCode } from 'lucide-react';
+import { ArrowLeft, BarChart3, Users, UserCog, Menu, HelpCircle, Pill, ClipboardList, FileCode } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import PageContainer from '@/components/PageContainer';
@@ -604,15 +604,11 @@ function InstructorSimulationGroupPage() {
           if (bankQ) await handleToggleQuestionInclusion(id, bankQ, false);
         }
       } else if (questionBankTab === 'patientSpecific' && selectedPatientForQuestionBank) {
-        pendingQuestionIds.forEach(id => {
-          if (!includedQuestionIds.has(id)) {
-            const bankQ = allBankQuestions.find(q => q.id === id);
-            if (bankQ) {
-              instructorService.addCaseSpecificQuestion(selectedPatientForQuestionBank, { id: bankQ.id, title: bankQ.title, keyQuestion: bankQ.questionText, clinicalIntent: bankQ.clinicalIntent, evaluationCriteria: bankQ.evaluationCriteria, required: bankQ.isMandatory });
-              if (patientEditor.selectedPatientForEdit === selectedPatientForQuestionBank) patientEditor.setCaseSpecificQuestions(instructorService.getCaseSpecificQuestions(selectedPatientForQuestionBank));
-            }
-          }
-        });
+        const idsToAdd = Array.from(pendingQuestionIds).filter(id => !includedQuestionIds.has(id));
+        if (idsToAdd.length > 0) {
+          await instructorService.assignQuestionToGroup(groupId || '1', idsToAdd, selectedPatientForQuestionBank);
+        }
+
         includedQuestionIds.forEach(id => {
           if (!pendingQuestionIds.has(id)) {
             instructorService.deleteCaseSpecificQuestion(selectedPatientForQuestionBank, id);
@@ -679,7 +675,6 @@ function InstructorSimulationGroupPage() {
             { id: 'analytics', label: 'Analytics', icon: <BarChart3 className="w-5 h-5" /> },
             { id: 'patients', label: `Manage ${aiPersonaLabelPlural}`, icon: <Users className="w-5 h-5" /> },
             { id: 'students', label: `Manage ${userRoleLabel}s`, icon: <UserCog className="w-5 h-5" /> },
-            { id: 'rubric', label: 'Group-Wide Key Questions', icon: <FileText className="w-5 h-5" /> },
             { id: 'questionBank', label: 'Question Bank', icon: <HelpCircle className="w-5 h-5" />, onClick: () => { setActiveSection('questionBank'); questionBankTab === 'global' ? syncGlobalIds() : syncPatientIds(selectedPatientForQuestionBank); } },
             { id: 'dtpBank', label: 'DTP Bank', icon: <Pill className="w-5 h-5" /> },
             { id: 'recommendationsBank', label: 'Recommendations Bank', icon: <ClipboardList className="w-5 h-5" /> },
