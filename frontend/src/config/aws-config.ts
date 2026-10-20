@@ -6,7 +6,6 @@ export const appConfig = {
   cognito: {
     userPoolId: import.meta.env.VITE_COGNITO_USER_POOL_ID || '',
     userPoolClientId: import.meta.env.VITE_COGNITO_USER_POOL_CLIENT_ID || '',
-    identityPoolId: import.meta.env.VITE_IDENTITY_POOL_ID || '',
   },
   api: {
     endpoint: import.meta.env.VITE_API_ENDPOINT || '',
@@ -19,13 +18,14 @@ export const appConfig = {
   },
 };
 
-// Configure Amplify for Cognito auth
+// Configure Amplify for Cognito auth (User Pool only).
+// No identityPoolId: the browser must never mint AWS credentials. Leaving it unset
+// also stops fetchAuthSession() from calling Cognito Identity on every refresh.
 Amplify.configure({
   Auth: {
     Cognito: {
       userPoolId: appConfig.cognito.userPoolId,
       userPoolClientId: appConfig.cognito.userPoolClientId,
-      identityPoolId: appConfig.cognito.identityPoolId,
       loginWith: {
         email: true,
       },

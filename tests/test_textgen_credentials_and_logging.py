@@ -276,6 +276,13 @@ def test_cors_reads_capitalised_origin_header(cors_main):
     "http://main.d3uv171xv91wfq.amplifyapp.com",    # wrong scheme
     "https://evil.amplifyapp.com.attacker.net",     # suffix must be anchored
     "https://evil-amplifyapp.com",                  # "." in the pattern is literal
+    # "*" must stay inside the host: no port, userinfo, path or control chars
+    "https://evil.com:1234.amplifyapp.com",
+    "https://evil.com@x.amplifyapp.com",
+    "https://evil.com/x.amplifyapp.com",
+    "https://evil.com?.amplifyapp.com",
+    "https://main.d3uv171xv91wfq.amplifyapp.com\n",
+    "https://.amplifyapp.com",
     "http://localhost:5175",
     "",
     None,
@@ -284,9 +291,19 @@ def test_cors_falls_back_to_primary_origin_when_not_allowed(cors_main, origin):
     assert cors_main._get_cors_origin(_origin_event(origin)) == PRIMARY_ORIGIN
 
 
-def test_cors_star_allows_everything(monkeypatch, request):
-    # Unset ALLOWED_ORIGINS defaults to "*" (backwards-compatible behaviour).
-    monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+@pytest.mark.parametrize("value", [None, "", " ", ",", " , "])
+def test_cors_fails_closed_when_allowed_origins_unset_or_empty(monkeypatch, request, value):
+    if value is None:
+        monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+    else:
+        monkeypatch.setenv("ALLOWED_ORIGINS", value)
+    main = request.getfixturevalue("main")
+    assert main._get_cors_origin(_origin_event("https://anything.example")) == ""
+    assert main._get_cors_origin(_origin_event(PRIMARY_ORIGIN)) == ""
+
+
+def test_cors_explicit_star_allows_everything(monkeypatch, request):
+    monkeypatch.setenv("ALLOWED_ORIGINS", "*")
     main = request.getfixturevalue("main")
     assert main._get_cors_origin(_origin_event("https://anything.example")) == "*"
 
@@ -305,6 +322,21 @@ def test_cors_matches_shared_python_cors_layer(monkeypatch, cors_main):
         "https://evil.example.com",
         "https://amplifyapp.com",
         "https://evil.amplifyapp.com.attacker.net",
+        "https://evil.com:1234.amplifyapp.com",
+        "https://evil.com@x.amplifyapp.com",
+        "https://main.d3uv171xv91wfq.amplifyapp.com\n",
         "",
     ]:
         assert cors_main._get_cors_origin(_origin_event(origin)) == cors_helper._resolve_origin(origin), origin
+
+
+def test_cors_empty_config_matches_shared_python_cors_layer(monkeypatch, request):
+    """Both copies must fail closed identically when ALLOWED_ORIGINS is unset."""
+    monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+    main = request.getfixturevalue("main")
+    layer_path = os.path.join(os.path.dirname(_SRC), "..", "layers", "cors", "python", "cors_helper.py")
+    spec = importlib.util.spec_from_file_location("_cors_helper_empty", os.path.normpath(layer_path))
+    cors_helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cors_helper)
+    for origin in [PRIMARY_ORIGIN, "https://evil.example.com", ""]:
+        assert main._get_cors_origin(_origin_event(origin)) == cors_helper._resolve_origin(origin) == "", origin

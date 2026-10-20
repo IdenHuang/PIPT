@@ -1,6 +1,5 @@
 const jwt = require('jsonwebtoken');
 const jwksClient = require('jwks-rsa');
-const AWS = require('aws-sdk');
 const logger = require('./logger');
 
 const client = jwksClient({
@@ -36,35 +35,4 @@ function verifyToken(token) {
   });
 }
 
-async function getStsCredentials(idToken) {
-  logger.info("Requesting STS credentials", { component: "auth", operation: "getStsCredentials" });
-  const cognitoIdentity = new AWS.CognitoIdentity({ region: process.env.AWS_REGION });
-  const loginProvider = `cognito-idp.${process.env.AWS_REGION}.amazonaws.com/${process.env.COGNITO_USER_POOL_ID}`;
-  try {
-    const identityId = await cognitoIdentity.getId({
-      IdentityPoolId: process.env.IDENTITY_POOL_ID,
-      Logins: { [loginProvider]: idToken },
-    }).promise();
-
-    const credentials = await cognitoIdentity.getCredentialsForIdentity({
-      IdentityId: identityId.IdentityId,
-      Logins: { [loginProvider]: idToken },
-    }).promise();
-
-    logger.info("STS credentials issued", {
-      component: "auth",
-      operation: "getStsCredentials",
-      expiration: credentials.Credentials?.Expiration,
-    });
-    return credentials.Credentials;
-  } catch (err) {
-    logger.error("Failed to obtain STS credentials", {
-      component: "auth",
-      operation: "getStsCredentials",
-      error: err.message,
-    });
-    throw err;
-  }
-}
-
-module.exports = { verifyToken, getStsCredentials };
+module.exports = { verifyToken };

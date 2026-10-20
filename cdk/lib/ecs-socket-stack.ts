@@ -111,18 +111,6 @@ export class EcsSocketStack extends Stack {
       })
     );
 
-    // Add permissions for Cognito Identity operations
-    taskRole.addToPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: [
-          "cognito-identity:GetId",
-          "cognito-identity:GetCredentialsForIdentity",
-        ],
-        resources: ["*"],
-      })
-    );
-    
     // Add VPC endpoint permissions for private subnet access
     taskRole.addToPolicy(
       new iam.PolicyStatement({
@@ -194,7 +182,6 @@ export class EcsSocketStack extends Stack {
         AWS_DEFAULT_REGION: this.region,
         COGNITO_USER_POOL_ID: apiServiceStack.getUserPoolId(),
         COGNITO_CLIENT_ID: apiServiceStack.getUserPoolClientId(),
-        IDENTITY_POOL_ID: apiServiceStack.getIdentityPoolId(),
         TEXT_GENERATION_ENDPOINT: apiServiceStack.getEndpointUrl(),
         APPSYNC_GRAPHQL_URL: apiServiceStack.appSyncApi.graphqlUrl,
         SOCKET_EXECUTION_ROLE_ARN: taskRole.roleArn,
