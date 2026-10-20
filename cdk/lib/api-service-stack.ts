@@ -368,21 +368,9 @@ export class ApiServiceStack extends cdk.Stack {
           this.appClient.userPoolClientId
         ),
         VITE_AWS_REGION: cdk.SecretValue.unsafePlainText(this.region),
-        VITE_IDENTITY_POOL_ID: cdk.SecretValue.unsafePlainText(
-          this.identityPool.ref
-        ),
       },
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
-
-    // Create roles and policies
-    const createPolicyStatement = (actions: string[], resources: string[]) => {
-      return new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: actions,
-        resources: resources,
-      });
-    };
 
     /**
      *
@@ -420,8 +408,11 @@ export class ApiServiceStack extends cdk.Stack {
     this.stageARN_APIGW = this.api.deploymentStage.stageArn;
     this.apiGW_basedURL = this.api.urlForPath();
 
-    // Default authenticated role for Identity Pool (used by Nova Sonic voice feature)
-    // Carries the permissions previously on studentRole: DynamoDB, Bedrock, Secrets Manager
+    // Authenticated role for the Identity Pool. Intentionally carries NO permissions.
+    // Any signed-in user can exchange their ID token for this role's STS credentials and
+    // call AWS directly, bypassing every handler-level authz check, so nothing user-facing
+    // may be granted here. The socket server's Nova Sonic process uses the ECS task role
+    // (cdk/lib/ecs-socket-stack.ts) for Bedrock, DynamoDB and Secrets Manager instead.
     const authenticatedRole = new iam.Role(this, `${id}-AuthenticatedRole`, {
       assumedBy: new iam.FederatedPrincipal(
         "cognito-identity.amazonaws.com",
@@ -436,42 +427,6 @@ export class ApiServiceStack extends cdk.Stack {
         "sts:AssumeRoleWithWebIdentity"
       ),
     });
-
-    authenticatedRole.attachInlinePolicy(
-      new iam.Policy(this, `${id}-AuthenticatedPolicy`, {
-        statements: [
-          // DynamoDB permissions for Nova Sonic
-          createPolicyStatement(
-            [
-              "dynamodb:GetItem",
-              "dynamodb:Query",
-              "dynamodb:Scan",
-              "dynamodb:PutItem",
-              "dynamodb:UpdateItem",
-            ],
-            [
-              `arn:aws:dynamodb:${this.region}:${this.account}:table/${this.dynamoTableName}`,
-            ]
-          ),
-          // Bedrock permissions for Nova Sonic
-          createPolicyStatement(
-            [
-              "bedrock:InvokeModel",
-              "bedrock:InvokeModelWithBidirectionalStream",
-              "bedrock:Converse",
-              "bedrock:ConverseStream",
-              "bedrock:InvokeModelWithResponseStream",
-            ],
-            ["*"]
-          ),
-          // Secrets Manager permissions for Nova Sonic
-          createPolicyStatement(
-            ["secretsmanager:GetSecretValue"],
-            [db.secretPathUser.secretArn]
-          ),
-        ],
-      })
-    );
 
     // Create unauthenticated role with no permissions
     const unauthenticatedRole = new iam.Role(

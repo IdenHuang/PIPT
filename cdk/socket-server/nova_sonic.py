@@ -88,7 +88,8 @@ OUTPUT_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_SIZE = 1024
 
-# STS credentials from Cognito will be passed via environment variables
+# AWS credentials come from the ECS task role (inherited via
+# AWS_CONTAINER_CREDENTIALS_RELATIVE_URI). See NovaSonic.refresh_env_credentials.
 
 
 
@@ -124,8 +125,23 @@ def get_pg_connection():
 class NovaSonic:
 
     def refresh_env_credentials(self):
-        # Credentials already set by server.js via STS
-        pass
+        """Export the task-role credentials as env vars for the smithy Bedrock client.
+
+        aws_sdk_bedrock_runtime only reads credentials through
+        EnvironmentCredentialsResolver, while the ECS task role is exposed through the
+        container credentials endpoint. Resolve it with boto3 and copy it into the
+        environment (same approach as voice_preview_tts.make_client).
+        """
+        creds = boto3.Session().get_credentials()
+        if not creds:
+            raise RuntimeError("No AWS credentials available from the ECS task role")
+        frozen = creds.get_frozen_credentials()
+        os.environ["AWS_ACCESS_KEY_ID"] = frozen.access_key
+        os.environ["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
+        if frozen.token:
+            os.environ["AWS_SESSION_TOKEN"] = frozen.token
+        else:
+            os.environ.pop("AWS_SESSION_TOKEN", None)
 
     def __init__(self, model_id='amazon.nova-sonic-v1:0', region=None, socket_client=None, voice_id=None, session_id=None):
         self.user_id = os.getenv("USER_ID")
@@ -167,6 +183,7 @@ class NovaSonic:
 
     def _init_client(self):
         """Initialize the Bedrock Client for Nova"""
+        self.refresh_env_credentials()
         config = Config(
             endpoint_uri=f"https://bedrock-runtime.{self.region}.amazonaws.com",
             region=self.region,

@@ -140,7 +140,6 @@ Create or edit `frontend/.env` with your deployed backend values:
 VITE_AWS_REGION=ca-central-1
 VITE_COGNITO_USER_POOL_ID=ca-central-1_XXXXXXXXX
 VITE_COGNITO_USER_POOL_CLIENT_ID=xxxxxxxxxxxxxxxxxxxxxxxxxx
-VITE_IDENTITY_POOL_ID=ca-central-1:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 VITE_API_ENDPOINT=https://xxxxxxxxxx.execute-api.ca-central-1.amazonaws.com/prod/
 VITE_SOCKET_URL=wss://xxxxxxxxxxxxxx.cloudfront.net
 VITE_APPSYNC_GRAPHQL_URL=https://xxxxxxxxxxxxxxxxxxxxxx.appsync-api.ca-central-1.amazonaws.com/graphql
@@ -151,7 +150,6 @@ VITE_APPSYNC_GRAPHQL_URL=https://xxxxxxxxxxxxxxxxxxxxxx.appsync-api.ca-central-1
 | `VITE_AWS_REGION` | AWS region of deployment | Your CDK deploy region |
 | `VITE_COGNITO_USER_POOL_ID` | Cognito User Pool ID | CDK output or Cognito console |
 | `VITE_COGNITO_USER_POOL_CLIENT_ID` | Cognito App Client ID | CDK output or Cognito console |
-| `VITE_IDENTITY_POOL_ID` | Cognito Identity Pool ID | CDK output or Cognito console |
 | `VITE_API_ENDPOINT` | API Gateway base URL (with trailing `/`) | CDK output or API Gateway console |
 | `VITE_SOCKET_URL` | WebSocket URL for real-time features | CDK output (EcsSocket stack) |
 | `VITE_APPSYNC_GRAPHQL_URL` | AppSync GraphQL endpoint | CDK output or AppSync console |
@@ -177,7 +175,6 @@ export const appConfig = {
   cognito: {
     userPoolId: import.meta.env.VITE_COGNITO_USER_POOL_ID || '',
     userPoolClientId: import.meta.env.VITE_COGNITO_USER_POOL_CLIENT_ID || '',
-    identityPoolId: import.meta.env.VITE_IDENTITY_POOL_ID || '',
   },
   api: {
     endpoint: import.meta.env.VITE_API_ENDPOINT || '',

@@ -25,14 +25,20 @@ REGION = os.environ["REGION"]
 
 # CORS: Use ALLOWED_ORIGINS env var (comma-separated) instead of wildcard.
 # Entries may contain "*" for subdomains (e.g. "https://*.amplifyapp.com").
-# Matching mirrors cdk/layers/cors/python/cors_helper.py and
-# cdk/lambda/lib/cors.js; this container-image Lambda cannot use the layer.
-_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+# Matching mirrors cdk/layers/cors/python/cors_helper.py,
+# cdk/lambda/lib/cors.js, cdk/lambda/adminFunction/cors.js and
+# cdk/socket-server/server.js; this container-image Lambda cannot use the layer.
+# Unset/empty fails closed (no origin allowed); only an explicit "*" allows all.
+_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
+# "*" matches one or more DNS labels (letters, digits, hyphens joined by dots), so
+# it can never span a scheme, port, userinfo or path delimiter (":", "@", "/").
+_WILDCARD_HOST_LABELS = r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*"
 
 
 def _origin_pattern(pattern):
-    """Compile an allowed-origin entry; "*" matches one or more characters."""
-    return re.compile("^" + re.escape(pattern).replace(r"\*", ".+") + "$")
+    """Compile an allowed-origin entry; "*" matches one or more DNS labels."""
+    return re.compile("^" + re.escape(pattern).replace(r"\*", _WILDCARD_HOST_LABELS) + "$")
 
 
 _ALLOWED_ORIGIN_PATTERNS = [_origin_pattern(o) for o in _ALLOWED_ORIGINS if o != "*"]
@@ -40,7 +46,9 @@ _ALLOWED_ORIGIN_PATTERNS = [_origin_pattern(o) for o in _ALLOWED_ORIGINS if o !=
 
 def _get_cors_origin(event):
     """Return the Access-Control-Allow-Origin value based on the request origin."""
-    if not _ALLOWED_ORIGINS or "*" in _ALLOWED_ORIGINS:
+    if not _ALLOWED_ORIGINS:
+        return ""  # misconfigured: fail closed, browsers reject an empty origin
+    if "*" in _ALLOWED_ORIGINS:
         return "*"
     headers = event.get("headers") or {}
     origin = headers.get("origin") or headers.get("Origin") or ""

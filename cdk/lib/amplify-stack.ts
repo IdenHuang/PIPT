@@ -67,7 +67,6 @@ export class AmplifyStack extends cdk.Stack {
         { name: "VITE_COGNITO_USER_POOL_ID", value: apiStack.getUserPoolId() },
         { name: "VITE_COGNITO_USER_POOL_CLIENT_ID", value: apiStack.getUserPoolClientId() },
         { name: "VITE_API_ENDPOINT", value: apiStack.getEndpointUrl() },
-        { name: "VITE_IDENTITY_POOL_ID", value: apiStack.getIdentityPoolId() },
         { name: "VITE_SOCKET_URL", value: socketUrl },
         { name: "VITE_APPSYNC_GRAPHQL_URL", value: apiStack.appSyncApi.graphqlUrl },
       ],

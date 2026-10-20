@@ -4,7 +4,7 @@ const { createServer } = require("http");
 const { Server } = require("socket.io");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
-const { verifyToken, getStsCredentials } = require("./auth");
+const { verifyToken } = require("./auth");
 const { verifySessionScope } = require("./session-auth");
 const { authorizeSessionRequest } = require("./session-guard");
 const logger = require("./logger");
@@ -97,18 +97,23 @@ const app = express();
 const server = createServer(app);
 
 // Parse ALLOWED_ORIGINS env var for CORS. Supports wildcard subdomains.
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "*").split(",").map(s => s.trim()).filter(Boolean);
+// Matching mirrors cdk/lambda/lib/cors.js. Unset/empty fails closed (no browser
+// origin allowed); only an explicit "*" entry allows every origin.
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+// "*" matches one or more DNS labels, never ":", "@" or "/".
+const WILDCARD_HOST_LABELS = "[A-Za-z0-9-]+(?:\\.[A-Za-z0-9-]+)*";
+const allowedOriginPatterns = allowedOrigins.filter((p) => p !== "*").map((pattern) => {
+  const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, WILDCARD_HOST_LABELS);
+  return new RegExp("^" + escaped + "$");
+});
+if (allowedOrigins.length === 0) {
+  console.warn("⚠️ ALLOWED_ORIGINS is not set; all browser origins will be rejected");
+}
 const corsOriginConfig = allowedOrigins.includes("*")
   ? "*"
   : (origin, callback) => {
       if (!origin) return callback(null, true); // allow non-browser requests
-      const isAllowed = allowedOrigins.some((pattern) => {
-        if (pattern.includes("*")) {
-          const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".+");
-          return new RegExp("^" + escaped + "$").test(origin);
-        }
-        return pattern === origin;
-      });
+      const isAllowed = allowedOriginPatterns.some((re) => re.test(origin));
       callback(null, isAllowed ? origin : false);
     };
 
@@ -429,23 +434,10 @@ io.on("connection", (socket) => {
     }
 
     // ── Local child process path (fallback) ───────────────────────────────
-
-    // Get Cognito Identity Pool credentials for user-specific access
-    console.log(
-      "🔑 Getting Cognito Identity Pool credentials for user:",
-      socket.userEmail,
-    );
-    let stsCredentials;
-    try {
-      stsCredentials = await getStsCredentials(socket.handshake.auth.token);
-      console.log("✅ Successfully obtained Cognito Identity Pool credentials");
-    } catch (error) {
-      console.error("❌ Failed to get Cognito credentials:", error.message);
-      socket.emit("nova-error", {
-        error: "Failed to authenticate with AWS services",
-      });
-      return;
-    }
+    // nova_sonic.py inherits the ECS task role through process.env
+    // (AWS_CONTAINER_CREDENTIALS_RELATIVE_URI). Per-user Cognito Identity Pool
+    // credentials are deliberately not used: that role is reachable by any
+    // signed-in user directly, so it carries no permissions.
 
     const PORT = process.env.PORT || 80;
 
@@ -466,9 +458,6 @@ io.on("connection", (socket) => {
           SESSION_ID: sessionId,
           VOICE_ID: config.voice_id || "",
           USER_ID: socket.userId || "anonymous",
-          AWS_ACCESS_KEY_ID: stsCredentials.AccessKeyId,
-          AWS_SECRET_ACCESS_KEY: stsCredentials.SecretKey,
-          AWS_SESSION_TOKEN: stsCredentials.SessionToken,
           SM_DB_CREDENTIALS: process.env.SM_DB_CREDENTIALS || "",
           RDS_PROXY_ENDPOINT: process.env.RDS_PROXY_ENDPOINT || "",
           PATIENT_NAME: config.patient_name || "",
@@ -584,9 +573,6 @@ io.on("connection", (socket) => {
               SESSION_ID: sessionId,
               VOICE_ID: config.voice_id || "",
               USER_ID: socket.userId || "anonymous",
-              AWS_ACCESS_KEY_ID: stsCredentials.AccessKeyId,
-              AWS_SECRET_ACCESS_KEY: stsCredentials.SecretKey,
-              AWS_SESSION_TOKEN: stsCredentials.SessionToken,
               SM_DB_CREDENTIALS: process.env.SM_DB_CREDENTIALS || "",
               RDS_PROXY_ENDPOINT: process.env.RDS_PROXY_ENDPOINT || "",
               PATIENT_NAME: config.patient_name || "",
