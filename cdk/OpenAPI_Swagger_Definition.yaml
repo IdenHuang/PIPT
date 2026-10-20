@@ -155,10 +155,15 @@ paths:
             "chat" (default) generates a conversational response,
             "debrief" generates a post-session debrief evaluation,
             "match" performs question matching,
-            "test_debrief" generates a debrief using a prompt provided in the request body without persisting results.
+            "test_debrief" generates a debrief using a prompt provided in the request body without persisting results,
+            "test_system_prompt" runs a Prompt Playground chat turn using the system_prompt (and optional
+            patient_prompt) from the request body without persisting messages.
+            test_debrief and test_system_prompt are restricted to instructors of the simulation group and
+            admins; the Lambda enforces this (cdk/text_generation/src/helpers/authz.py). For
+            test_system_prompt, session_id must be a playground scratch ID matching ^test-[A-Za-z0-9-]{1,64}$.
           schema:
             type: string
-            enum: ["chat", "debrief", "match", "test_debrief"]
+            enum: ["chat", "debrief", "match", "test_debrief", "test_system_prompt"]
             default: "chat"
       requestBody:
         required: false
@@ -169,7 +174,19 @@ paths:
               properties:
                 message_content:
                   type: string
-                  description: Content of the student's message (used when mode=chat)
+                  description: >
+                    Content of the student's message (used when mode=chat or mode=test_system_prompt).
+                    For mode=test_system_prompt, omit or leave empty to start the playground conversation.
+                system_prompt:
+                  type: string
+                  description: >
+                    Instructor-authored system prompt to test. Used only when mode=test_system_prompt;
+                    falls back to the default system prompt when empty.
+                patient_prompt:
+                  type: string
+                  description: >
+                    Optional patient prompt override. Used only when mode=test_system_prompt;
+                    falls back to the persona's stored prompt when empty.
                 debrief_prompt:
                   type: string
                   description: >
@@ -179,7 +196,7 @@ paths:
       responses:
         "200":
           description: >
-            Response varies by mode. For mode=chat, returns the LLM response.
+            Response varies by mode. For mode=chat and mode=test_system_prompt, returns the LLM response.
             For mode=test_debrief, returns the debrief evaluation result.
           content:
             application/json:

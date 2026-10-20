@@ -1,5 +1,6 @@
 # Force CodePipeline rebuild - cohere embed v4 region fix
 import os
+import re
 import json
 import time
 import boto3
@@ -22,18 +23,31 @@ logger.setLevel(logging.INFO)
 DB_SECRET_NAME = os.environ["SM_DB_CREDENTIALS"]
 REGION = os.environ["REGION"]
 
-# CORS: Use ALLOWED_ORIGINS env var (comma-separated) instead of wildcard
+# CORS: Use ALLOWED_ORIGINS env var (comma-separated) instead of wildcard.
+# Entries may contain "*" for subdomains (e.g. "https://*.amplifyapp.com").
+# Matching mirrors cdk/layers/cors/python/cors_helper.py and
+# cdk/lambda/lib/cors.js; this container-image Lambda cannot use the layer.
 _ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+
+
+def _origin_pattern(pattern):
+    """Compile an allowed-origin entry; "*" matches one or more characters."""
+    return re.compile("^" + re.escape(pattern).replace(r"\*", ".+") + "$")
+
+
+_ALLOWED_ORIGIN_PATTERNS = [_origin_pattern(o) for o in _ALLOWED_ORIGINS if o != "*"]
+
 
 def _get_cors_origin(event):
     """Return the Access-Control-Allow-Origin value based on the request origin."""
-    if "*" in _ALLOWED_ORIGINS:
+    if not _ALLOWED_ORIGINS or "*" in _ALLOWED_ORIGINS:
         return "*"
-    origin = (event.get("headers") or {}).get("origin") or (event.get("headers") or {}).get("Origin") or ""
-    if origin in _ALLOWED_ORIGINS:
+    headers = event.get("headers") or {}
+    origin = headers.get("origin") or headers.get("Origin") or ""
+    if origin and any(p.fullmatch(origin) for p in _ALLOWED_ORIGIN_PATTERNS):
         return origin
     # Fallback: return first allowed origin (won't match but is safe)
-    return _ALLOWED_ORIGINS[0] if _ALLOWED_ORIGINS else ""
+    return _ALLOWED_ORIGINS[0]
 RDS_PROXY_ENDPOINT = os.environ["RDS_PROXY_ENDPOINT"]
 BEDROCK_LLM_PARAM = os.environ["BEDROCK_LLM_PARAM"]
 EMBEDDING_MODEL_PARAM = os.environ["EMBEDDING_MODEL_PARAM"]
@@ -707,7 +721,10 @@ def handler(event, context):
                 embeddings_model=embeddings,
                 ddb_table_name=TABLE_NAME,
                 raw_prompt_mode=True,
-                is_initial_prompt=is_playground_initial
+                is_initial_prompt=is_playground_initial,
+                # Playground IDs are "test-..." scratch keys, not chat UUIDs:
+                # never write them to the graded "messages" table.
+                persist_messages=False,
             )
 
             return {
