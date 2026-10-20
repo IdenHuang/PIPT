@@ -231,3 +231,80 @@ def test_pgvector_does_not_issue_create_extension():
     """app_rw has no DDL rights; the extension comes from the db_setup baseline migration."""
     with open(os.path.join(_SRC, "helpers", "helper.py"), encoding="utf-8") as fh:
         assert "create_extension=False" in fh.read()
+
+
+# ── CORS origin matching ────────────────────────────────────────────────────
+# Same ALLOWED_ORIGINS shape the CDK stack sets (cdk/lib/api-service-stack.ts).
+DEPLOYED_ORIGINS = (
+    "https://main.d3sunerinpg5un.amplifyapp.com,"
+    "https://*.amplifyapp.com,"
+    "http://localhost:5173,"
+    "http://localhost:5174"
+)
+PRIMARY_ORIGIN = "https://main.d3sunerinpg5un.amplifyapp.com"
+
+
+@pytest.fixture
+def cors_main(monkeypatch, request):
+    """main.py loaded with the deployed ALLOWED_ORIGINS list (read at import time)."""
+    monkeypatch.setenv("ALLOWED_ORIGINS", DEPLOYED_ORIGINS)
+    return request.getfixturevalue("main")
+
+
+def _origin_event(origin, header="origin"):
+    return {"headers": {header: origin} if origin is not None else {}}
+
+
+@pytest.mark.parametrize("origin", [
+    "https://main.d3uv171xv91wfq.amplifyapp.com",  # other Amplify app via wildcard
+    "https://feature-x.d3uv171xv91wfq.amplifyapp.com",
+    PRIMARY_ORIGIN,
+    "http://localhost:5173",
+])
+def test_cors_echoes_allowed_origins_including_wildcards(cors_main, origin):
+    assert cors_main._get_cors_origin(_origin_event(origin)) == origin
+
+
+def test_cors_reads_capitalised_origin_header(cors_main):
+    origin = "https://main.d3uv171xv91wfq.amplifyapp.com"
+    assert cors_main._get_cors_origin(_origin_event(origin, header="Origin")) == origin
+
+
+@pytest.mark.parametrize("origin", [
+    "https://evil.example.com",
+    "https://amplifyapp.com",                       # wildcard needs a subdomain
+    "http://main.d3uv171xv91wfq.amplifyapp.com",    # wrong scheme
+    "https://evil.amplifyapp.com.attacker.net",     # suffix must be anchored
+    "https://evil-amplifyapp.com",                  # "." in the pattern is literal
+    "http://localhost:5175",
+    "",
+    None,
+])
+def test_cors_falls_back_to_primary_origin_when_not_allowed(cors_main, origin):
+    assert cors_main._get_cors_origin(_origin_event(origin)) == PRIMARY_ORIGIN
+
+
+def test_cors_star_allows_everything(monkeypatch, request):
+    # Unset ALLOWED_ORIGINS defaults to "*" (backwards-compatible behaviour).
+    monkeypatch.delenv("ALLOWED_ORIGINS", raising=False)
+    main = request.getfixturevalue("main")
+    assert main._get_cors_origin(_origin_event("https://anything.example")) == "*"
+
+
+def test_cors_matches_shared_python_cors_layer(monkeypatch, cors_main):
+    """Text-gen must resolve origins exactly like cdk/layers/cors/python/cors_helper.py."""
+    layer_path = os.path.join(os.path.dirname(_SRC), "..", "layers", "cors", "python", "cors_helper.py")
+    spec = importlib.util.spec_from_file_location("_cors_helper_under_test", os.path.normpath(layer_path))
+    cors_helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cors_helper)  # reads ALLOWED_ORIGINS set by cors_main
+
+    for origin in [
+        "https://main.d3uv171xv91wfq.amplifyapp.com",
+        PRIMARY_ORIGIN,
+        "http://localhost:5174",
+        "https://evil.example.com",
+        "https://amplifyapp.com",
+        "https://evil.amplifyapp.com.attacker.net",
+        "",
+    ]:
+        assert cors_main._get_cors_origin(_origin_event(origin)) == cors_helper._resolve_origin(origin), origin
