@@ -77,6 +77,143 @@ import chat_history
 # reaches the frontend or gets persisted as a message.
 _INTERRUPTED_RE = re.compile(r'\{\s*"interrupted"\s*:\s*true\s*\}', re.IGNORECASE)
 
+# Shown in place of AI text when the guardrail cannot be applied (missing
+# config or API error). The guardrail fails closed: unscreened text is never
+# treated as "passed".
+_GUARDRAIL_UNAVAILABLE_MSG = "I'm unable to respond right now. Please try again in a moment."
+
+# Sent to the client (error code "guardrail_unavailable") when the voice session
+# is refused or ended because the guardrail can't be applied. Nova Sonic audio
+# can't be screened, so voice must not run at all without a working guardrail.
+VOICE_UNAVAILABLE_MSG = "Voice chat is unavailable right now. Please try again later."
+GUARDRAIL_UNAVAILABLE_ERROR = "guardrail_unavailable"
+
+
+class AudioGate:
+    """Holds AI speech audio until the text it speaks has passed the guardrail.
+
+    Bedrock Guardrails only screen text, and Nova Sonic streams speech next to
+    its transcript. Nova Sonic sends each spoken segment's planned text as a
+    SPECULATIVE text block *before* that segment's audio block
+    (https://docs.aws.amazon.com/nova/latest/nova2-userguide/sonic-output-events.html).
+    Audio is buffered until that text has been screened and has passed, then
+    released. If the guardrail blocks or fails, buffered audio is dropped and
+    the rest of the AI turn stays silent. Audio is never released unscreened.
+
+    States: "pending" (buffer), "open" (forward), "blocked" (drop until the
+    turn ends).
+    """
+
+    # ~1.5 min of 24 kHz 16-bit mono PCM as base64; beyond this, drop (fail closed).
+    MAX_PENDING_BYTES = 6 * 1024 * 1024
+
+    def __init__(self):
+        self.state = "pending"
+        self._pending = []
+        self._pending_bytes = 0
+        self._segment_screened = False
+        self._overflow_logged = False
+
+    @property
+    def blocked(self):
+        return self.state == "blocked"
+
+    def _drop_pending(self, reason):
+        if self._pending:
+            logger.warning("🛡️ Dropping %d unscreened audio chunks (%s)", len(self._pending), reason)
+        self._pending = []
+        self._pending_bytes = 0
+
+    def _release(self):
+        self.state = "open"
+        released, self._pending, self._pending_bytes = self._pending, [], 0
+        return released
+
+    def reset_turn(self):
+        """A new turn started: unscreened audio from the old turn is discarded."""
+        self._drop_pending("turn ended before its text was screened")
+        self.state = "pending"
+        self._segment_screened = False
+        self._overflow_logged = False
+
+    def new_segment(self):
+        """A SPECULATIVE text block opened: gate the next segment's audio."""
+        if self.blocked:
+            return
+        self._drop_pending("new segment started before previous audio was screened")
+        self.state = "pending"
+        self._segment_screened = False
+
+    def close_segment(self):
+        """An audio block ended: the next segment must be screened again."""
+        if not self.blocked:
+            self.state = "pending"
+            self._segment_screened = False
+
+    def text_screened(self, passed, defer):
+        """Record the guardrail verdict for one AI text fragment.
+
+        defer=True while inside the SPECULATIVE block: wait for the whole
+        block (segment_text_done) before releasing audio. Otherwise (e.g. a
+        FINAL transcript for audio that arrived first) release on pass.
+        Returns audio chunks that may be sent now.
+        """
+        if self.blocked:
+            return []
+        if not passed:
+            self.state = "blocked"
+            self._drop_pending("guardrail blocked or failed")
+            return []
+        self._segment_screened = True
+        if defer or not self._pending:
+            # Nothing held (e.g. a FINAL transcript after its audio already
+            # played): don't open the gate for audio that hasn't arrived yet.
+            return []
+        return self._release()
+
+    def segment_text_done(self):
+        """The SPECULATIVE block ended; release its audio if all of it passed."""
+        if self.blocked or not self._segment_screened:
+            return []
+        return self._release()
+
+    def audio(self, b64):
+        """True if this chunk may be sent now; otherwise it is held or dropped."""
+        if self.state == "open":
+            return True
+        if self.state == "pending":
+            if self._pending_bytes + len(b64) > self.MAX_PENDING_BYTES:
+                if not self._overflow_logged:
+                    logger.warning("🛡️ Unscreened audio buffer full — dropping further chunks")
+                    self._overflow_logged = True
+                return False
+            self._pending.append(b64)
+            self._pending_bytes += len(b64)
+        return False
+
+
+def resolve_guardrail_config(guardrail_id="", guardrail_region=""):
+    """Resolve the Bedrock Guardrail ID and region for this session.
+
+    Runtime environment variables take precedence over values supplied in the
+    init payload, so an operator-configured guardrail can't be overridden by
+    the caller. The region falls back to the deployment region (AWS_REGION);
+    it is never defaulted to us-east-1, because guardrail IDs are regional and
+    the guardrail lives in the stack region.
+
+    Returns:
+        (guardrail_id, guardrail_region) — either may be "" if not configured.
+    """
+    gid = (os.getenv("BEDROCK_GUARDRAIL_ID") or guardrail_id or "").strip()
+    region = (
+        os.getenv("BEDROCK_GUARDRAIL_REGION")
+        or guardrail_region
+        or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or ""
+    ).strip()
+    return gid, region
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -251,13 +388,30 @@ class NovaSonic:
     def __init__(self, websocket, voice_id=None, session_id=None, region=None,
                  patient_name="", patient_prompt="", patient_id="",
                  simulation_group_id="", llm_completion=False, extra_system_prompt="",
-                 user_id=None, cognito_token="", text_generation_endpoint=""):
+                 user_id=None, cognito_token="", text_generation_endpoint="",
+                 guardrail_id="", guardrail_region=""):
         self.ws = websocket
         self.user_id = user_id or os.getenv("USER_ID")
         self.model_id = MODEL_ID
         # Nova Sonic is only available in us-east-1 regardless of deployment region
         self.region = "us-east-1"
         self.deployment_region = region or os.getenv("AWS_REGION", "us-east-1")
+        self.guardrail_id, self.guardrail_region = resolve_guardrail_config(
+            guardrail_id, guardrail_region
+        )
+        if not self.guardrail_id or not self.guardrail_region:
+            logger.error(
+                "🛡️ Bedrock Guardrail not configured (set BEDROCK_GUARDRAIL_ID or pass guardrail_id "
+                "in the init payload) — voice session will be refused"
+            )
+        # Set when the guardrail can't be applied (not configured / API error),
+        # as opposed to the guardrail intervening on content.
+        self._guardrail_failed = False
+        self._guardrail_abort_sent = False
+        # AI audio is held until the text it speaks passes the guardrail.
+        self._audio_gate = AudioGate()
+        self._speculative_content_id = None
+        self._in_speculative_text = False
 
         self.client = None
         self.stream = None
@@ -367,13 +521,17 @@ class NovaSonic:
         self.client = BedrockRuntimeClient(config=config)
         logger.info("Initialized Bedrock client for %s in %s", self.model_id, self.region)
 
-    def _get_bedrock_client(self):
+    def _get_guardrail_client(self):
+        # The guardrail lives in the stack region, not the Nova Sonic region (us-east-1).
         if not self._bedrock_client:
-            self._bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+            self._bedrock_client = boto3.client("bedrock-runtime", region_name=self.guardrail_region)
         return self._bedrock_client
 
     def _apply_guardrail(self, text: str, source: str) -> tuple:
         """Screen text through Bedrock Guardrails using the ApplyGuardrail API.
+
+        Fails closed: if the guardrail is not configured or the API call fails,
+        the text is reported as blocked rather than passed.
 
         Args:
             text: The text to evaluate.
@@ -383,15 +541,16 @@ class NovaSonic:
             (passed: bool, replacement: str | None)
             If passed is False, replacement contains the guardrail's blocked message.
         """
-        guardrail_id = os.getenv("BEDROCK_GUARDRAIL_ID", "")
-        if not guardrail_id or not guardrail_id.strip():
-            return True, None
         if not text or not text.strip():
             return True, None
+        if not self.guardrail_id or not self.guardrail_region:
+            logger.error("Guardrail not configured — failing closed (%s)", source)
+            self._guardrail_failed = True
+            return False, _GUARDRAIL_UNAVAILABLE_MSG
         try:
-            client = self._get_bedrock_client()
+            client = self._get_guardrail_client()
             response = client.apply_guardrail(
-                guardrailIdentifier=guardrail_id,
+                guardrailIdentifier=self.guardrail_id,
                 guardrailVersion="DRAFT",
                 source=source,
                 content=[{"text": {"text": text}}],
@@ -403,8 +562,61 @@ class NovaSonic:
                 return False, blocked_msg
             return True, None
         except Exception as e:
-            logger.error("Guardrail check failed (%s): %s", source, e)
-            return True, None
+            # boto3 already retries throttling/transient errors; don't let an
+            # unreachable guardrail turn into unscreened content.
+            logger.error("Guardrail check failed — failing closed (%s): %s", source, e)
+            self._guardrail_failed = True
+            return False, _GUARDRAIL_UNAVAILABLE_MSG
+
+    def check_guardrail_available(self) -> bool:
+        """Preflight check, run before the Nova Sonic stream is opened.
+
+        Nova Sonic streams speech straight to the client and only the text
+        transcript can be screened, so a voice session must not start unless
+        the guardrail is configured and callable. Makes one ApplyGuardrail
+        call on a harmless phrase; any successful response (even an
+        intervention) proves the guardrail is reachable and permitted.
+
+        Blocking (boto3); call via asyncio.to_thread from async code.
+        """
+        if not self.guardrail_id or not self.guardrail_region:
+            logger.error("🛡️ Guardrail preflight failed: not configured — refusing voice session")
+            return False
+        try:
+            self._get_guardrail_client().apply_guardrail(
+                guardrailIdentifier=self.guardrail_id,
+                guardrailVersion="DRAFT",
+                source="INPUT",
+                content=[{"text": {"text": "Hello"}}],
+            )
+            return True
+        except Exception as e:
+            logger.error("🛡️ Guardrail preflight failed — refusing voice session: %s", e)
+            return False
+
+    async def _abort_for_guardrail(self):
+        """End the session after the guardrail became unavailable mid-session.
+
+        Stops all further output (audio included) and tells the socket server,
+        which ends voice mode in the browser.
+        """
+        if self._guardrail_abort_sent:
+            return
+        self._guardrail_abort_sent = True
+        logger.error("🛡️ Guardrail unavailable mid-session — ending voice session %s", self.session_id)
+        self._audio_gate.text_screened(False, defer=False)  # drop any held audio
+        await self._emit({"type": "audio-flush"})  # stop audio already queued in the browser
+        await self._emit({
+            "type": "error",
+            "error": GUARDRAIL_UNAVAILABLE_ERROR,
+            "message": VOICE_UNAVAILABLE_MSG,
+        })
+        self.is_active = False
+        if self.stream:
+            try:
+                await self.stream.input_stream.close()
+            except Exception:
+                pass  # Stream may already be closed
 
     def _get_medical_context(self):
         """Load the full patient case file from the pgvector store.
@@ -1084,6 +1296,19 @@ class NovaSonic:
             self.is_active = False
 
     async def _handle_event(self, json_data):
+        """Gate every Nova Sonic event on the guardrail still being usable.
+
+        Once the guardrail can't be applied, nothing further (audio included)
+        is forwarded and the session is ended.
+        """
+        if self._guardrail_failed:
+            await self._abort_for_guardrail()
+            return
+        await self._dispatch_event(json_data)
+        if self._guardrail_failed:
+            await self._abort_for_guardrail()
+
+    async def _dispatch_event(self, json_data):
         """Dispatch a single Nova Sonic event to the appropriate handler.
 
         Nova Sonic sends three main event types:
@@ -1133,9 +1358,28 @@ class NovaSonic:
             self.role = new_role
             if new_role != prev_role:
                 self._emitted_texts_this_turn = set()
+                self._audio_gate.reset_turn()
+                self._in_speculative_text = False
             if "additionalModelFields" in cs:
                 fields = json.loads(cs["additionalModelFields"])
                 self.display_assistant_text = fields.get("generationStage") == "SPECULATIVE"
+                if new_role == "ASSISTANT" and self.display_assistant_text:
+                    # Planned text for the next spoken segment: hold its audio
+                    # until this whole block has been screened.
+                    self._audio_gate.new_segment()
+                    self._speculative_content_id = cs.get("contentId")
+                    self._in_speculative_text = True
+
+        # ── contentEnd ────────────────────────────────────────────────
+        elif "contentEnd" in evt:
+            ce = evt["contentEnd"]
+            if self._in_speculative_text and (
+                ce.get("contentId") == self._speculative_content_id or ce.get("type") == "TEXT"
+            ):
+                self._in_speculative_text = False
+                await self._send_audio_chunks(self._audio_gate.segment_text_done())
+            elif ce.get("type") == "AUDIO":
+                self._audio_gate.close_segment()
             # Signal a new turn to the frontend so it creates a new chat bubble.
             # For USER turns detected by Nova Sonic (e.g. interruptions), we emit
             # user-turn-start here. For ASSISTANT turns, we emit turn-start with role.
@@ -1156,17 +1400,21 @@ class NovaSonic:
             if not text.strip():
                 return
 
-            # Deduplicate — skip any text already emitted this turn
-            if text in self._emitted_texts_this_turn:
-                return
-            self._emitted_texts_this_turn.add(text)
-
             # Determine effective role — if user audio is active, any
             # transcribed text belongs to the user even if self.role
             # hasn't switched yet (Nova Sonic timing issue)
             effective_role = self.role
             if self._user_audio_active and effective_role == "ASSISTANT":
                 effective_role = "USER"
+
+            # Deduplicate — skip any text already emitted this turn. A repeat
+            # already passed the guardrail earlier this turn (a failed or
+            # blocked check blocks the gate for the rest of the turn).
+            if text in self._emitted_texts_this_turn:
+                if effective_role == "ASSISTANT":
+                    await self._gate_text_verdict(True)
+                return
+            self._emitted_texts_this_turn.add(text)
 
             # Diagnosis completion check
             diagnosis_achieved = "SESSION COMPLETED" in text
@@ -1175,8 +1423,10 @@ class NovaSonic:
                 text += " SESSION COMPLETED"
 
             if effective_role == "ASSISTANT":
-                # Screen AI output through guardrails before sending to client
+                # Screen AI output through guardrails before sending to client.
+                # The verdict also decides whether this segment's audio is played.
                 passed, replacement = self._apply_guardrail(text, "OUTPUT")
+                await self._gate_text_verdict(passed)
                 if not passed:
                     text = replacement
                 if self._buffered_ai_message:
@@ -1203,7 +1453,27 @@ class NovaSonic:
         # ── audioOutput ───────────────────────────────────────────────
         elif "audioOutput" in evt:
             b64 = evt["audioOutput"]["content"]
+            # Only forwarded once its text has passed the guardrail.
+            if self._audio_gate.audio(b64):
+                await self._emit({"type": "audio", "data": b64})
+
+    async def _send_audio_chunks(self, chunks):
+        for b64 in chunks:
             await self._emit({"type": "audio", "data": b64})
+
+    async def _gate_text_verdict(self, passed):
+        """Apply a guardrail verdict for AI text to the audio gate.
+
+        On pass, releases held audio (or waits for the end of the SPECULATIVE
+        block). On block, drops held audio and tells the browser to discard
+        audio it already queued for this turn.
+        """
+        was_blocked = self._audio_gate.blocked
+        released = self._audio_gate.text_screened(passed, defer=self._in_speculative_text)
+        await self._send_audio_chunks(released)
+        if self._audio_gate.blocked and not was_blocked:
+            logger.warning("🛡️ AI reply blocked — muting the rest of this turn (session %s)", self.session_id)
+            await self._emit({"type": "audio-flush"})
 
     # ------------------------------------------------------------------
     # Database helpers

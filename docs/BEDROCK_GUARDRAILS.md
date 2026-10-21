@@ -51,12 +51,17 @@ const guardrail = new bedrock.CfnGuardrail(this, `${id}-BedrockGuardrail`, {
 
 ### Environment Variable Propagation
 
-The guardrail ID propagates to consuming services via environment variables:
+The guardrail ID and region propagate to consuming services via environment variables. Guardrail IDs are regional, so every `ApplyGuardrail` call goes to the region the guardrail was created in (the Api stack region), never to the Nova Sonic region (`us-east-1`).
 
-| Service | Environment Variable | Source |
-|---------|---------------------|--------|
-| Text Generation Lambda | `BEDROCK_GUARDRAIL_ID` | `guardrail.attrGuardrailId` |
-| ECS Socket Server | `BEDROCK_GUARDRAIL_ID` | `apiServiceStack.getGuardrailId()` |
+| Service | Guardrail ID | Guardrail region |
+|---------|--------------|------------------|
+| Text Generation Lambda | `BEDROCK_GUARDRAIL_ID` = `guardrail.attrGuardrailId` | `AWS_REGION` (Lambda region = stack region) |
+| ECS Socket Server (incl. spawned `nova_sonic.py` and `voice_preview_tts.py`) | `BEDROCK_GUARDRAIL_ID` = `apiServiceStack.getGuardrailId()` | `BEDROCK_GUARDRAIL_REGION` = `apiServiceStack.region` |
+| AgentCore Voice Agent | `BEDROCK_GUARDRAIL_ID` runtime env var if set, otherwise `guardrail_id` from the socket server's init payload | `BEDROCK_GUARDRAIL_REGION` runtime env var, otherwise `guardrail_region` from the init payload, otherwise `AWS_REGION` |
+
+The voice agent is deployed outside CDK, so the socket server forwards its own guardrail ID and region in the init message. Runtime env vars on the agent take precedence over the payload.
+
+The AgentCore runtime role needs `bedrock:ApplyGuardrail` on the guardrail ARN; see [AgentCore Voice Agent Setup](./AGENTCORE_VOICE_AGENT_SETUP.md#410-add-iam-permissions-to-the-service-role).
 
 ### Versioning
 
@@ -92,11 +97,16 @@ def apply_text_guardrail(text: str, source: str) -> tuple:
     Returns:
         (passed: bool, replacement: str | None)
     """
-    guardrail_id = os.environ.get('BEDROCK_GUARDRAIL_ID', '')
-    if not guardrail_id or not guardrail_id.strip():
+    if not text or not text.strip():
         return True, None
 
-    client = boto3.client('bedrock-runtime', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+    guardrail_id = (os.environ.get('BEDROCK_GUARDRAIL_ID') or '').strip()
+    guardrail_region = (os.environ.get('BEDROCK_GUARDRAIL_REGION')
+                        or os.environ.get('AWS_REGION') or '').strip()
+    if not guardrail_id or not guardrail_region:
+        return False, _GUARDRAIL_FALLBACK   # not configured: fail closed
+
+    client = boto3.client('bedrock-runtime', region_name=guardrail_region)
     response = client.apply_guardrail(
         guardrailIdentifier=guardrail_id,
         guardrailVersion='DRAFT',
@@ -113,7 +123,9 @@ def apply_text_guardrail(text: str, source: str) -> tuple:
 
 ### Retry and Fallback Behavior
 
-The guardrail call includes a retry mechanism:
+Every guardrail implementation fails closed. A missing guardrail ID or region, or a failed `ApplyGuardrail` call, is reported as blocked, never as passed.
+
+Text generation (`chat.py`):
 
 1. First attempt calls the `ApplyGuardrail` API.
 2. On failure, the system waits 500ms and retries once.
@@ -122,6 +134,17 @@ The guardrail call includes a retry mechanism:
 ```python
 _GUARDRAIL_FALLBACK = "I'm unable to process that message right now. Please try again in a moment."
 ```
+
+Voice (`voice-agent/nova_sonic.py`, `socket-server/nova_sonic.py`, `socket-server/voice_preview_tts.py`) speaks through Nova Sonic, whose audio streams to the browser unscreened (only the text transcript can be checked). Voice therefore refuses to run at all without a working guardrail:
+
+1. **Preflight** — before the Nova Sonic stream is opened, the voice code makes one `ApplyGuardrail` call on a harmless phrase. If the guardrail is not configured, or the call fails (for example `AccessDenied` because the role lacks `bedrock:ApplyGuardrail`), the session is refused: no audio is produced and the student sees "Voice chat is unavailable right now. Please try again later." (instructors see "Voice preview is unavailable right now..." for voice preview).
+2. **Mid-session failure** — if a later guardrail call fails, all further output (audio included) is dropped, the transcript shows `"I'm unable to respond right now. Please try again in a moment."`, and the session is ended with the same "unavailable" message. The voice agent signals this to the socket server as `{"type": "error", "error": "guardrail_unavailable"}`, which the socket server relays to the browser as `voice-session-ended`.
+
+boto3's built-in retries handle throttling and transient errors, so voice makes a single call per check. All failures are logged at ERROR level (`Guardrail preflight failed`, `failing closed`, `Guardrail unavailable mid-session`).
+
+3. **Per-reply audio gating** — Bedrock Guardrails screen text only, so AI speech is gated on its text. Nova Sonic sends each spoken segment's planned text (a `SPECULATIVE` text block) before that segment's audio ([Nova Sonic output events](https://docs.aws.amazon.com/nova/latest/nova2-userguide/sonic-output-events.html)). An `AudioGate` (in each voice file) buffers the segment's audio until the whole `SPECULATIVE` block has passed `ApplyGuardrail`, then releases it. If the text is blocked or the check fails, the buffered audio is dropped, the rest of that AI turn stays silent, the transcript shows the guardrail's blocked message, and the agent sends `{"type": "audio-flush"}` so the browser discards any audio it already queued for the turn. Audio whose text was never screened is discarded when the turn ends; it is never played. The cost is one guardrail call of latency before each spoken segment.
+
+Remaining voice limitation: voice input screening is logged only, because the student's audio has already reached the model when its transcript arrives.
 
 ## Content Filtering Rules
 

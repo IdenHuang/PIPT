@@ -188,6 +188,8 @@ export class EcsSocketStack extends Stack {
         TURN_SERVER_URL: turnServerStack.turnServerUrl,
         STUN_SERVER_URL: turnServerStack.stunServerUrl,
         BEDROCK_GUARDRAIL_ID: apiServiceStack.getGuardrailId(),
+        // Guardrail IDs are regional; the guardrail lives in the Api stack's region.
+        BEDROCK_GUARDRAIL_REGION: apiServiceStack.region,
         TABLE_NAME: dynamoTableName,
         SM_STREAM_CALLBACK_SECRET: apiServiceStack.streamCallbackSecret.secretName,
         ALLOWED_ORIGINS: apiServiceStack.getAllowedOriginsEnv(),

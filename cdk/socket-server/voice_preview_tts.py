@@ -77,6 +77,139 @@ def emit(obj: dict):
 # Lazy-initialized Bedrock Runtime client for guardrail calls
 _guardrail_client = None
 
+# Returned as the replacement when the guardrail cannot be applied (missing
+# config or API error). The guardrail fails closed.
+_GUARDRAIL_UNAVAILABLE_MSG = "I'm unable to respond right now. Please try again in a moment."
+
+# Shown to the instructor (via server.js "nova-error") when the preview is
+# refused or stopped because the guardrail can't be applied. Nova Sonic audio
+# can't be screened, so the preview must not run without a working guardrail.
+_PREVIEW_UNAVAILABLE_MSG = "Voice preview is unavailable right now. Please try again later."
+
+# Set when the guardrail can't be applied (not configured / API error), as
+# opposed to the guardrail intervening on content.
+_guardrail_failed = False
+
+
+class AudioGate:
+    """Holds AI speech audio until the text it speaks has passed the guardrail.
+
+    Keep in sync with cdk/voice-agent/nova_sonic.py AudioGate (see there for
+    the full rationale). Nova Sonic sends each segment's planned text as a
+    SPECULATIVE block before its audio; audio is buffered until that text
+    passes, dropped if it is blocked, and never released unscreened.
+    """
+
+    MAX_PENDING_BYTES = 6 * 1024 * 1024
+
+    def __init__(self):
+        self.state = "pending"
+        self._pending = []
+        self._pending_bytes = 0
+        self._segment_screened = False
+        self._overflow_logged = False
+
+    @property
+    def blocked(self):
+        return self.state == "blocked"
+
+    def _drop_pending(self, reason):
+        if self._pending:
+            logger.warning("🛡️ Dropping %d unscreened audio chunks (%s)", len(self._pending), reason)
+        self._pending = []
+        self._pending_bytes = 0
+
+    def _release(self):
+        self.state = "open"
+        released, self._pending, self._pending_bytes = self._pending, [], 0
+        return released
+
+    def reset_turn(self):
+        self._drop_pending("turn ended before its text was screened")
+        self.state = "pending"
+        self._segment_screened = False
+        self._overflow_logged = False
+
+    def new_segment(self):
+        if self.blocked:
+            return
+        self._drop_pending("new segment started before previous audio was screened")
+        self.state = "pending"
+        self._segment_screened = False
+
+    def close_segment(self):
+        if not self.blocked:
+            self.state = "pending"
+            self._segment_screened = False
+
+    def text_screened(self, passed, defer):
+        if self.blocked:
+            return []
+        if not passed:
+            self.state = "blocked"
+            self._drop_pending("guardrail blocked or failed")
+            return []
+        self._segment_screened = True
+        if defer or not self._pending:
+            return []
+        return self._release()
+
+    def segment_text_done(self):
+        if self.blocked or not self._segment_screened:
+            return []
+        return self._release()
+
+    def audio(self, b64):
+        if self.state == "open":
+            return True
+        if self.state == "pending":
+            if self._pending_bytes + len(b64) > self.MAX_PENDING_BYTES:
+                if not self._overflow_logged:
+                    logger.warning("🛡️ Unscreened audio buffer full — dropping further chunks")
+                    self._overflow_logged = True
+                return False
+            self._pending.append(b64)
+            self._pending_bytes += len(b64)
+        return False
+
+
+def _resolve_guardrail_config() -> tuple[str, str]:
+    """Return (guardrail_id, guardrail_region); either may be "" if unset."""
+    guardrail_id = (os.getenv("BEDROCK_GUARDRAIL_ID") or "").strip()
+    guardrail_region = (
+        os.getenv("BEDROCK_GUARDRAIL_REGION")
+        or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or ""
+    ).strip()
+    return guardrail_id, guardrail_region
+
+
+def _check_guardrail_available() -> bool:
+    """Preflight: one ApplyGuardrail call before the Nova Sonic stream opens.
+
+    Any successful response proves the guardrail is configured, reachable
+    and permitted.
+    """
+    global _guardrail_client
+    guardrail_id, guardrail_region = _resolve_guardrail_config()
+    if not guardrail_id or not guardrail_region:
+        logger.error("🛡️ Guardrail preflight failed: not configured — refusing voice preview")
+        return False
+    try:
+        if _guardrail_client is None:
+            _guardrail_client = boto3.client("bedrock-runtime", region_name=guardrail_region)
+        _guardrail_client.apply_guardrail(
+            guardrailIdentifier=guardrail_id,
+            guardrailVersion="DRAFT",
+            source="INPUT",
+            content=[{"text": {"text": "Hello"}}],
+        )
+        return True
+    except Exception as e:
+        logger.error("🛡️ Guardrail preflight failed — refusing voice preview: %s", e)
+        return False
+
 
 def _apply_guardrail(text: str, source: str) -> tuple[bool, str | None]:
     """Screen text through Bedrock Guardrails using the ApplyGuardrail API.
@@ -89,16 +222,20 @@ def _apply_guardrail(text: str, source: str) -> tuple[bool, str | None]:
         (passed, replacement): If passed is False, replacement contains
         the guardrail's blocked message.
     """
-    global _guardrail_client
+    global _guardrail_client, _guardrail_failed
 
-    guardrail_id = os.getenv("BEDROCK_GUARDRAIL_ID", "")
-    if not guardrail_id or not guardrail_id.strip():
-        return True, None
     if not text or not text.strip():
         return True, None
+    # Fail closed when not configured. Guardrail IDs are regional, so call the
+    # region the guardrail was created in (the stack region), not REGION (Nova Sonic).
+    guardrail_id, guardrail_region = _resolve_guardrail_config()
+    if not guardrail_id or not guardrail_region:
+        logger.error("Guardrail not configured (BEDROCK_GUARDRAIL_ID or region missing) — failing closed (%s)", source)
+        _guardrail_failed = True
+        return False, _GUARDRAIL_UNAVAILABLE_MSG
     try:
         if _guardrail_client is None:
-            _guardrail_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+            _guardrail_client = boto3.client("bedrock-runtime", region_name=guardrail_region)
         response = _guardrail_client.apply_guardrail(
             guardrailIdentifier=guardrail_id,
             guardrailVersion="DRAFT",
@@ -112,8 +249,9 @@ def _apply_guardrail(text: str, source: str) -> tuple[bool, str | None]:
             return False, blocked_msg
         return True, None
     except Exception as e:
-        logger.error("Guardrail check failed (%s): %s", source, e)
-        return True, None
+        logger.error("Guardrail check failed — failing closed (%s): %s", source, e)
+        _guardrail_failed = True
+        return False, _GUARDRAIL_UNAVAILABLE_MSG
 
 
 def make_client() -> BedrockRuntimeClient:
@@ -166,9 +304,18 @@ async def process_responses(stream, done_event: asyncio.Event):
     SILENCE_TIMEOUT = 3.0  # seconds of silence after last audio chunk
     last_audio_time: float | None = None
 
-    # Guardrail integration: track role and accumulate text per turn
+    # Guardrail integration: track role and accumulate text per content block.
+    # AI audio is held by the gate until the text it speaks has passed.
     current_role: str | None = None
     accumulated_text = ""
+    gate = AudioGate()
+    in_speculative_text = False
+
+    def send_audio(chunks):
+        nonlocal audio_count
+        for b64 in chunks:
+            emit({"type": "audio", "data": b64})
+            audio_count += 1
 
     try:
         while True:
@@ -211,9 +358,20 @@ async def process_responses(stream, done_event: asyncio.Event):
 
                 # Track role from contentStart events
                 if "contentStart" in evt:
-                    role = evt["contentStart"].get("role")
+                    cs = evt["contentStart"]
+                    role = cs.get("role")
                     if role:
+                        if role != current_role:
+                            gate.reset_turn()
+                            in_speculative_text = False
                         current_role = role
+                    try:
+                        stage = json.loads(cs.get("additionalModelFields") or "{}").get("generationStage")
+                    except (TypeError, ValueError):
+                        stage = None
+                    if role == "ASSISTANT" and stage == "SPECULATIVE":
+                        gate.new_segment()
+                        in_speculative_text = True
 
                 # Accumulate text from textOutput events
                 elif "textOutput" in evt:
@@ -232,12 +390,26 @@ async def process_responses(stream, done_event: asyncio.Event):
                             passed, replacement = _apply_guardrail(accumulated_text, "OUTPUT")
                             if not passed:
                                 logger.warning("🛡️ AI output blocked by guardrail: %s → %s", accumulated_text[:60], replacement)
+                            # The verdict decides whether this segment's audio plays.
+                            send_audio(gate.text_screened(passed, defer=in_speculative_text))
                     accumulated_text = ""
+                    if in_speculative_text:
+                        in_speculative_text = False
+                        send_audio(gate.segment_text_done())
+                    elif evt["contentEnd"].get("type") == "AUDIO":
+                        gate.close_segment()
 
-                # Forward audio chunks as before
+                # Guardrail became unavailable mid-preview: stop all output.
+                if _guardrail_failed:
+                    logger.error("🛡️ Guardrail unavailable mid-preview — stopping voice preview")
+                    emit({"type": "error", "error": _PREVIEW_UNAVAILABLE_MSG})
+                    return
+
+                # Forward audio only once its text has passed the guardrail
                 if "audioOutput" in evt:
-                    emit({"type": "audio", "data": evt["audioOutput"]["content"]})
-                    audio_count += 1
+                    b64 = evt["audioOutput"]["content"]
+                    if gate.audio(b64):
+                        send_audio([b64])
                     last_audio_time = asyncio.get_event_loop().time()
 
             buffer = buffer[idx:]
@@ -335,6 +507,12 @@ async def handle_stdin(stream, prompt_name, done_event: asyncio.Event):
 
 
 async def run(voice_id: str):
+    # Refuse the preview unless the guardrail works: Nova Sonic audio reaches
+    # the listener unscreened, so never open the stream without it.
+    if not await asyncio.to_thread(_check_guardrail_available):
+        emit({"type": "error", "error": _PREVIEW_UNAVAILABLE_MSG})
+        return
+
     client = make_client()
     stream = await client.invoke_model_with_bidirectional_stream(
         InvokeModelWithBidirectionalStreamOperationInput(model_id=MODEL_ID)

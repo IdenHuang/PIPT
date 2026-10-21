@@ -151,8 +151,9 @@ Add the following environment variables:
 | `SM_DB_CREDENTIALS` | The Secrets Manager secret name for the RDS **user** credentials (the secret clients use to connect to RDS) | Go to **Secrets Manager** in the console and find the secret named `{StackPrefix}/userCredentials/rdsDbCredential` (described as "Secrets for clients to connect to RDS"), created by the Database stack. Copy the **secret name** (not the ARN). ⚠️ Use the `userCredentials` secret — **not** the admin secret at `{StackPrefix}/credentials/rdsDbCredential` and **not** the `TableCreator` secret. |
 | `RDS_PROXY_ENDPOINT` | The RDS Proxy endpoint for the user proxy | Found in the Database stack CloudFormation outputs, or in the **RDS** console under **Proxies**. It will look something like `{StackPrefix}-database-userproxy-....rds.amazonaws.com`. |
 | `TABLE_NAME` | `{StackPrefix}-Api-DynamoDB-Conversation-Table` | The DynamoDB table used to persist conversation history. All other services read this from CDK-managed config — the voice agent must have it set manually here since it runs outside CDK. |
-
 These match the environment variables that were previously defined in the now-removed `VoiceAgentStack`. Without them, the voice agent will fail to connect to the database or reach Nova Sonic in the correct region.
+
+You do **not** need to add a guardrail variable here. The socket server sends the guardrail to the voice agent automatically when each voice session starts. (Advanced: setting `BEDROCK_GUARDRAIL_ID` and `BEDROCK_GUARDRAIL_REGION` on the runtime overrides what the socket server sends.)
 
 ### 4.9 Host the Agent
 
@@ -169,8 +170,39 @@ Once the agent is hosted, you will likely see a popup or notification asking you
 5. Click **Add permissions** > **Attach policies** and add these two managed policies:
    - `AmazonDynamoDBFullAccess_v2` (for conversation history in DynamoDB)
    - `AWSSecretsManagerClientReadOnlyAccess` (for reading RDS credentials from Secrets Manager)
+6. Add the guardrail permission. The voice agent needs this to screen content; without it, every voice session is refused and students see "Voice chat is unavailable right now. Please try again later." The deployment generates the exact policy for you, so there is nothing to fill in:
+   1. In a new browser tab, open **CloudFormation** (make sure the region in the top-right matches your deployment, e.g. Canada (Central)).
+   2. Click the stack named **`{StackPrefix}-Api`**, then the **Outputs** tab.
+   3. Find **`AgentCoreGuardrailPolicy`** and copy its entire **Value** (it starts with `{"Version":"2012-10-17"`).
+   4. Back on the IAM role, click **Add permissions** > **Create inline policy**.
+   5. Click the **JSON** button, delete everything in the editor, and paste the value you copied.
+   6. Click **Next**, name the policy `PiptGuardrailAccess`, and click **Create policy**.
 
-These two policies, combined with the default `AmazonBedrockAgentCoreRuntimeExecutionPolicy`, cover all the permissions the voice agent needs and nothing more.
+   The same value is also printed at the end of `cdk deploy` as `{StackPrefix}-Api.AgentCoreGuardrailPolicy`.
+
+   <details>
+   <summary>What the policy looks like</summary>
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Sid": "ApplyPiptGuardrail",
+         "Effect": "Allow",
+         "Action": "bedrock:ApplyGuardrail",
+         "Resource": "arn:aws:bedrock:<region>:<account-id>:guardrail/<guardrail-id>"
+       }
+     ]
+   }
+   ```
+
+   The `Resource` value is the `BedrockGuardrailArn` output of the same stack.
+   </details>
+
+These policies, combined with the default `AmazonBedrockAgentCoreRuntimeExecutionPolicy`, cover all the permissions the voice agent needs.
+
+> **Upgrade order:** on an existing runtime, add the `bedrock:ApplyGuardrail` permission *before* updating the runtime to a voice-agent image that fails closed, and redeploy the socket server (ECS) so it sends the guardrail ID. Otherwise every voice session is refused with "Voice chat is unavailable" until both are in place.
 
 ---
 

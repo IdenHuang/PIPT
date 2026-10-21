@@ -7,7 +7,8 @@ function getPool() {
   if (!pool) {
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
-      ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false
+      // Always verify the server certificate (matches lib/lib.js); never depend on NODE_ENV.
+      ssl: { rejectUnauthorized: true }
     });
   }
   return pool;
