@@ -1655,6 +1655,25 @@ function StudentChatPage() {
           {/* Message Input Area — only shown when session is active */}
           {sessionStatus === 'active' && !sessionCompleted && (
             <div className="p-6" style={{ borderTopWidth: '1px', borderTopStyle: 'solid', borderTopColor: UI_COLORS.border.default }}>
+              {/* Why voice mode ended (e.g. voice unavailable, timeout). Inside voice
+                  mode the error is shown in the voice panel instead. */}
+              {!isVoiceModeActive && voiceError && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="mb-3 flex items-center gap-2 px-4 py-2 rounded-lg text-sm"
+                  style={{ backgroundColor: '#fef2f2', color: '#b91c1c' }}
+                >
+                  <span className="flex-1">{voiceError}</span>
+                  <button
+                    onClick={() => setVoiceError(null)}
+                    className="p-1 rounded-full"
+                    aria-label="Dismiss voice message"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
               {isVoiceModeActive ? (
                 /* Voice mode controls — replaces text input */
                 <div className="flex items-center gap-3">
