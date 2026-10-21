@@ -170,7 +170,7 @@ Once the agent is hosted, you will likely see a popup or notification asking you
 5. Click **Add permissions** > **Attach policies** and add these two managed policies:
    - `AmazonDynamoDBFullAccess_v2` (for conversation history in DynamoDB)
    - `AWSSecretsManagerClientReadOnlyAccess` (for reading RDS credentials from Secrets Manager)
-6. Add the guardrail permission. The voice agent needs this to screen content; without it, voice chat shows "I'm unable to respond right now" instead of the AI's replies. The deployment generates the exact policy for you, so there is nothing to fill in:
+6. Add the guardrail permission. The voice agent needs this to screen content; without it, every voice session is refused and students see "Voice chat is unavailable right now. Please try again later." The deployment generates the exact policy for you, so there is nothing to fill in:
    1. In a new browser tab, open **CloudFormation** (make sure the region in the top-right matches your deployment, e.g. Canada (Central)).
    2. Click the stack named **`{StackPrefix}-Api`**, then the **Outputs** tab.
    3. Find **`AgentCoreGuardrailPolicy`** and copy its entire **Value** (it starts with `{"Version":"2012-10-17"`).
@@ -202,7 +202,7 @@ Once the agent is hosted, you will likely see a popup or notification asking you
 
 These policies, combined with the default `AmazonBedrockAgentCoreRuntimeExecutionPolicy`, cover all the permissions the voice agent needs.
 
-> **Upgrade order:** on an existing runtime, add the `bedrock:ApplyGuardrail` permission *before* updating the runtime to a voice-agent image that fails closed. Otherwise every AI transcript is replaced with the "unable to respond" message until the permission is added.
+> **Upgrade order:** on an existing runtime, add the `bedrock:ApplyGuardrail` permission *before* updating the runtime to a voice-agent image that fails closed, and redeploy the socket server (ECS) so it sends the guardrail ID. Otherwise every voice session is refused with "Voice chat is unavailable" until both are in place.
 
 ---
 
