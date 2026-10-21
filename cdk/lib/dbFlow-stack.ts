@@ -99,6 +99,11 @@ export class DBFlowStack extends Stack {
                 DB_SECRET_NAME: db.secretPathAdminName,     // Admin Secret Manager name
                 DB_USER_SECRET_NAME: db.secretPathUser.secretName, // User Secret Manager name
                 DB_PROXY: db.secretPathTableCreator.secretName, // Proxy Secret
+                // db_setup connects to the RDS instance endpoint directly, whose certificate
+                // is issued by the Amazon RDS CA (not in Node's default trust store). Node.js 20+
+                // Lambda runtimes ship Amazon CA certs here but don't load them by default.
+                // https://docs.aws.amazon.com/lambda/latest/dg/lambda-nodejs.html#nodejs-certificate-loading
+                NODE_EXTRA_CA_CERTS: "/var/runtime/ca-cert.pem",
             },
             vpc: db.dbInstance.vpc,
             vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },

@@ -403,7 +403,9 @@ io.on("connection", (socket) => {
               if (msg.verdict) {
                 socket.emit("diagnosis-complete", { message: "Session completed successfully" });
               }
-            } else if (msg.type === "error" && (msg.error === "session_timeout" || msg.error === "stream_error")) {
+            } else if (msg.type === "error" && (msg.error === "session_timeout" || msg.error === "stream_error" || msg.error === "guardrail_unavailable")) {
+              // guardrail_unavailable: the agent refused (or stopped) the session
+              // because content can't be screened; voice must not run unguarded.
               console.log("⏰ Voice session ended:", msg.error, msg.message);
               socket.emit("voice-session-ended", {
                 reason: msg.error,
@@ -534,6 +536,18 @@ io.on("connection", (socket) => {
                 socket.emit("diagnosis-complete", {
                   message: "Session completed successfully",
                 });
+              }
+            }
+            // ─ Guardrail unavailable: refuse/end voice (audio can't be screened)
+            else if (parsed.type === "error" && parsed.error === "guardrail_unavailable") {
+              console.error("🛡️ Nova process stopped: guardrail unavailable");
+              socket.emit("voice-session-ended", {
+                reason: parsed.error,
+                message: parsed.message || "Voice chat is unavailable right now. Please try again later.",
+              });
+              if (novaProcess) {
+                novaProcess.kill();
+                novaProcess = null;
               }
             }
           } catch {
@@ -837,6 +851,13 @@ io.on("connection", (socket) => {
             socket.emit("voice-preview-done", {});
           } else if (msg.type === "error") {
             socket.emit("nova-error", { error: msg.error });
+            // The preview can't continue after an error (e.g. guardrail
+            // unavailable); stop the process so no further audio is relayed.
+            if (ttsProcess) {
+              ttsProcess.kill();
+              ttsProcess = null;
+              ttsReady = false;
+            }
           }
         } catch {
           console.log("[tts]", line);

@@ -15,9 +15,15 @@ Flow:
   socket server → AgentCore proxy → /ws → websocket_handler() → NovaSonic
 """
 
+import asyncio
 import logging
 from bedrock_agentcore import BedrockAgentCoreApp
-from nova_sonic import NovaSonic, require_session_id
+from nova_sonic import (
+    GUARDRAIL_UNAVAILABLE_ERROR,
+    VOICE_UNAVAILABLE_MSG,
+    NovaSonic,
+    require_session_id,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -98,10 +104,22 @@ async def websocket_handler(websocket, context):
             guardrail_region=init_msg.get("guardrail_region", ""),
         )
 
-        # 3. Start the Nova Sonic session (opens Bedrock stream)
+        # 3. Refuse the session unless the guardrail works. Nova Sonic audio
+        #    reaches the student unscreened (only the transcript can be
+        #    checked), so never open the stream without a usable guardrail.
+        if not await asyncio.to_thread(nova.check_guardrail_available):
+            await websocket.send_json({
+                "type": "error",
+                "error": GUARDRAIL_UNAVAILABLE_ERROR,
+                "message": VOICE_UNAVAILABLE_MSG,
+            })
+            await websocket.close()
+            return
+
+        # 4. Start the Nova Sonic session (opens Bedrock stream)
         await nova.start_session()
 
-        # 4. Handle audio frames until the client disconnects
+        # 5. Handle audio frames until the client disconnects
         await nova.handle_websocket()
 
     except Exception as e:

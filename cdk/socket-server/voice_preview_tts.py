@@ -81,6 +81,53 @@ _guardrail_client = None
 # config or API error). The guardrail fails closed.
 _GUARDRAIL_UNAVAILABLE_MSG = "I'm unable to respond right now. Please try again in a moment."
 
+# Shown to the instructor (via server.js "nova-error") when the preview is
+# refused or stopped because the guardrail can't be applied. Nova Sonic audio
+# can't be screened, so the preview must not run without a working guardrail.
+_PREVIEW_UNAVAILABLE_MSG = "Voice preview is unavailable right now. Please try again later."
+
+# Set when the guardrail can't be applied (not configured / API error), as
+# opposed to the guardrail intervening on content.
+_guardrail_failed = False
+
+
+def _resolve_guardrail_config() -> tuple[str, str]:
+    """Return (guardrail_id, guardrail_region); either may be "" if unset."""
+    guardrail_id = (os.getenv("BEDROCK_GUARDRAIL_ID") or "").strip()
+    guardrail_region = (
+        os.getenv("BEDROCK_GUARDRAIL_REGION")
+        or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or ""
+    ).strip()
+    return guardrail_id, guardrail_region
+
+
+def _check_guardrail_available() -> bool:
+    """Preflight: one ApplyGuardrail call before the Nova Sonic stream opens.
+
+    Any successful response proves the guardrail is configured, reachable
+    and permitted.
+    """
+    global _guardrail_client
+    guardrail_id, guardrail_region = _resolve_guardrail_config()
+    if not guardrail_id or not guardrail_region:
+        logger.error("🛡️ Guardrail preflight failed: not configured — refusing voice preview")
+        return False
+    try:
+        if _guardrail_client is None:
+            _guardrail_client = boto3.client("bedrock-runtime", region_name=guardrail_region)
+        _guardrail_client.apply_guardrail(
+            guardrailIdentifier=guardrail_id,
+            guardrailVersion="DRAFT",
+            source="INPUT",
+            content=[{"text": {"text": "Hello"}}],
+        )
+        return True
+    except Exception as e:
+        logger.error("🛡️ Guardrail preflight failed — refusing voice preview: %s", e)
+        return False
+
 
 def _apply_guardrail(text: str, source: str) -> tuple[bool, str | None]:
     """Screen text through Bedrock Guardrails using the ApplyGuardrail API.
@@ -93,21 +140,16 @@ def _apply_guardrail(text: str, source: str) -> tuple[bool, str | None]:
         (passed, replacement): If passed is False, replacement contains
         the guardrail's blocked message.
     """
-    global _guardrail_client
+    global _guardrail_client, _guardrail_failed
 
     if not text or not text.strip():
         return True, None
     # Fail closed when not configured. Guardrail IDs are regional, so call the
     # region the guardrail was created in (the stack region), not REGION (Nova Sonic).
-    guardrail_id = (os.getenv("BEDROCK_GUARDRAIL_ID") or "").strip()
-    guardrail_region = (
-        os.getenv("BEDROCK_GUARDRAIL_REGION")
-        or os.getenv("AWS_REGION")
-        or os.getenv("AWS_DEFAULT_REGION")
-        or ""
-    ).strip()
+    guardrail_id, guardrail_region = _resolve_guardrail_config()
     if not guardrail_id or not guardrail_region:
         logger.error("Guardrail not configured (BEDROCK_GUARDRAIL_ID or region missing) — failing closed (%s)", source)
+        _guardrail_failed = True
         return False, _GUARDRAIL_UNAVAILABLE_MSG
     try:
         if _guardrail_client is None:
@@ -126,6 +168,7 @@ def _apply_guardrail(text: str, source: str) -> tuple[bool, str | None]:
         return True, None
     except Exception as e:
         logger.error("Guardrail check failed — failing closed (%s): %s", source, e)
+        _guardrail_failed = True
         return False, _GUARDRAIL_UNAVAILABLE_MSG
 
 
@@ -247,6 +290,12 @@ async def process_responses(stream, done_event: asyncio.Event):
                                 logger.warning("🛡️ AI output blocked by guardrail: %s → %s", accumulated_text[:60], replacement)
                     accumulated_text = ""
 
+                # Guardrail became unavailable mid-preview: stop all output.
+                if _guardrail_failed:
+                    logger.error("🛡️ Guardrail unavailable mid-preview — stopping voice preview")
+                    emit({"type": "error", "error": _PREVIEW_UNAVAILABLE_MSG})
+                    return
+
                 # Forward audio chunks as before
                 if "audioOutput" in evt:
                     emit({"type": "audio", "data": evt["audioOutput"]["content"]})
@@ -348,6 +397,12 @@ async def handle_stdin(stream, prompt_name, done_event: asyncio.Event):
 
 
 async def run(voice_id: str):
+    # Refuse the preview unless the guardrail works: Nova Sonic audio reaches
+    # the listener unscreened, so never open the stream without it.
+    if not await asyncio.to_thread(_check_guardrail_available):
+        emit({"type": "error", "error": _PREVIEW_UNAVAILABLE_MSG})
+        return
+
     client = make_client()
     stream = await client.invoke_model_with_bidirectional_stream(
         InvokeModelWithBidirectionalStreamOperationInput(model_id=MODEL_ID)

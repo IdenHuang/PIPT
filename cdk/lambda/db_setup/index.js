@@ -31,7 +31,9 @@ async function runMigrations(db) {
     host: db.host,
     port: db.port || 5432,
     database: db.dbname,
-    ssl: { rejectUnauthorized: false },
+    // Verify the server certificate. The RDS CA is trusted via
+    // NODE_EXTRA_CA_CERTS=/var/runtime/ca-cert.pem (set in dbFlow-stack.ts).
+    ssl: { rejectUnauthorized: true },
   });
   await client.connect();
   try {
@@ -61,7 +63,9 @@ async function createAppUsers(
     host: adminDb.host,
     database: adminDb.dbname, // target DB
     port: adminDb.port || 5432,
-    ssl: { rejectUnauthorized: false },
+    // Verify the server certificate (see runMigrations): this client handles the
+    // admin credentials and writes the rotated app passwords.
+    ssl: { rejectUnauthorized: true },
   });
   await adminClient.connect();
 

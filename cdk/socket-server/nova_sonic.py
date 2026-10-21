@@ -81,6 +81,12 @@ logger.setLevel(logging.INFO)
 # config or API error). The guardrail fails closed.
 _GUARDRAIL_UNAVAILABLE_MSG = "I'm unable to respond right now. Please try again in a moment."
 
+# Printed as {"type": "error", "error": "guardrail_unavailable", ...} when the
+# voice session is refused or ended because the guardrail can't be applied.
+# Nova Sonic audio can't be screened, so voice must not run without it.
+VOICE_UNAVAILABLE_MSG = "Voice chat is unavailable right now. Please try again later."
+GUARDRAIL_UNAVAILABLE_ERROR = "guardrail_unavailable"
+
 # Connection pool for better performance
 pg_conn_pool = None
 from threading import Lock
@@ -180,7 +186,11 @@ class NovaSonic:
         ).strip()
         if not self.guardrail_id or not self.guardrail_region:
             logger.error("🛡️ Bedrock Guardrail not configured (BEDROCK_GUARDRAIL_ID or region missing) "
-                         "— AI text will be withheld for this session")
+                         "— voice session will be refused")
+        # Set when the guardrail can't be applied (not configured / API error),
+        # as opposed to the guardrail intervening on content.
+        self._guardrail_failed = False
+        self._guardrail_abort_sent = False
         self.client = None
         self.stream = None
         self.response = None
@@ -569,6 +579,37 @@ VOICE MODE OVERRIDE (IMPORTANT):
             print(f"🔥 Error in _process_responses(): {e}", flush=True)
 
     async def _handle_event(self, json_data):
+        """Gate every Nova Sonic event on the guardrail still being usable.
+
+        Once the guardrail can't be applied, nothing further (audio included)
+        is forwarded and the session is ended.
+        """
+        if self._guardrail_failed:
+            await self._abort_for_guardrail()
+            return
+        await self._dispatch_event(json_data)
+        if self._guardrail_failed:
+            await self._abort_for_guardrail()
+
+    async def _abort_for_guardrail(self):
+        """Stop all output and tell server.js the voice session must end."""
+        if self._guardrail_abort_sent:
+            return
+        self._guardrail_abort_sent = True
+        logger.error("🛡️ Guardrail unavailable mid-session — ending voice session %s", self.session_id)
+        print(json.dumps({
+            "type": "error",
+            "error": GUARDRAIL_UNAVAILABLE_ERROR,
+            "message": VOICE_UNAVAILABLE_MSG,
+        }), flush=True)
+        self.is_active = False
+        if self.stream:
+            try:
+                await self.stream.input_stream.close()
+            except Exception:
+                pass  # Stream may already be closed
+
+    async def _dispatch_event(self, json_data):
         """Dispatch one parsed JSON event to your existing logic."""
         evt = json_data.get("event", {})
         
@@ -799,6 +840,7 @@ VOICE MODE OVERRIDE (IMPORTANT):
             return True, None
         if not self.guardrail_id or not self.guardrail_region:
             logger.error("Guardrail not configured — failing closed (%s)", source)
+            self._guardrail_failed = True
             return False, _GUARDRAIL_UNAVAILABLE_MSG
         try:
             client = self._get_guardrail_client()
@@ -818,7 +860,29 @@ VOICE MODE OVERRIDE (IMPORTANT):
             # Fail closed — boto3 already retries transient errors, and an
             # unreachable guardrail must not turn into unscreened content.
             logger.error("Guardrail check failed — failing closed (%s): %s", source, e)
+            self._guardrail_failed = True
             return False, _GUARDRAIL_UNAVAILABLE_MSG
+
+    def check_guardrail_available(self) -> bool:
+        """Preflight check, run before the Nova Sonic stream is opened.
+
+        Makes one ApplyGuardrail call on a harmless phrase; any successful
+        response proves the guardrail is configured, reachable and permitted.
+        """
+        if not self.guardrail_id or not self.guardrail_region:
+            logger.error("🛡️ Guardrail preflight failed: not configured — refusing voice session")
+            return False
+        try:
+            self._get_guardrail_client().apply_guardrail(
+                guardrailIdentifier=self.guardrail_id,
+                guardrailVersion="DRAFT",
+                source="INPUT",
+                content=[{"text": {"text": "Hello"}}],
+            )
+            return True
+        except Exception as e:
+            logger.error("🛡️ Guardrail preflight failed — refusing voice session: %s", e)
+            return False
 
     def _clean_transcript(self, text):
         """Basic capitalization and whitespace cleanup for voice transcripts.
@@ -973,6 +1037,16 @@ async def main():
         sys.exit(1)
     deployment_region = os.getenv("AWS_REGION")
     nova_client = NovaSonic(voice_id=voice, session_id=session_id, region=deployment_region)
+
+    # Refuse the session unless the guardrail works: Nova Sonic audio reaches
+    # the student unscreened, so never open the stream without it.
+    if not nova_client.check_guardrail_available():
+        print(json.dumps({
+            "type": "error",
+            "error": GUARDRAIL_UNAVAILABLE_ERROR,
+            "message": VOICE_UNAVAILABLE_MSG,
+        }), flush=True)
+        sys.exit(1)
     
     # First listen for any initial configuration from stdin
     # This allows the frontend to set the voice before starting the session
