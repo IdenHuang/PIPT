@@ -381,6 +381,9 @@ io.on("connection", (socket) => {
 
             if (msg.type === "audio") {
               socket.emit("audio-chunk", { data: msg.data });
+            } else if (msg.type === "audio-flush") {
+              // Guardrail blocked (or couldn't screen) the AI reply: discard queued audio.
+              socket.emit("audio-flush", {});
             } else if (msg.type === "user-turn-start") {
               socket.emit("turn-start", { role: "user" });
             } else if (msg.type === "turn-start") {
@@ -499,6 +502,10 @@ io.on("connection", (socket) => {
             if (parsed.type === "audio") {
               // Skip debug file saving for better performance
               socket.emit("audio-chunk", { data: parsed.data });
+            }
+            // ─ Guardrail blocked the AI reply: discard queued audio ──────
+            else if (parsed.type === "audio-flush") {
+              socket.emit("audio-flush", {});
             }
             // ─ Turn start signals ─────────────────────────────────────────
             else if (parsed.type === "user-turn-start") {

@@ -142,7 +142,9 @@ Voice (`voice-agent/nova_sonic.py`, `socket-server/nova_sonic.py`, `socket-serve
 
 boto3's built-in retries handle throttling and transient errors, so voice makes a single call per check. All failures are logged at ERROR level (`Guardrail preflight failed`, `failing closed`, `Guardrail unavailable mid-session`).
 
-Remaining voice limitation: when the guardrail is working and **intervenes** on a specific AI reply, the transcript is replaced but the audio for that reply has already streamed and is still heard. Voice input screening is logged only, because the audio has already reached the model when the transcript arrives.
+3. **Per-reply audio gating** — Bedrock Guardrails screen text only, so AI speech is gated on its text. Nova Sonic sends each spoken segment's planned text (a `SPECULATIVE` text block) before that segment's audio ([Nova Sonic output events](https://docs.aws.amazon.com/nova/latest/nova2-userguide/sonic-output-events.html)). An `AudioGate` (in each voice file) buffers the segment's audio until the whole `SPECULATIVE` block has passed `ApplyGuardrail`, then releases it. If the text is blocked or the check fails, the buffered audio is dropped, the rest of that AI turn stays silent, the transcript shows the guardrail's blocked message, and the agent sends `{"type": "audio-flush"}` so the browser discards any audio it already queued for the turn. Audio whose text was never screened is discarded when the turn ends; it is never played. The cost is one guardrail call of latency before each spoken segment.
+
+Remaining voice limitation: voice input screening is logged only, because the student's audio has already reached the model when its transcript arrives.
 
 ## Content Filtering Rules
 

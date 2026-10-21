@@ -91,6 +91,88 @@ _PREVIEW_UNAVAILABLE_MSG = "Voice preview is unavailable right now. Please try a
 _guardrail_failed = False
 
 
+class AudioGate:
+    """Holds AI speech audio until the text it speaks has passed the guardrail.
+
+    Keep in sync with cdk/voice-agent/nova_sonic.py AudioGate (see there for
+    the full rationale). Nova Sonic sends each segment's planned text as a
+    SPECULATIVE block before its audio; audio is buffered until that text
+    passes, dropped if it is blocked, and never released unscreened.
+    """
+
+    MAX_PENDING_BYTES = 6 * 1024 * 1024
+
+    def __init__(self):
+        self.state = "pending"
+        self._pending = []
+        self._pending_bytes = 0
+        self._segment_screened = False
+        self._overflow_logged = False
+
+    @property
+    def blocked(self):
+        return self.state == "blocked"
+
+    def _drop_pending(self, reason):
+        if self._pending:
+            logger.warning("🛡️ Dropping %d unscreened audio chunks (%s)", len(self._pending), reason)
+        self._pending = []
+        self._pending_bytes = 0
+
+    def _release(self):
+        self.state = "open"
+        released, self._pending, self._pending_bytes = self._pending, [], 0
+        return released
+
+    def reset_turn(self):
+        self._drop_pending("turn ended before its text was screened")
+        self.state = "pending"
+        self._segment_screened = False
+        self._overflow_logged = False
+
+    def new_segment(self):
+        if self.blocked:
+            return
+        self._drop_pending("new segment started before previous audio was screened")
+        self.state = "pending"
+        self._segment_screened = False
+
+    def close_segment(self):
+        if not self.blocked:
+            self.state = "pending"
+            self._segment_screened = False
+
+    def text_screened(self, passed, defer):
+        if self.blocked:
+            return []
+        if not passed:
+            self.state = "blocked"
+            self._drop_pending("guardrail blocked or failed")
+            return []
+        self._segment_screened = True
+        if defer or not self._pending:
+            return []
+        return self._release()
+
+    def segment_text_done(self):
+        if self.blocked or not self._segment_screened:
+            return []
+        return self._release()
+
+    def audio(self, b64):
+        if self.state == "open":
+            return True
+        if self.state == "pending":
+            if self._pending_bytes + len(b64) > self.MAX_PENDING_BYTES:
+                if not self._overflow_logged:
+                    logger.warning("🛡️ Unscreened audio buffer full — dropping further chunks")
+                    self._overflow_logged = True
+                return False
+            self._pending.append(b64)
+            self._pending_bytes += len(b64)
+        return False
+
+
 def _resolve_guardrail_config() -> tuple[str, str]:
     """Return (guardrail_id, guardrail_region); either may be "" if unset."""
     guardrail_id = (os.getenv("BEDROCK_GUARDRAIL_ID") or "").strip()
@@ -222,9 +304,18 @@ async def process_responses(stream, done_event: asyncio.Event):
     SILENCE_TIMEOUT = 3.0  # seconds of silence after last audio chunk
     last_audio_time: float | None = None
 
-    # Guardrail integration: track role and accumulate text per turn
+    # Guardrail integration: track role and accumulate text per content block.
+    # AI audio is held by the gate until the text it speaks has passed.
     current_role: str | None = None
     accumulated_text = ""
+    gate = AudioGate()
+    in_speculative_text = False
+
+    def send_audio(chunks):
+        nonlocal audio_count
+        for b64 in chunks:
+            emit({"type": "audio", "data": b64})
+            audio_count += 1
 
     try:
         while True:
@@ -267,9 +358,20 @@ async def process_responses(stream, done_event: asyncio.Event):
 
                 # Track role from contentStart events
                 if "contentStart" in evt:
-                    role = evt["contentStart"].get("role")
+                    cs = evt["contentStart"]
+                    role = cs.get("role")
                     if role:
+                        if role != current_role:
+                            gate.reset_turn()
+                            in_speculative_text = False
                         current_role = role
+                    try:
+                        stage = json.loads(cs.get("additionalModelFields") or "{}").get("generationStage")
+                    except (TypeError, ValueError):
+                        stage = None
+                    if role == "ASSISTANT" and stage == "SPECULATIVE":
+                        gate.new_segment()
+                        in_speculative_text = True
 
                 # Accumulate text from textOutput events
                 elif "textOutput" in evt:
@@ -288,7 +390,14 @@ async def process_responses(stream, done_event: asyncio.Event):
                             passed, replacement = _apply_guardrail(accumulated_text, "OUTPUT")
                             if not passed:
                                 logger.warning("🛡️ AI output blocked by guardrail: %s → %s", accumulated_text[:60], replacement)
+                            # The verdict decides whether this segment's audio plays.
+                            send_audio(gate.text_screened(passed, defer=in_speculative_text))
                     accumulated_text = ""
+                    if in_speculative_text:
+                        in_speculative_text = False
+                        send_audio(gate.segment_text_done())
+                    elif evt["contentEnd"].get("type") == "AUDIO":
+                        gate.close_segment()
 
                 # Guardrail became unavailable mid-preview: stop all output.
                 if _guardrail_failed:
@@ -296,10 +405,11 @@ async def process_responses(stream, done_event: asyncio.Event):
                     emit({"type": "error", "error": _PREVIEW_UNAVAILABLE_MSG})
                     return
 
-                # Forward audio chunks as before
+                # Forward audio only once its text has passed the guardrail
                 if "audioOutput" in evt:
-                    emit({"type": "audio", "data": evt["audioOutput"]["content"]})
-                    audio_count += 1
+                    b64 = evt["audioOutput"]["content"]
+                    if gate.audio(b64):
+                        send_audio([b64])
                     last_audio_time = asyncio.get_event_loop().time()
 
             buffer = buffer[idx:]

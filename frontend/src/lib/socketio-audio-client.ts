@@ -50,6 +50,7 @@ export class SocketIOAudioClient {
   private boundOnTextMessage: ((...args: unknown[]) => void) | null = null;
   private boundOnTurnStart: ((...args: unknown[]) => void) | null = null;
   private boundOnSessionEnded: ((...args: unknown[]) => void) | null = null;
+  private boundOnAudioFlush: ((...args: unknown[]) => void) | null = null;
 
   constructor(config: SocketIOAudioClientConfig) {
     this.config = config;
@@ -106,6 +107,13 @@ export class SocketIOAudioClient {
       this.config.socket.on('nova-started', this.boundOnNovaStarted);
       this.config.socket.on('audio-chunk', this.boundOnAudioChunk);
       this.config.socket.on('nova-error', this.boundOnNovaError);
+
+      // The guardrail blocked (or couldn't screen) the AI reply: stop any of
+      // its audio that is still queued for playback.
+      this.boundOnAudioFlush = () => {
+        this.flushPlaybackQueue();
+      };
+      this.config.socket.on('audio-flush', this.boundOnAudioFlush);
 
       // Listen for server-side session end (e.g. Bedrock 60s timeout)
       this.boundOnSessionEnded = (data: unknown) => {
@@ -355,6 +363,10 @@ export class SocketIOAudioClient {
     if (this.boundOnSessionEnded) {
       this.config.socket.off('voice-session-ended', this.boundOnSessionEnded);
       this.boundOnSessionEnded = null;
+    }
+    if (this.boundOnAudioFlush) {
+      this.config.socket.off('audio-flush', this.boundOnAudioFlush);
+      this.boundOnAudioFlush = null;
     }
 
     this.muted = false;
