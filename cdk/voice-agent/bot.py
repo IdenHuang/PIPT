@@ -39,7 +39,8 @@ async def websocket_handler(websocket, context):
     1. Client sends an init message with session config:
        {"type": "init", "session_id": "...", "voice_id": "...",
         "patient_name": "...", "patient_prompt": "...", "patient_id": "...",
-        "llm_completion": false, "system_prompt": "...", "user_id": "..."}
+        "llm_completion": false, "system_prompt": "...", "user_id": "...",
+        "guardrail_id": "...", "guardrail_region": "..."}
     2. Client sends audio frames:
        {"type": "start_audio"}
        {"type": "audio", "data": "<base64 PCM>"}
@@ -91,6 +92,10 @@ async def websocket_handler(websocket, context):
             user_id=init_msg.get("user_id"),
             cognito_token=init_msg.get("cognito_token", ""),
             text_generation_endpoint=init_msg.get("text_generation_endpoint", ""),
+            # Used only when the runtime has no BEDROCK_GUARDRAIL_ID /
+            # BEDROCK_GUARDRAIL_REGION env vars (runtime config takes precedence).
+            guardrail_id=init_msg.get("guardrail_id", ""),
+            guardrail_region=init_msg.get("guardrail_region", ""),
         )
 
         # 3. Start the Nova Sonic session (opens Bedrock stream)

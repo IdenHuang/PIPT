@@ -156,15 +156,29 @@ def apply_text_guardrail(text: str, source: str) -> tuple:
         (passed: bool, replacement: str | None)
         If passed is False, replacement contains the guardrail's blocked message.
     """
-    guardrail_id = os.environ.get('BEDROCK_GUARDRAIL_ID', '')
-    if not guardrail_id or not guardrail_id.strip():
-        return True, None
     if not text or not text.strip():
         return True, None
     _GUARDRAIL_FALLBACK = "I'm unable to process that message right now. Please try again in a moment."
 
+    # Fail closed when the guardrail is not configured: a missing ID or region
+    # must never be treated as "passed". Guardrail IDs are regional, so the call
+    # must go to the region the guardrail was created in (the stack region).
+    guardrail_id = (os.environ.get('BEDROCK_GUARDRAIL_ID') or '').strip()
+    guardrail_region = (
+        os.environ.get('BEDROCK_GUARDRAIL_REGION')
+        or os.environ.get('AWS_REGION')
+        or os.environ.get('AWS_DEFAULT_REGION')
+        or ''
+    ).strip()
+    if not guardrail_id or not guardrail_region:
+        logger.error(
+            "Guardrail not configured (BEDROCK_GUARDRAIL_ID or region missing) — failing closed (%s)",
+            source,
+        )
+        return False, _GUARDRAIL_FALLBACK
+
     def _call_guardrail():
-        client = boto3.client('bedrock-runtime', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+        client = boto3.client('bedrock-runtime', region_name=guardrail_region)
         return client.apply_guardrail(
             guardrailIdentifier=guardrail_id,
             guardrailVersion='DRAFT',

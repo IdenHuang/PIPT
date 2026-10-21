@@ -364,6 +364,11 @@ io.on("connection", (socket) => {
           system_prompt: patientContext.system_prompt || config.system_prompt || "",
           cognito_token: socket.handshake.auth.token || "",
           text_generation_endpoint: process.env.TEXT_GENERATION_ENDPOINT || "",
+          // The voice agent runs outside CDK, so pass the guardrail it must apply.
+          // It fails closed (withholds AI text) if neither this nor its own
+          // BEDROCK_GUARDRAIL_ID env var is set.
+          guardrail_id: process.env.BEDROCK_GUARDRAIL_ID || "",
+          guardrail_region: process.env.BEDROCK_GUARDRAIL_REGION || process.env.AWS_REGION || "",
         });
 
         socket.agentWs = agentWs;

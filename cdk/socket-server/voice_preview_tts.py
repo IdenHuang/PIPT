@@ -77,6 +77,10 @@ def emit(obj: dict):
 # Lazy-initialized Bedrock Runtime client for guardrail calls
 _guardrail_client = None
 
+# Returned as the replacement when the guardrail cannot be applied (missing
+# config or API error). The guardrail fails closed.
+_GUARDRAIL_UNAVAILABLE_MSG = "I'm unable to respond right now. Please try again in a moment."
+
 
 def _apply_guardrail(text: str, source: str) -> tuple[bool, str | None]:
     """Screen text through Bedrock Guardrails using the ApplyGuardrail API.
@@ -91,14 +95,23 @@ def _apply_guardrail(text: str, source: str) -> tuple[bool, str | None]:
     """
     global _guardrail_client
 
-    guardrail_id = os.getenv("BEDROCK_GUARDRAIL_ID", "")
-    if not guardrail_id or not guardrail_id.strip():
-        return True, None
     if not text or not text.strip():
         return True, None
+    # Fail closed when not configured. Guardrail IDs are regional, so call the
+    # region the guardrail was created in (the stack region), not REGION (Nova Sonic).
+    guardrail_id = (os.getenv("BEDROCK_GUARDRAIL_ID") or "").strip()
+    guardrail_region = (
+        os.getenv("BEDROCK_GUARDRAIL_REGION")
+        or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or ""
+    ).strip()
+    if not guardrail_id or not guardrail_region:
+        logger.error("Guardrail not configured (BEDROCK_GUARDRAIL_ID or region missing) — failing closed (%s)", source)
+        return False, _GUARDRAIL_UNAVAILABLE_MSG
     try:
         if _guardrail_client is None:
-            _guardrail_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+            _guardrail_client = boto3.client("bedrock-runtime", region_name=guardrail_region)
         response = _guardrail_client.apply_guardrail(
             guardrailIdentifier=guardrail_id,
             guardrailVersion="DRAFT",
@@ -112,8 +125,8 @@ def _apply_guardrail(text: str, source: str) -> tuple[bool, str | None]:
             return False, blocked_msg
         return True, None
     except Exception as e:
-        logger.error("Guardrail check failed (%s): %s", source, e)
-        return True, None
+        logger.error("Guardrail check failed — failing closed (%s): %s", source, e)
+        return False, _GUARDRAIL_UNAVAILABLE_MSG
 
 
 def make_client() -> BedrockRuntimeClient:

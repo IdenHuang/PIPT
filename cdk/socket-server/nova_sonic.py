@@ -77,6 +77,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Shown in place of AI text when the guardrail cannot be applied (missing
+# config or API error). The guardrail fails closed.
+_GUARDRAIL_UNAVAILABLE_MSG = "I'm unable to respond right now. Please try again in a moment."
+
 # Connection pool for better performance
 pg_conn_pool = None
 from threading import Lock
@@ -165,6 +169,18 @@ class NovaSonic:
         self.model_id = model_id
         self.region = 'us-east-1'
         self.deployment_region = region or os.getenv('AWS_REGION', 'us-east-1')
+        # Guardrail IDs are regional: call the region the guardrail was created in
+        # (the stack region), never the Nova Sonic region.
+        self.guardrail_id = (os.getenv("BEDROCK_GUARDRAIL_ID") or "").strip()
+        self.guardrail_region = (
+            os.getenv("BEDROCK_GUARDRAIL_REGION")
+            or os.getenv("AWS_REGION")
+            or os.getenv("AWS_DEFAULT_REGION")
+            or ""
+        ).strip()
+        if not self.guardrail_id or not self.guardrail_region:
+            logger.error("🛡️ Bedrock Guardrail not configured (BEDROCK_GUARDRAIL_ID or region missing) "
+                         "— AI text will be withheld for this session")
         self.client = None
         self.stream = None
         self.response = None
@@ -759,14 +775,17 @@ VOICE MODE OVERRIDE (IMPORTANT):
 
         # else: ignore other event types
     
-    def _get_bedrock_client(self):
-        """Cached bedrock client"""
+    def _get_guardrail_client(self):
+        """Cached bedrock-runtime client in the guardrail's region."""
         if not self._bedrock_client:
-            self._bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+            self._bedrock_client = boto3.client("bedrock-runtime", region_name=self.guardrail_region)
         return self._bedrock_client
 
     def _apply_guardrail(self, text: str, source: str) -> tuple:
         """Screen text through Bedrock Guardrails using the ApplyGuardrail API.
+
+        Fails closed: if the guardrail is not configured or the API call fails,
+        the text is reported as blocked rather than passed.
 
         Args:
             text: The text to evaluate.
@@ -776,15 +795,15 @@ VOICE MODE OVERRIDE (IMPORTANT):
             (passed: bool, replacement: str | None)
             If passed is False, replacement contains the guardrail's blocked message.
         """
-        guardrail_id = os.getenv("BEDROCK_GUARDRAIL_ID", "")
-        if not guardrail_id or not guardrail_id.strip():
-            return True, None
         if not text or not text.strip():
             return True, None
+        if not self.guardrail_id or not self.guardrail_region:
+            logger.error("Guardrail not configured — failing closed (%s)", source)
+            return False, _GUARDRAIL_UNAVAILABLE_MSG
         try:
-            client = self._get_bedrock_client()
+            client = self._get_guardrail_client()
             response = client.apply_guardrail(
-                guardrailIdentifier=guardrail_id,
+                guardrailIdentifier=self.guardrail_id,
                 guardrailVersion="DRAFT",
                 source=source,
                 content=[{"text": {"text": text}}],
@@ -796,9 +815,10 @@ VOICE MODE OVERRIDE (IMPORTANT):
                 return False, blocked_msg
             return True, None
         except Exception as e:
-            logger.error("Guardrail check failed (%s): %s", source, e)
-            # Fail open — don't block the conversation if the guardrail API is unreachable
-            return True, None
+            # Fail closed — boto3 already retries transient errors, and an
+            # unreachable guardrail must not turn into unscreened content.
+            logger.error("Guardrail check failed — failing closed (%s): %s", source, e)
+            return False, _GUARDRAIL_UNAVAILABLE_MSG
 
     def _clean_transcript(self, text):
         """Basic capitalization and whitespace cleanup for voice transcripts.

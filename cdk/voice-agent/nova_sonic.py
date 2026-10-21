@@ -77,6 +77,34 @@ import chat_history
 # reaches the frontend or gets persisted as a message.
 _INTERRUPTED_RE = re.compile(r'\{\s*"interrupted"\s*:\s*true\s*\}', re.IGNORECASE)
 
+# Shown in place of AI text when the guardrail cannot be applied (missing
+# config or API error). The guardrail fails closed: unscreened text is never
+# treated as "passed".
+_GUARDRAIL_UNAVAILABLE_MSG = "I'm unable to respond right now. Please try again in a moment."
+
+
+def resolve_guardrail_config(guardrail_id="", guardrail_region=""):
+    """Resolve the Bedrock Guardrail ID and region for this session.
+
+    Runtime environment variables take precedence over values supplied in the
+    init payload, so an operator-configured guardrail can't be overridden by
+    the caller. The region falls back to the deployment region (AWS_REGION);
+    it is never defaulted to us-east-1, because guardrail IDs are regional and
+    the guardrail lives in the stack region.
+
+    Returns:
+        (guardrail_id, guardrail_region) — either may be "" if not configured.
+    """
+    gid = (os.getenv("BEDROCK_GUARDRAIL_ID") or guardrail_id or "").strip()
+    region = (
+        os.getenv("BEDROCK_GUARDRAIL_REGION")
+        or guardrail_region
+        or os.getenv("AWS_REGION")
+        or os.getenv("AWS_DEFAULT_REGION")
+        or ""
+    ).strip()
+    return gid, region
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -251,13 +279,22 @@ class NovaSonic:
     def __init__(self, websocket, voice_id=None, session_id=None, region=None,
                  patient_name="", patient_prompt="", patient_id="",
                  simulation_group_id="", llm_completion=False, extra_system_prompt="",
-                 user_id=None, cognito_token="", text_generation_endpoint=""):
+                 user_id=None, cognito_token="", text_generation_endpoint="",
+                 guardrail_id="", guardrail_region=""):
         self.ws = websocket
         self.user_id = user_id or os.getenv("USER_ID")
         self.model_id = MODEL_ID
         # Nova Sonic is only available in us-east-1 regardless of deployment region
         self.region = "us-east-1"
         self.deployment_region = region or os.getenv("AWS_REGION", "us-east-1")
+        self.guardrail_id, self.guardrail_region = resolve_guardrail_config(
+            guardrail_id, guardrail_region
+        )
+        if not self.guardrail_id or not self.guardrail_region:
+            logger.error(
+                "🛡️ Bedrock Guardrail not configured (set BEDROCK_GUARDRAIL_ID or pass guardrail_id "
+                "in the init payload) — AI text will be withheld for this session"
+            )
 
         self.client = None
         self.stream = None
@@ -367,13 +404,17 @@ class NovaSonic:
         self.client = BedrockRuntimeClient(config=config)
         logger.info("Initialized Bedrock client for %s in %s", self.model_id, self.region)
 
-    def _get_bedrock_client(self):
+    def _get_guardrail_client(self):
+        # The guardrail lives in the stack region, not the Nova Sonic region (us-east-1).
         if not self._bedrock_client:
-            self._bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+            self._bedrock_client = boto3.client("bedrock-runtime", region_name=self.guardrail_region)
         return self._bedrock_client
 
     def _apply_guardrail(self, text: str, source: str) -> tuple:
         """Screen text through Bedrock Guardrails using the ApplyGuardrail API.
+
+        Fails closed: if the guardrail is not configured or the API call fails,
+        the text is reported as blocked rather than passed.
 
         Args:
             text: The text to evaluate.
@@ -383,15 +424,15 @@ class NovaSonic:
             (passed: bool, replacement: str | None)
             If passed is False, replacement contains the guardrail's blocked message.
         """
-        guardrail_id = os.getenv("BEDROCK_GUARDRAIL_ID", "")
-        if not guardrail_id or not guardrail_id.strip():
-            return True, None
         if not text or not text.strip():
             return True, None
+        if not self.guardrail_id or not self.guardrail_region:
+            logger.error("Guardrail not configured — failing closed (%s)", source)
+            return False, _GUARDRAIL_UNAVAILABLE_MSG
         try:
-            client = self._get_bedrock_client()
+            client = self._get_guardrail_client()
             response = client.apply_guardrail(
-                guardrailIdentifier=guardrail_id,
+                guardrailIdentifier=self.guardrail_id,
                 guardrailVersion="DRAFT",
                 source=source,
                 content=[{"text": {"text": text}}],
@@ -403,8 +444,10 @@ class NovaSonic:
                 return False, blocked_msg
             return True, None
         except Exception as e:
-            logger.error("Guardrail check failed (%s): %s", source, e)
-            return True, None
+            # boto3 already retries throttling/transient errors; don't let an
+            # unreachable guardrail turn into unscreened content.
+            logger.error("Guardrail check failed — failing closed (%s): %s", source, e)
+            return False, _GUARDRAIL_UNAVAILABLE_MSG
 
     def _get_medical_context(self):
         """Load the full patient case file from the pgvector store.

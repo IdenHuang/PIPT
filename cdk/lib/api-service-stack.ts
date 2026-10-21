@@ -1348,6 +1348,29 @@ export class ApiServiceStack extends cdk.Stack {
       description: "Bedrock Guardrail Version",
     });
 
+    new cdk.CfnOutput(this, "BedrockGuardrailArn", {
+      value: guardrail.attrGuardrailArn,
+      description: "Bedrock Guardrail ARN",
+    });
+
+    // Ready-to-paste inline policy for the AgentCore voice agent's service role.
+    // The AgentCore runtime is created in the console (outside CDK), so this
+    // permission can't be granted here; see docs/AGENTCORE_VOICE_AGENT_SETUP.md 4.10.
+    new cdk.CfnOutput(this, "AgentCoreGuardrailPolicy", {
+      value: cdk.Stack.of(this).toJsonString({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Sid: "ApplyPiptGuardrail",
+            Effect: "Allow",
+            Action: "bedrock:ApplyGuardrail",
+            Resource: guardrail.attrGuardrailArn,
+          },
+        ],
+      }),
+      description: "Paste into the AgentCore voice agent role as an inline policy (JSON tab)",
+    });
+
     /**
      * ECR Image Waiter Custom Resource
      * Waits for Docker images to exist in ECR before creating Lambda functions.
