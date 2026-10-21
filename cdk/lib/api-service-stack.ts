@@ -2554,6 +2554,14 @@ export class ApiServiceStack extends cdk.Stack {
       exportName: `${id}-IdentityPoolId`,
     });
 
+    // TEMPORARY (two-phase export removal): Amplify and EcsSocket no longer
+    // import the identity pool ID, but their deployed templates still do.
+    // Keep the auto-generated cross-stack export alive so this stack can
+    // deploy first; remove this line after Amplify and EcsSocket have been
+    // redeployed without the import.
+    // https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.Stack.html#exportwbrvalueexportedvalue-options
+    this.exportValue(this.identityPool.ref);
+
     new cdk.CfnOutput(this, 'Region', {
       value: this.region,
       description: 'AWS Region',
