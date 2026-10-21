@@ -213,6 +213,24 @@ def run_pg(operation, commit: bool = False):
                     pass
 
 
+def require_session_id(session_id: object) -> str:
+    """Return session_id if it is a chat UUID; otherwise raise ValueError.
+
+    session_id is the only partition key for the DynamoDB conversation history
+    (and the chat_id for Postgres messages, which is a uuid column). A missing
+    or non-UUID value must be rejected rather than replaced with a shared
+    literal like "default", which would let unrelated sessions read and write
+    one common history partition.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("session_id is required")
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        raise ValueError("session_id must be a chat UUID") from None
+    return session_id
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # NovaSonic — bidirectional streaming client
 # ═══════════════════════════════════════════════════════════════════════════
@@ -260,7 +278,9 @@ class NovaSonic:
         self.display_assistant_text = False
 
         self.voice_id = voice_id
-        self.session_id = session_id or "default"
+        # session_id is the sole DynamoDB history partition key, so a missing
+        # value must fail rather than fall back to a shared key.
+        self.session_id = require_session_id(session_id)
         self.patient_name = patient_name
         self.patient_prompt = patient_prompt
         self.llm_completion = llm_completion

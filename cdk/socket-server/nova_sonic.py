@@ -122,6 +122,23 @@ def get_pg_connection():
         return pg_conn_pool.getconn()
 
 
+def require_session_id(session_id: object) -> str:
+    """Return session_id if it is a chat UUID; otherwise raise ValueError.
+
+    session_id is the only partition key for the DynamoDB conversation history
+    (and the chat_id for Postgres messages, a uuid column). A missing or
+    non-UUID value must be rejected rather than replaced with a shared literal
+    like "default", which would let unrelated sessions share one history.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("session_id is required")
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        raise ValueError("session_id must be a chat UUID") from None
+    return session_id
+
+
 class NovaSonic:
 
     def refresh_env_credentials(self):
@@ -159,7 +176,8 @@ class NovaSonic:
         self.role = None
         self.display_assistant_text = False
         self.voice_id = voice_id
-        self.session_id = session_id or os.getenv("SESSION_ID", "default")
+        # Sole DynamoDB history partition key: fail rather than share a default.
+        self.session_id = require_session_id(session_id or os.getenv("SESSION_ID"))
         self.patient_name = os.getenv("PATIENT_NAME", "")
         self.patient_prompt = os.getenv("PATIENT_PROMPT", "")
         self.llm_completion = os.getenv("LLM_COMPLETION", "false").lower() == "true"
@@ -928,7 +946,11 @@ async def handle_stdin(nova_client, reader):
 
 async def main():
     voice = os.getenv("VOICE_ID")
-    session_id = os.getenv("SESSION_ID", "default")
+    try:
+        session_id = require_session_id(os.getenv("SESSION_ID"))
+    except ValueError as e:
+        print(f"❌ Refusing to start Nova Sonic: {e}", flush=True)
+        sys.exit(1)
     deployment_region = os.getenv("AWS_REGION")
     nova_client = NovaSonic(voice_id=voice, session_id=session_id, region=deployment_region)
     
