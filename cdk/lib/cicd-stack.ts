@@ -35,15 +35,7 @@ export class CICDStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal("codebuild.amazonaws.com"),
     });
 
-    // REVIEW: The CodeBuild role has AmazonEC2ContainerRegistryPowerUser which grants
-    // push/pull to ALL ECR repositories in the account. Since we grant per-repo push via
-    // ecrRepo.grantPullPush(buildProject), the managed policy is redundant and overly broad.
-    // Remove it and rely on the per-repo grants instead.
-    codeBuildRole.addManagedPolicy(
-      iam.ManagedPolicy.fromAwsManagedPolicyName(
-        "AmazonEC2ContainerRegistryPowerUser"
-      )
-    );
+    // ECR access is granted per repository inside the loop below, not account-wide.
 
     codeBuildRole.addToPolicy(
       new iam.PolicyStatement({
@@ -319,6 +311,10 @@ export class CICDStack extends cdk.Stack {
 
       // Grant permissions to push to ECR
       ecrRepo.grantPullPush(buildProject);
+      // grantPullPush doesn't cover these: check_and_build.sh calls describe-images,
+      // and the vulnerability gate calls describe-image-scan-findings. Without them
+      // both checks swallow AccessDenied and the gate promotes images unchecked.
+      ecrRepo.grant(buildProject, "ecr:DescribeImages", "ecr:DescribeImageScanFindings");
 
       // Add build action to the list
       buildActions.push(
