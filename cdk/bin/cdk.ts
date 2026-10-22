@@ -57,7 +57,9 @@ const vpcStack = new VpcStack(app, `${StackPrefix}-VpcStack`, {
 });
 const dbStack = new DatabaseStack(app, `${StackPrefix}-Database`, vpcStack, {
   env,
-  terminationProtection: false,
+  // Reject stack deletion outright; RDS deletionProtection only guards the instance,
+  // not the proxy, IAM role, or app credential secrets in this stack.
+  terminationProtection: true,
 });
 
 // CloudFront WAF must be in us-east-1 (AWS requirement for CLOUDFRONT scope)
