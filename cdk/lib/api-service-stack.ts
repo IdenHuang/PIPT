@@ -1823,7 +1823,10 @@ export class ApiServiceStack extends cdk.Stack {
         securityGroups: [apiLambdaSg],
         functionName: `${id}-DataIngestLambdaDockerFunction`,
         environment: {
-          SM_DB_CREDENTIALS: db.secretPathAdminName,
+          // Least-privilege app_tc user (DML + CREATE on public), not the RDS
+          // master credential. CREATE is needed by SQLRecordManager.create_schema()
+          // and PGVector's langchain table creation.
+          SM_DB_CREDENTIALS: db.secretPathTableCreator.secretName,
           RDS_PROXY_ENDPOINT: db.rdsProxyEndpoint,
           BUCKET: dataIngestionBucket.bucketName,
           REGION: this.region,
@@ -1892,17 +1895,13 @@ export class ApiServiceStack extends cdk.Stack {
       );
     }
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: only the app_tc DB credential, the sole
+    // secret this function reads (SM_DB_CREDENTIALS in data_ingestion/src/main.py).
     dataIngestLambdaDockerFunc.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathTableCreator.secretArn],
       })
     );
 
@@ -1953,7 +1952,42 @@ export class ApiServiceStack extends cdk.Stack {
       }
     );
 
-    // This rule will help invoke timeout Lambda function when the alarm is triggered
+    // Alert when data_ingestion finds readwrite (app_rw) still holding forbidden
+    // privileges on the vectorstore tables after narrowing (e.g. UPDATE on
+    // langchain_pg_embedding). Ingestion keeps running, so without this the
+    // failure would only show up in the logs. The pattern must match
+    // READWRITE_PRIVILEGE_CHECK_FAILED in data_ingestion/src/helpers/helper.py.
+    const readwritePrivilegeMetricFilter = new logs.MetricFilter(
+      this,
+      `${id}-ReadwritePrivilegeCheckMetricFilter`,
+      {
+        logGroup: logGroup,
+        metricNamespace: "DataIngestion",
+        metricName: "ReadwritePrivilegeCheckFailures",
+        filterPattern: logs.FilterPattern.literal("READWRITE_PRIVILEGE_CHECK_FAILED"),
+        metricValue: "1",
+      }
+    );
+
+    new cloudwatch.Alarm(this, `${id}-ReadwritePrivilegeCheckAlarm`, {
+      alarmName: `${id}-DataIngest-ReadwritePrivilegeCheck`,
+      alarmDescription:
+        "app_rw (readwrite) still holds forbidden privileges on vectorstore tables — embeddings may be writable by text_generation; check data ingestion logs",
+      metric: readwritePrivilegeMetricFilter.metric({
+        statistic: "Sum",
+        period: cdk.Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator:
+        cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
+    // This rule will help invoke timeout Lambda function when the alarm is triggered.
+    // Scoped to the timeout alarm: an unscoped pattern matches every alarm in
+    // the account, so any other alarm (e.g. the privilege check above, which
+    // fires mid-ingest) would mark in-flight files as "error".
     const timeoutRule = new events.Rule(
       this,
       `${id}-DataIngestLambdaTimeoutRule`,
@@ -1961,6 +1995,7 @@ export class ApiServiceStack extends cdk.Stack {
         eventPattern: {
           source: ["aws.cloudwatch"],
           detailType: ["CloudWatch Alarm State Change"],
+          resources: [timeoutAlarm.alarmArn],
           detail: {
             state: { value: ["ALARM", "OK"] },
           },

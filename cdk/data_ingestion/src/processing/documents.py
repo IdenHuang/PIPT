@@ -278,6 +278,10 @@ def process_documents(
     """
     folders = ["documents", "info", "answer_key"]
     all_doc_chunks = []
+    # Files are marked "completed" only after index() has written their
+    # embeddings. Marking them earlier meant a failure inside index() left
+    # them "completed" with no embeddings, and later runs skipped them.
+    processed_file_paths = []
     
     for folder in folders:
         paginator = s3.get_paginator('list_objects_v2')
@@ -310,9 +314,11 @@ def process_documents(
                     )
 
                     all_doc_chunks.extend(this_doc_chunks)
-                    update_ingestion_status(persona_id, file_path, "completed", connection)
+                    processed_file_paths.append(file_path)
     
     if all_doc_chunks:  # Check if there are any documents to index
+        # If this raises, no file is marked "completed", so they are all
+        # re-derived from the original upload on the next run.
         idx = index(
             all_doc_chunks, 
             record_manager, 
@@ -323,3 +329,6 @@ def process_documents(
         logger.info(f"Indexing updates: \n {idx}")
     else:
         logger.info("No documents found for indexing.")
+
+    for file_path in processed_file_paths:
+        update_ingestion_status(persona_id, file_path, "completed", connection)

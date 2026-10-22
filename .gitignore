@@ -1,6 +1,7 @@
 .hypothesis
 # Kiro
 .kiro
+.agents/
 
 # Environment variables
 .env
