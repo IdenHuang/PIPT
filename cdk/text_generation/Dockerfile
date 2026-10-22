@@ -13,8 +13,13 @@ FROM public.ecr.aws/lambda/python:3.12
 
 ENV PYTHONUNBUFFERED=1
 
-# Install only runtime shared libraries
-RUN dnf -y install libpq && dnf clean all
+# Apply OS security updates the base image tag may not include yet, then
+# install only runtime shared libraries. AL2023 pins dnf to the image's release,
+# so --releasever=latest is needed to see newer patched packages.
+# https://docs.aws.amazon.com/linux/al2023/ug/deterministic-upgrades.html
+RUN dnf -y upgrade --releasever=latest \
+    && dnf -y install --releasever=latest libpq \
+    && dnf clean all
 
 # Copy compiled packages from builder
 COPY --from=builder /install ${LAMBDA_TASK_ROOT}
