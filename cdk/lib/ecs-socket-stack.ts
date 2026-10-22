@@ -84,11 +84,10 @@ export class EcsSocketStack extends Stack {
               ],
               resources: ["*"],
             }),
-            new iam.PolicyStatement({
-              effect: iam.Effect.ALLOW,
-              actions: ["sts:AssumeRole", "sts:GetCallerIdentity"],
-              resources: ["*"],
-            }),
+            // No sts:AssumeRole here: the socket server never assumes another role,
+            // and an unscoped AssumeRole would let it pivot into any role that trusts
+            // this account (and read secrets through it). sts:GetCallerIdentity
+            // needs no IAM permission.
           ],
         }),
       },

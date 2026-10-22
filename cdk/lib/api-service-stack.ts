@@ -462,19 +462,18 @@ export class ApiServiceStack extends cdk.Stack {
       }
     );
 
-    // REVIEW: Secrets Manager access is granted on `*` (all secrets in the account).
-    // Scope this to the specific secret ARNs that each Lambda actually needs:
-    //   resources: [db.secretPathUser.secretArn]
-    // This applies to lambdaRole, coglambdaRole, and every per-function grant below.
+    // Secrets Manager: student, instructor and timeout-handler functions read the
+    // app_rw credential; the admin function reads app_tc. The JWT authorizers read
+    // no secrets. Because the role is shared, it holds the union of both.
+    // REVIEW: Moving the admin function (and the authorizers) onto their own roles
+    // would let this role drop app_tc and keep only db.secretPathUser.
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
         resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
+          db.secretPathUser.secretArn,
+          db.secretPathTableCreator.secretArn,
         ],
       })
     );
@@ -666,17 +665,13 @@ export class ApiServiceStack extends cdk.Stack {
       }
     );
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: addStudentOnSignUp reads only the app_tc
+    // credential (SM_DB_CREDENTIALS). preSignupLambda reads no secrets (SSM only).
     coglambdaRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathTableCreator.secretArn],
       })
     );
 
@@ -728,20 +723,6 @@ export class ApiServiceStack extends cdk.Stack {
         resources: [
           `arn:aws:iam::${this.account}:user/*`,
           `arn:aws:iam::${this.account}:group/*`,
-        ],
-      })
-    );
-
-    coglambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: [
-          // Secrets Manager
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
         ],
       })
     );
@@ -2041,6 +2022,11 @@ export class ApiServiceStack extends cdk.Stack {
     // Link the EventBridge rule to trigger timeoutHandlerLambda
     timeoutRule.addTarget(new targets.LambdaFunction(timeoutHandlerLambda));
 
+    // CloudFront signing key used by the signed-URL Lambdas below. It is created
+    // out-of-band (docs/DEPLOYMENT_GUIDE.md, "Secret 3"), not by CDK, so reference
+    // it by name and match Secrets Manager's 6-character ARN suffix.
+    const cfSigningKeySecretArn = `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${stackPrefix}/CloudFrontSigningKey-??????`;
+
     /**
      *
      * Create Lambda function that will return all file names for a specified simulation group and patient
@@ -2080,17 +2066,12 @@ export class ApiServiceStack extends cdk.Stack {
     // Grant the Lambda function read-only permissions to the S3 bucket
     dataIngestionBucket.grantRead(getFilesFunction);
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: app_rw credential + CloudFront signing key
     getFilesFunction.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathUser.secretArn, cfSigningKeySecretArn],
       })
     );
 
@@ -2140,17 +2121,12 @@ export class ApiServiceStack extends cdk.Stack {
     // Grant the Lambda function read-only permissions to the S3 bucket
     dataIngestionBucket.grantRead(getFilesFunctionStudent);
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: app_rw credential + CloudFront signing key
     getFilesFunctionStudent.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathUser.secretArn, cfSigningKeySecretArn],
       })
     );
 
@@ -2197,17 +2173,12 @@ export class ApiServiceStack extends cdk.Stack {
       .defaultChild as lambda.CfnFunction;
     cfnGetProfilePictures.overrideLogicalId("GetProfilePictures");
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: app_rw credential + CloudFront signing key
     getProfilePictures.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathUser.secretArn, cfSigningKeySecretArn],
       })
     );
 
@@ -2254,17 +2225,12 @@ export class ApiServiceStack extends cdk.Stack {
       .defaultChild as lambda.CfnFunction;
     cfnGetProfilePicturesStudent.overrideLogicalId("GetProfilePicturesStudent");
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: app_rw credential + CloudFront signing key
     getProfilePicturesStudent.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathUser.secretArn, cfSigningKeySecretArn],
       })
     );
 
@@ -2306,17 +2272,12 @@ export class ApiServiceStack extends cdk.Stack {
     // Grant the Lambda function the necessary permissions
     dataIngestionBucket.grantDelete(deleteFile);
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: app_rw credential only
     deleteFile.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathUser.secretArn],
       })
     );
 
@@ -2423,17 +2384,12 @@ export class ApiServiceStack extends cdk.Stack {
       .defaultChild as lambda.CfnFunction;
     cfnDeleteLastMessage.overrideLogicalId("DeleteLastMessage");
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: app_rw credential only
     deleteLastMessage.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathUser.secretArn],
       })
     );
 
