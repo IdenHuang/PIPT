@@ -81,6 +81,11 @@ WHERE to_regclass('public.' || f.tbl) IS NOT NULL
   AND has_table_privilege('readwrite', to_regclass('public.' || f.tbl), f.priv);
 """
 
+# Logged when readwrite still holds forbidden privileges after narrowing. A
+# CloudWatch metric filter in cdk/lib/api-service-stack.ts matches this exact
+# string and drives the ReadwritePrivilegeCheck alarm; don't change it alone.
+READWRITE_PRIVILEGE_CHECK_FAILED = "READWRITE_PRIVILEGE_CHECK_FAILED"
+
 def grant_readwrite_on_vectorstore_tables(connection) -> bool:
     """Apply READWRITE_GRANTS_SQL on the app_tc psycopg2 connection, then
     confirm readwrite holds none of READWRITE_FORBIDDEN_PRIVILEGES_SQL.
@@ -91,7 +96,11 @@ def grant_readwrite_on_vectorstore_tables(connection) -> bool:
     A failure is logged, not raised: ingestion itself is unaffected, and
     readwrite keeps SELECT from the default privileges, so RAG retrieval still
     works. Only deleteFile's DELETE would be missing until the next deploy,
-    when db_setup re-runs the same grants.
+    when db_setup re-runs the same grants (and fails the deploy if forbidden
+    privileges remain).
+
+    Leftover forbidden privileges are logged with READWRITE_PRIVILEGE_CHECK_FAILED
+    so the CloudWatch alarm fires instead of the failure only reaching the logs.
 
     Returns True only if the grants were applied and the check is clean, so
     main.py tries again on the next invocation otherwise.
@@ -104,7 +113,10 @@ def grant_readwrite_on_vectorstore_tables(connection) -> bool:
         if not connection.autocommit:
             connection.commit()
         if leftover:
-            logger.error(f"readwrite still holds privileges it should not have on vectorstore tables: {leftover}")
+            logger.error(
+                f"{READWRITE_PRIVILEGE_CHECK_FAILED}: readwrite still holds privileges "
+                f"it should not have on vectorstore tables: {leftover}"
+            )
             return False
         return True
     except Exception as e:

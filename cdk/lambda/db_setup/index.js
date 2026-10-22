@@ -96,14 +96,14 @@ async function createAppUsers(
     GRANT USAGE ON SCHEMA public TO tablecreator;
     GRANT CREATE ON SCHEMA public TO tablecreator;
 
-    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO readwrite;
-    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO tablecreator;
-
-    ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO readwrite;
+    ${adminOwnedGrantsSql()}
     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO tablecreator;
 
-    GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO readwrite;
-    GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO tablecreator;
+    -- readwrite gets no blanket table access: earlier versions granted it full
+    -- DML on every table (and every future admin-created table) by default.
+    -- Grants persist until revoked, so drop that default here; the per-table
+    -- reset below replaces the existing table grants.
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM readwrite;
 
     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO readwrite;
     ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO tablecreator;
@@ -126,11 +126,12 @@ async function createAppUsers(
     GRANT readwrite TO ${RW_NAME};
     GRANT tablecreator TO ${TC_NAME};
 
-    -- The blanket GRANT ON ALL TABLES above also covers the vectorstore tables
-    -- when the admin owns them (databases where they were created before
-    -- data_ingestion moved to app_tc). Narrow them here, in the same
-    -- transaction, so readwrite never ends up with UPDATE on embeddings.
-    ${readwriteNarrowingSql({ namedTablesOnly: true })}
+    -- Every admin-owned table: reset readwrite to exactly READWRITE_TABLE_PRIVILEGES
+    -- (application tables, plus the vectorstore tables on databases where the
+    -- admin created them before data_ingestion moved to app_tc). Anything
+    -- unlisted (pgmigrations, legacy tables) gets nothing. Runs in this
+    -- transaction, so live connections never see the tables without grants.
+    ${readwriteNarrowingSql(READWRITE_TABLE_PRIVILEGES)}
   `;
 
   await adminClient.query("BEGIN");
@@ -204,57 +205,154 @@ async function grantReadwriteOnTableCreatorObjects(adminDb, tcName, tcPass) {
 
       -- Every app_tc-owned table: reset readwrite's access to exactly what it
       -- needs. Unlisted tables (upsertion_record, anything new) get nothing.
-      ${readwriteNarrowingSql({ namedTablesOnly: false })}
+      ${readwriteNarrowingSql(VECTORSTORE_TABLE_PRIVILEGES)}
     `);
 
     // A REVOKE only removes grants made by the revoking role (or the owner),
     // so confirm the end state instead of trusting that the statements ran.
+    // Fail closed: throwing fails the TriggerFunction and therefore the deploy,
+    // rather than reporting success while app_rw can still rewrite embeddings.
+    // Safe to throw here: the rotated passwords are already in Secrets Manager.
     const { rows } = await tcClient.query(READWRITE_FORBIDDEN_PRIVILEGES_SQL);
-    if (rows.length > 0) {
-      console.error(JSON.stringify({
-        level: "ERROR",
-        message: "readwrite still holds privileges it should not have on vectorstore tables",
-        privileges: rows,
-      }));
-    }
+    assertNoForbiddenPrivileges(rows);
   } finally {
     await tcClient.end();
   }
 }
 
 /**
- * Reset readwrite's privileges on tables owned by the current role.
- *
- *   langchain_pg_collection: SELECT, INSERT
- *   langchain_pg_embedding:  SELECT, DELETE
- *   anything else:           nothing
- *
- * namedTablesOnly limits it to the three vectorstore tables. The admin uses
- * this so it doesn't touch the application tables it owns. app_tc owns only
- * tables it created, so it narrows all of them.
- *
+ * readwrite's privileges on the vectorstore tables (see
+ * grantReadwriteOnTableCreatorObjects for who uses what). upsertion_record is
+ * deliberately absent: app_rw never touches it, so it gets nothing.
  * Keep in sync with READWRITE_GRANTS_SQL in data_ingestion/src/helpers/helper.py.
  */
-function readwriteNarrowingSql({ namedTablesOnly }) {
-  const nameFilter = namedTablesOnly
-    ? "AND c.relname IN ('langchain_pg_collection', 'langchain_pg_embedding', 'upsertion_record')"
-    : "";
+const VECTORSTORE_TABLE_PRIVILEGES = Object.freeze({
+  langchain_pg_collection: "SELECT, INSERT",
+  langchain_pg_embedding: "SELECT, DELETE",
+});
+
+/**
+ * Exactly what readwrite (app_rw) may do on each application table, from the
+ * SQL the app_rw services run: lambda/lib/studentFunction.js,
+ * lambda/lib/instructorFunction.js, text_generation, socket-server,
+ * voice-agent, deleteFile, deleteLastMessage, timeoutHandler (and the
+ * read-only getFiles / getProfilePictures / generatePreSignedURL /
+ * deletePatient). adminFunction and addStudentOnSignUp connect as app_tc and
+ * aren't covered here.
+ *
+ * Foreign-key cascades run as the table owner, so a DELETE on a parent (e.g.
+ * personas) doesn't need DELETE on its child tables.
+ *
+ * A table missing from this map gets NO access for app_rw. When a migration
+ * adds a table the app_rw services use, add it here in the same change
+ * (test/readwritePrivilegeCheck.test.ts fails otherwise).
+ */
+const APPLICATION_TABLE_PRIVILEGES = Object.freeze({
+  chats: "SELECT, INSERT, UPDATE, DELETE",
+  debrief_feedback: "SELECT, INSERT",
+  debrief_prompt_history: "SELECT, INSERT",
+  debriefs: "SELECT, INSERT",
+  dtp_bank: "SELECT, INSERT, UPDATE",
+  enrollments: "SELECT, INSERT, DELETE",
+  feedback: "SELECT",
+  group_instructors: "SELECT",
+  issue_reports: "SELECT, INSERT",
+  key_questions: "SELECT",
+  messages: "SELECT, INSERT, UPDATE, DELETE",
+  organizations: "SELECT",
+  persona_data: "SELECT, INSERT, UPDATE, DELETE",
+  persona_media: "SELECT, INSERT, UPDATE, DELETE",
+  personas: "SELECT, INSERT, UPDATE, DELETE",
+  question_bank: "SELECT, INSERT, UPDATE",
+  question_interactions: "SELECT, INSERT",
+  recommendations_bank: "SELECT, INSERT, UPDATE",
+  rubrics: "SELECT",
+  simulation_group_dtps: "SELECT, INSERT, UPDATE, DELETE",
+  simulation_group_questions: "SELECT, INSERT, UPDATE, DELETE",
+  simulation_group_recommendations: "SELECT, INSERT, UPDATE, DELETE",
+  simulation_groups: "SELECT, INSERT, UPDATE",
+  student_interactions: "SELECT, INSERT, UPDATE",
+  system_prompt_history: "SELECT",
+  user_engagement_log: "SELECT, INSERT",
+  users: "SELECT, INSERT, UPDATE",
+});
+
+const READWRITE_TABLE_PRIVILEGES = Object.freeze({
+  ...APPLICATION_TABLE_PRIVILEGES,
+  ...VECTORSTORE_TABLE_PRIVILEGES,
+});
+
+/**
+ * What used to be "GRANT ... ON ALL TABLES / ALL SEQUENCES IN SCHEMA public",
+ * limited to objects the admin owns:
+ *   tablecreator: SELECT, INSERT, UPDATE, DELETE on every admin-owned table
+ *   readwrite, tablecreator: USAGE on every admin-owned sequence
+ *
+ * The ALL TABLES form fails outright ("permission denied for table ...") as
+ * soon as the schema holds a table the admin has no privileges on, which is
+ * the case once data_ingestion (app_tc) has created the vectorstore tables. A
+ * role always holds full privileges on what it owns, so app_tc loses nothing.
+ */
+function adminOwnedGrantsSql() {
   return `
     DO $$
     DECLARE r record;
     BEGIN
       FOR r IN
-        SELECT c.relname,
-               CASE c.relname
-                 WHEN 'langchain_pg_collection' THEN 'SELECT, INSERT'
-                 WHEN 'langchain_pg_embedding'  THEN 'SELECT, DELETE'
-               END AS privs
+        SELECT c.relname, c.relkind
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'public'
+          AND c.relkind IN ('r', 'p', 'S')
+          AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+      LOOP
+        IF r.relkind = 'S' THEN
+          EXECUTE format('GRANT USAGE ON SEQUENCE public.%I TO readwrite, tablecreator', r.relname);
+        ELSE
+          EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO tablecreator', r.relname);
+        END IF;
+      END LOOP;
+    END$$;
+  `;
+}
+
+const PRIVILEGE_LIST_RE = /^(SELECT|INSERT|UPDATE|DELETE)(, (SELECT|INSERT|UPDATE|DELETE))*$/;
+const TABLE_NAME_RE = /^[a-z_][a-z0-9_]*$/;
+
+/**
+ * Reset readwrite's privileges on every public table owned by the current
+ * role: REVOKE ALL, then GRANT exactly what privilegeMap lists. Tables not in
+ * the map end up with nothing. Tables owned by other roles aren't touched (the
+ * current role couldn't change them anyway).
+ *
+ * The admin passes READWRITE_TABLE_PRIVILEGES; app_tc, which only owns the
+ * vectorstore tables it created, passes VECTORSTORE_TABLE_PRIVILEGES.
+ *
+ * Keep in sync with READWRITE_GRANTS_SQL in data_ingestion/src/helpers/helper.py.
+ */
+function readwriteNarrowingSql(privilegeMap) {
+  const entries = Object.entries(privilegeMap);
+  for (const [tbl, privs] of entries) {
+    // Constants, but they're interpolated into SQL, so check them anyway.
+    if (!TABLE_NAME_RE.test(tbl) || !PRIVILEGE_LIST_RE.test(privs)) {
+      throw new Error(`Invalid readwrite privilege entry: ${tbl} => ${privs}`);
+    }
+  }
+  const values = entries.map(([tbl, privs]) => `('${tbl}', '${privs}')`).join(",\n          ");
+  return `
+    DO $$
+    DECLARE r record;
+    BEGIN
+      FOR r IN
+        SELECT c.relname, m.privs
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN (VALUES
+          ${values}
+        ) AS m(tbl, privs) ON m.tbl = c.relname
+        WHERE n.nspname = 'public'
           AND c.relkind IN ('r', 'p')
           AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)
-          ${nameFilter}
       LOOP
         EXECUTE format('REVOKE ALL ON TABLE public.%I FROM readwrite', r.relname);
         IF r.privs IS NOT NULL THEN
@@ -278,6 +376,25 @@ const READWRITE_FORBIDDEN_PRIVILEGES_SQL = `
   WHERE to_regclass('public.' || f.tbl) IS NOT NULL
     AND has_table_privilege('readwrite', to_regclass('public.' || f.tbl), f.priv);
 `;
+
+/**
+ * Throw if READWRITE_FORBIDDEN_PRIVILEGES_SQL returned any rows.
+ *
+ * The usual cause is a vectorstore table owned by a role other than the admin
+ * or app_tc (neither narrowing pass touches it), or a grant made by a third
+ * role (a REVOKE can't remove it). Fix by revoking as that owner/grantor, or
+ * moving ownership to app_tc, then redeploy.
+ */
+function assertNoForbiddenPrivileges(rows) {
+  if (!rows || rows.length === 0) return;
+  const pairs = rows.map((r) => `${r.tbl}:${r.priv}`).join(", ");
+  console.error(JSON.stringify({
+    level: "ERROR",
+    message: "readwrite still holds privileges it should not have on vectorstore tables",
+    privileges: rows,
+  }));
+  throw new Error(`readwrite still holds forbidden privileges on vectorstore tables: ${pairs}`);
+}
 
 exports.handler = async function (event, context) {
   const requestId = context?.awsRequestId || "unknown";
@@ -304,3 +421,11 @@ exports.handler = async function (event, context) {
     throw error;
   }
 };
+
+// Exported for unit tests.
+exports.assertNoForbiddenPrivileges = assertNoForbiddenPrivileges;
+exports.readwriteNarrowingSql = readwriteNarrowingSql;
+exports.APPLICATION_TABLE_PRIVILEGES = APPLICATION_TABLE_PRIVILEGES;
+exports.VECTORSTORE_TABLE_PRIVILEGES = VECTORSTORE_TABLE_PRIVILEGES;
+exports.READWRITE_TABLE_PRIVILEGES = READWRITE_TABLE_PRIVILEGES;
+exports.READWRITE_FORBIDDEN_PRIVILEGES_SQL = READWRITE_FORBIDDEN_PRIVILEGES_SQL;

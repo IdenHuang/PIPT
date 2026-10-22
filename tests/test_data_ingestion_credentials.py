@@ -440,7 +440,16 @@ def test_grant_reports_failure_when_forbidden_privileges_remain(main, caplog):
     assert main._helper.grant_readwrite_on_vectorstore_tables(conn) is True
     conn.leftover_privileges = [("langchain_pg_embedding", "UPDATE")]
     assert main._helper.grant_readwrite_on_vectorstore_tables(conn) is False
-    assert "langchain_pg_embedding" in _logged(caplog)
+    logged = _logged(caplog)
+    assert "langchain_pg_embedding" in logged
+    # The CloudWatch alarm's metric filter keys on this exact marker.
+    assert main._helper.READWRITE_PRIVILEGE_CHECK_FAILED == "READWRITE_PRIVILEGE_CHECK_FAILED"
+    assert "READWRITE_PRIVILEGE_CHECK_FAILED" in logged
+
+
+def test_privilege_check_marker_not_logged_when_clean(main, caplog):
+    assert main._helper.grant_readwrite_on_vectorstore_tables(FakeConn("x")) is True
+    assert "READWRITE_PRIVILEGE_CHECK_FAILED" not in _logged(caplog)
 
 
 def test_forbidden_privileges_check_covers_write_paths(main):
