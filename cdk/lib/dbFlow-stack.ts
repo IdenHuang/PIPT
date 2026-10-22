@@ -83,13 +83,6 @@ export class DBFlowStack extends Stack {
             iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMReadOnlyAccess")
         );
 
-    // REVIEW: The DBFlow stack grants AmazonS3FullAccess to the migration Lambda.
-    // The migration runner only needs Secrets Manager and RDS access — it never touches S3.
-    // Remove this managed policy to follow least privilege.
-    lambdaRole.addManagedPolicy(
-            iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonS3FullAccess")
-        );
-
         // REVIEW: The TriggerFunction runs on every CDK deployment (by design — the timestamp
         // in the description forces a new version). This is correct for running migrations, but
         // the 300-second timeout may be tight if migrations are complex. Consider increasing to 600s.
