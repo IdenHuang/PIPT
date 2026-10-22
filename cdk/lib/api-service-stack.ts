@@ -319,7 +319,11 @@ export class ApiServiceStack extends cdk.Stack {
         requireSymbols: false,
       },
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      // Retain on stack delete/replacement; user accounts (and password hashes)
+      // are unrecoverable once the pool is deleted.
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+      // Blocks DeleteUserPool from console/CLI/CloudFormation until explicitly disabled.
+      deletionProtection: true,
     });
 
     // Create app client

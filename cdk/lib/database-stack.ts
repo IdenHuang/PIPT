@@ -38,6 +38,16 @@ export class DatabaseStack extends Stack {
 
         /**
          * Create Secrets for various users
+         *
+         * NOTE (accepted risk): The two app credential secrets below are seeded with fixed
+         * placeholder values via SecretValue.unsafePlainText, so those values appear in the
+         * synthesized template and CloudFormation history. This is intentional:
+         *   - The placeholders are non-functional: no DB user has these credentials. The DBFlow
+         *     TriggerFunction (lambda/db_setup) creates app_rw / app_tc with random passwords and
+         *     overwrites both secrets via PutSecretValue on every deploy.
+         *   - Switching to generateSecretString adds no protection. Any change to the seeded
+         *     value creates a new secret version that overwrites the rotated credentials, so DB
+         *     access breaks until DBFlow runs again. Leave these values unchanged.
          */
         this.secretPathAdminName = `${id}/credentials/rdsDbCredential`;
         const secretPathUserName = `${id}/userCredentials/rdsDbCredential`;
@@ -46,8 +56,8 @@ export class DatabaseStack extends Stack {
             description: "Secrets for clients to connect to RDS",
             removalPolicy: RemovalPolicy.DESTROY,
             secretObjectValue: {
-                username: SecretValue.unsafePlainText("applicationUsername"),   // will be changed at runtime
-                password: SecretValue.unsafePlainText("applicationPassword")    // will be changed at runtime
+                username: SecretValue.unsafePlainText("applicationUsername"),   // placeholder, see NOTE above
+                password: SecretValue.unsafePlainText("applicationPassword")    // placeholder, see NOTE above
             }
         });
 
@@ -57,8 +67,8 @@ export class DatabaseStack extends Stack {
             description: "Secrets for TableCreator to connect to RDS",
             removalPolicy: RemovalPolicy.DESTROY,
             secretObjectValue: {
-                username: SecretValue.unsafePlainText("applicationUsername"),   // will be changed at runtime
-                password: SecretValue.unsafePlainText("applicationPassword")    // will be changed at runtime
+                username: SecretValue.unsafePlainText("applicationUsername"),   // placeholder, see NOTE above
+                password: SecretValue.unsafePlainText("applicationPassword")    // placeholder, see NOTE above
             }
         });
 
