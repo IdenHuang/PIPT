@@ -74,7 +74,27 @@ export class EcsSocketStack extends Stack {
                 "bedrock:InvokeModelWithResponseStream",
                 "bedrock:ApplyGuardrail",
               ],
-              resources: ["*"],
+              // Scoped to specific models instead of "*" so leaked task credentials
+              // can't invoke arbitrary models in the account.
+              resources: [
+                // Same models/inference profiles as the textGen Lambda role
+                // (cdk/lib/api-service-stack.ts, bedrockPolicyStatement).
+                "arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-4-6",
+                "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6",
+                `arn:aws:bedrock:${this.region}::foundation-model/amazon.titan-embed-text-v2:0`,
+                "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0",
+                "arn:aws:bedrock:us-east-1::foundation-model/cohere.embed-v4:0",
+                // PIPT guardrail (Api stack deploys to the same region as this stack).
+                `arn:aws:bedrock:${this.region}:${this.account}:guardrail/*`,
+                // Models the socket server calls directly. Keep in sync with the
+                // model IDs and regions in cdk/socket-server/nova_sonic.py and
+                // cdk/socket-server/voice_preview_tts.py.
+                "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-sonic-v1:0",
+                "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-2-sonic-v1:0",
+                `arn:aws:bedrock:${this.region}::foundation-model/amazon.nova-lite-v1:0`,
+                // us-east-1 fallback used by the diagnosis check in nova_sonic.py
+                "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0",
+              ],
             }),
             new iam.PolicyStatement({
               effect: iam.Effect.ALLOW,
