@@ -1823,7 +1823,10 @@ export class ApiServiceStack extends cdk.Stack {
         securityGroups: [apiLambdaSg],
         functionName: `${id}-DataIngestLambdaDockerFunction`,
         environment: {
-          SM_DB_CREDENTIALS: db.secretPathAdminName,
+          // Least-privilege app_tc user (DML + CREATE on public), not the RDS
+          // master credential. CREATE is needed by SQLRecordManager.create_schema()
+          // and PGVector's langchain table creation.
+          SM_DB_CREDENTIALS: db.secretPathTableCreator.secretName,
           RDS_PROXY_ENDPOINT: db.rdsProxyEndpoint,
           BUCKET: dataIngestionBucket.bucketName,
           REGION: this.region,
@@ -1892,17 +1895,13 @@ export class ApiServiceStack extends cdk.Stack {
       );
     }
 
-    // Grant access to Secret Manager
+    // Grant access to Secret Manager: only the app_tc DB credential, the sole
+    // secret this function reads (SM_DB_CREDENTIALS in data_ingestion/src/main.py).
     dataIngestLambdaDockerFunc.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          //Secrets Manager
-          "secretsmanager:GetSecretValue",
-        ],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:*`,
-        ],
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathTableCreator.secretArn],
       })
     );
 

@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import boto3
 from botocore.config import Config
 import psycopg2
@@ -8,6 +9,7 @@ from datetime import datetime, timezone
 from typing import NamedTuple
 
 from helpers.vectorstore import update_vectorstore
+from helpers.helper import is_db_auth_error, open_vectorstore, grant_readwrite_on_vectorstore_tables
 from helpers.cohere_embeddings import CohereBedrockEmbeddings
 from langchain_aws import BedrockEmbeddings
 
@@ -34,7 +36,13 @@ bedrock_runtime = boto3.client("bedrock-runtime", region_name=BEDROCK_EMBEDDING_
 # Cached resources
 connection = None
 db_secret = None
+db_secret_loaded_at = 0.0
+# The app_tc password in SM_DB_CREDENTIALS is rotated by the db_setup Lambda on
+# every deploy, so the cached secret is re-read periodically and on auth failure.
+DB_SECRET_TTL_SECONDS = 300
 EMBEDDING_MODEL_ID = None
+# Set once grant_readwrite_on_vectorstore_tables() has succeeded in this container.
+readwrite_grants_applied = False
 
 # Set up class to represent parsed file path
 class ParsedFilePath(NamedTuple):
@@ -44,12 +52,19 @@ class ParsedFilePath(NamedTuple):
     file_name: str
     file_type: str
 
-def get_secret():
-    global db_secret
-    if db_secret is None:
+def get_secret(force_refresh=False):
+    """Return the DB secret, cached for DB_SECRET_TTL_SECONDS.
+
+    force_refresh=True re-reads it immediately (used after an authentication
+    failure, i.e. the password was rotated since it was cached).
+    """
+    global db_secret, db_secret_loaded_at
+    expired = (time.monotonic() - db_secret_loaded_at) > DB_SECRET_TTL_SECONDS
+    if db_secret is None or force_refresh or expired:
         try:
             response = secrets_manager_client.get_secret_value(SecretId=DB_SECRET_NAME)["SecretString"]
             db_secret = json.loads(response)
+            db_secret_loaded_at = time.monotonic()
         except Exception as e:
             logger.error(f"Error fetching secret {DB_SECRET_NAME}: {e}")
             raise
@@ -69,28 +84,65 @@ def get_parameter():
             raise
     return EMBEDDING_MODEL_ID
 
+def _open_connection():
+    """Open a new psycopg2 connection to the RDS proxy.
+
+    On an authentication failure (app_tc password rotated by db_setup since
+    the secret was cached) the secret is re-read and the connect retried once.
+    """
+    def _connect(secret):
+        connection_params = {
+            'dbname': secret["dbname"],
+            'user': secret["username"],
+            'password': secret["password"],
+            'host': RDS_PROXY_ENDPOINT,
+            'port': secret["port"],
+            'sslmode': 'require'
+        }
+        conn = psycopg2.connect(**connection_params)
+        conn.autocommit = True
+        return conn
+
+    try:
+        return _connect(get_secret())
+    except psycopg2.OperationalError as e:
+        if not is_db_auth_error(e):
+            raise
+        logger.warning("DB authentication failed; re-reading rotated credentials and retrying once")
+        return _connect(get_secret(force_refresh=True))
+
+def _connection_is_alive(conn):
+    """`conn.closed` only reflects client-side state, so also ping with SELECT 1
+    to detect a session terminated server-side between warm invocations."""
+    if conn is None or conn.closed:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        return True
+    except Exception:
+        return False
+
 def connect_to_db():
     global connection
-    if connection is None or connection.closed:
+    if _connection_is_alive(connection):
+        return connection
+
+    # Cached connection is closed/broken or missing: discard it and reconnect.
+    if connection is not None:
         try:
-            secret = get_secret()
-            connection_params = {
-                'dbname': secret["dbname"],
-                'user': secret["username"],
-                'password': secret["password"],
-                'host': RDS_PROXY_ENDPOINT,
-                'port': secret["port"],
-                'sslmode': 'require'
-            }
-            connection = psycopg2.connect(**connection_params)
-            connection.autocommit = True
-            logger.info("Connected to the database!")
-        except Exception as e:
-            logger.error(f"Failed to connect to database: {e}")
-            if connection:
-                connection.rollback()
-                connection.close()
-            raise
+            connection.close()
+        except Exception:
+            pass
+        connection = None
+
+    try:
+        connection = _open_connection()
+        logger.info("Connected to the database!")
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {e}")
+        raise
     return connection
 
 def get_embedding_count(persona_id):
@@ -179,6 +231,28 @@ def update_ingestion_status(persona_id: str, file_path: str, status: str):
         connection.rollback()
         logger.error(f"Error updating ingestion status for persona {persona_id}, file {file_path}: {e}")
         raise
+
+def mark_error_unless_completed(persona_id: str, file_path: str) -> bool:
+    """Set ingestion_status to 'error' unless it is already 'completed'.
+
+    A single conditional UPDATE, so it can't overwrite a concurrent run that
+    completed the file. Returns True if the status was changed.
+    """
+    connection = connect_to_db()
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE "persona_data"
+            SET ingestion_status = 'error'
+            WHERE persona_id = %s
+            AND filepath = %s
+            AND ingestion_status IS DISTINCT FROM 'completed';
+            """,
+            (persona_id, file_path),
+        )
+        changed = cur.rowcount > 0
+    connection.commit()
+    return changed
 
 def parse_s3_file_path(file_key):
     # Assuming the file path is of the format: {simulation_group_id}/{persona_id}/{documents or info}/{file_name}.{file_type}
@@ -274,6 +348,58 @@ def insert_file_into_db(persona_id, file_name, file_type, file_path, bucket_name
         logger.error(f"Error inserting file {file_name}.{file_type} into database: {e}")
         raise
 
+def _vectorstore_config(persona_id, force_refresh=False):
+    """PGVector / SQLRecordManager connection settings for a persona's collection."""
+    secret = get_secret(force_refresh=force_refresh)
+    return {
+        'collection_name': f'{persona_id}',
+        'dbname': secret["dbname"],
+        'user': secret["username"],
+        'password': secret["password"],
+        'host': RDS_PROXY_ENDPOINT,
+        'port': secret["port"]
+    }
+
+def _open_vectorstore_with_retry(persona_id, embeddings):
+    """Open PGVector + SQLRecordManager, retrying once with a freshly read DB secret.
+
+    PGVector and SQLRecordManager open their own SQLAlchemy connections, so a
+    rotated app_tc password surfaces here rather than in connect_to_db().
+    Only this setup step is retried: it changes no document state, unlike
+    process_documents(), which is not safe to replay. Only authentication
+    failures are retried; anything else raises as before.
+    """
+    try:
+        return open_vectorstore(_vectorstore_config(persona_id), embeddings)
+    except Exception as e:
+        if not is_db_auth_error(e):
+            raise
+        logger.warning(f"Vector store DB authentication failed; retrying with refreshed DB credentials: {type(e).__name__}")
+        return open_vectorstore(_vectorstore_config(persona_id, force_refresh=True), embeddings)
+
+def _ensure_readwrite_grants(connection):
+    """Narrow readwrite's access on the vectorstore tables once per container.
+
+    open_vectorstore() may have just created them (fresh DB), owned by app_tc.
+    """
+    global readwrite_grants_applied
+    if not readwrite_grants_applied:
+        readwrite_grants_applied = grant_readwrite_on_vectorstore_tables(connection)
+
+def _update_vectorstore_with_retry(bucket, simulation_group_id, persona_id, embeddings, connection):
+    """Open the vectorstore (with the credential retry above), then ingest once."""
+    vectorstore, record_manager = _open_vectorstore_with_retry(persona_id, embeddings)
+    _ensure_readwrite_grants(connection)
+    update_vectorstore(
+        bucket=bucket,
+        group=simulation_group_id,
+        persona_id=persona_id,
+        vectorstore=vectorstore,
+        record_manager=record_manager,
+        embeddings=embeddings,
+        connection=connection
+    )
+
 def update_vectorstore_from_s3(bucket, simulation_group_id, persona_id, file_path):
     connection = connect_to_db()
     if connection is None:
@@ -294,36 +420,35 @@ def update_vectorstore_from_s3(bucket, simulation_group_id, persona_id, file_pat
             region_name=BEDROCK_EMBEDDING_REGION
         )
 
-    secret = get_secret()
-
-    vectorstore_config_dict = {
-        'collection_name': f'{persona_id}',
-        'dbname': secret["dbname"],
-        'user': secret["username"],
-        'password': secret["password"],
-        'host': RDS_PROXY_ENDPOINT,
-        'port': secret["port"]
-    }
-
     try:
-        update_vectorstore(
-            bucket=bucket,
-            group=simulation_group_id,
-            persona_id=persona_id,
-            vectorstore_config_dict=vectorstore_config_dict,
-            embeddings=embeddings,
-            connection=connection
-        )
+        _update_vectorstore_with_retry(bucket, simulation_group_id, persona_id, embeddings, connection)
 
     except Exception as e:
         error_message = str(e)
         if "An error occurred (404) when calling the HeadObject operation: Not Found" in error_message:
-            logger.warning(f"Temporary page file not found while updating vectorstore for persona {persona_id}. "
-                           f"Ingestion status for this document is set to completed since it has already been processed.")
+            # A concurrent invocation for the same persona consumed the temp
+            # page files. Files are only marked "completed" after index(), so
+            # this run marked nothing. Give the triggering file a terminal
+            # status unless the other run already completed it. If that run
+            # finishes later, it overwrites "error" with "completed".
+            logger.warning(f"Temporary page file not found while updating vectorstore for persona {persona_id}; "
+                           f"another invocation is likely processing these files.")
+            try:
+                if mark_error_unless_completed(persona_id, file_path):
+                    logger.warning(f"ingestion_status set to 'error' for {file_path}; re-upload if it does not complete.")
+                else:
+                    logger.info(f"{file_path} is already 'completed'; leaving its status unchanged.")
+            except Exception as status_error:
+                logger.error(f"Could not update ingestion_status for {file_path}: {status_error}")
         else:
-            update_ingestion_status(persona_id, file_path, "error")
-            logger.error(f"Error updating vectorstore for persona {persona_id}: {e}, ingestion_status set to 'error'.")
-            raise
+            logger.error(f"Error updating vectorstore for persona {persona_id}: {e}")
+            # A failure writing the status must not mask the original error.
+            try:
+                update_ingestion_status(persona_id, file_path, "error")
+                logger.error(f"ingestion_status set to 'error' for {file_path}.")
+            except Exception as status_error:
+                logger.error(f"Could not set ingestion_status to 'error' for {file_path}: {status_error}")
+            raise e
 
 def handler(event, context):
     records = event.get('Records', [])
