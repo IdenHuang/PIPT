@@ -192,6 +192,8 @@ export class CICDStack extends cdk.Stack {
             GITHUB_USERNAME: { value: username },
             GITHUB_REPO: { value: props.githubRepo },
             PATH_FILTER: { value: lambdaConfig.sourceDir },
+            // Severities that block promotion in cdk/scripts/ecr_scan_gate.sh.
+            BLOCKING_SEVERITIES: { value: "CRITICAL HIGH" },
           },
           buildSpec: codebuild.BuildSpec.fromObject({
             version: "0.2",
@@ -210,49 +212,20 @@ export class CICDStack extends cdk.Stack {
               build: {
                 commands: [
                   'echo "Building Docker image..."',
-                  `docker build --build-arg REGISTRY=public.ecr.aws/docker/library/ -t $REPOSITORY_URI:$IMAGE_TAG $CODEBUILD_SRC_DIR/${lambdaConfig.sourceDir} -f $CODEBUILD_SRC_DIR/${lambdaConfig.sourceDir}/Dockerfile`,
+                  // --pull: the Docker layer cache otherwise keeps reusing a stale
+                  // base image, so upstream OS security patches never land.
+                  `docker build --pull --build-arg REGISTRY=public.ecr.aws/docker/library/ -t $REPOSITORY_URI:$IMAGE_TAG $CODEBUILD_SRC_DIR/${lambdaConfig.sourceDir} -f $CODEBUILD_SRC_DIR/${lambdaConfig.sourceDir}/Dockerfile`,
                 ],
               },
               post_build: {
                 commands: [
                   'echo "Pushing image with commit tag for scanning..."',
                   "docker push $REPOSITORY_URI:$IMAGE_TAG",
-                  'echo "Waiting for vulnerability scan to complete..."',
-                  `bash -c '
-                    SCAN_COMPLETE=false
-                    for i in $(seq 1 20); do
-                      STATUS=$(aws ecr describe-image-scan-findings \
-                        --repository-name $REPO_NAME \
-                        --image-id imageTag=$IMAGE_TAG \
-                        --query "imageScanStatus.status" \
-                        --output text 2>/dev/null || echo "IN_PROGRESS")
-                      if [ "$STATUS" = "COMPLETE" ] || [ "$STATUS" = "ACTIVE" ]; then
-                        SCAN_COMPLETE=true
-                        break
-                      fi
-                      echo "Scan status: $STATUS. Waiting 15s... (attempt $i/20)"
-                      sleep 15
-                    done
-                    if [ "$SCAN_COMPLETE" = false ]; then
-                      echo "WARNING: Vulnerability scan did not complete within 5 minutes. Proceeding with caution."
-                    fi
-                  '`,
-                  'echo "Checking vulnerability scan results..."',
-                  `bash -c '
-                    SCAN_RESULTS=$(aws ecr describe-image-scan-findings \
-                      --repository-name $REPO_NAME \
-                      --image-id imageTag=$IMAGE_TAG \
-                      --query "imageScanFindingsSummary.findingCounts.CRITICAL" \
-                      --output text 2>/dev/null || echo "0")
-                    
-                    if [[ "$SCAN_RESULTS" != "0" && "$SCAN_RESULTS" != "None" ]]; then
-                      echo "CRITICAL vulnerabilities found: $SCAN_RESULTS. Blocking deployment."
-                      echo "Image $REPOSITORY_URI:$IMAGE_TAG will NOT be promoted to latest."
-                      exit 1
-                    else
-                      echo "No critical vulnerabilities found. Promoting to latest."
-                    fi
-                  '`,
+                  // Fail-closed gate: any scan/API error, unfinished scan, or
+                  // CRITICAL/HIGH finding exits non-zero, which fails this phase
+                  // before the :latest push and Lambda deploy below.
+                  "chmod +x $CODEBUILD_SRC_DIR/cdk/scripts/ecr_scan_gate.sh",
+                  "$CODEBUILD_SRC_DIR/cdk/scripts/ecr_scan_gate.sh",
                   'echo "Scan passed. Tagging and pushing as latest..."',
                   "docker tag $REPOSITORY_URI:$IMAGE_TAG $REPOSITORY_URI:latest",
                   "docker push $REPOSITORY_URI:latest",
@@ -312,8 +285,8 @@ export class CICDStack extends cdk.Stack {
       // Grant permissions to push to ECR
       ecrRepo.grantPullPush(buildProject);
       // grantPullPush doesn't cover these: check_and_build.sh calls describe-images,
-      // and the vulnerability gate calls describe-image-scan-findings. Without them
-      // both checks swallow AccessDenied and the gate promotes images unchecked.
+      // and the vulnerability gate (scripts/ecr_scan_gate.sh) calls
+      // describe-image-scan-findings. Without them the gate fails every build.
       ecrRepo.grant(buildProject, "ecr:DescribeImages", "ecr:DescribeImageScanFindings");
 
       // Add build action to the list

@@ -1,7 +1,8 @@
 const fs = require("fs");
 const path = require("path");
 
-// Same ALLOWED_ORIGINS shape the CDK stack sets (cdk/lib/api-service-stack.ts).
+// Fixture exercising the helper's wildcard matching. The CDK stack itself
+// (cdk/lib/api-service-stack.ts) only emits exact origins.
 const DEPLOYED_ORIGINS = [
   "https://main.d3sunerinpg5un.amplifyapp.com",
   "https://*.amplifyapp.com",

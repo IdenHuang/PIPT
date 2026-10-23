@@ -82,12 +82,36 @@ export class ApiServiceStack extends cdk.Stack {
     this.layerList = {};
     this.dynamoTableName = `${id}-DynamoDB-Conversation-Table`;
 
+    // CORS allow-list: exact origins only. A wildcard such as
+    // "https://*.amplifyapp.com" would trust every tenant's Amplify app, since
+    // anyone can deploy to that shared domain.
+    //   -c AllowedOrigins="https://dev.<app-id>.amplifyapp.com,https://..."
+    //       extra exact origins (e.g. additional Amplify branches)
+    //   -c AllowLocalhostOrigins=true
+    //       adds the Vite dev server origins; use for dev deployments only
+    const extraAllowedOrigins: string[] = String(
+      this.node.tryGetContext("AllowedOrigins") ?? ""
+    )
+      .split(",")
+      .map((origin) => origin.trim())
+      .filter(Boolean);
+    const invalidOrigins = extraAllowedOrigins.filter(
+      (origin) => origin.includes("*") || !/^https:\/\/[^/]+$/.test(origin)
+    );
+    if (invalidOrigins.length > 0) {
+      throw new Error(
+        `AllowedOrigins must be exact https origins without wildcards or paths: ${invalidOrigins.join(", ")}`
+      );
+    }
+    const allowLocalhostOrigins =
+      String(this.node.tryGetContext("AllowLocalhostOrigins") ?? "false") === "true";
+
     const allowedOrigins = [
+      "https://main.d3uv171xv91wfq.amplifyapp.com", 
       "https://main.d3sunerinpg5un.amplifyapp.com",
       //"https://genrx.pharmsci.ubc.ca",
-      "https://*.amplifyapp.com",
-      "http://localhost:5173",
-      "http://localhost:5174",
+      ...extraAllowedOrigins,
+      ...(allowLocalhostOrigins ? ["http://localhost:5173", "http://localhost:5174"] : []),
       ...(sesVerifiedDomain ? [`https://${sesVerifiedDomain}`, `https://www.${sesVerifiedDomain}`] : []),
     ];
 
@@ -452,8 +476,8 @@ export class ApiServiceStack extends cdk.Stack {
       }
     );
 
-    // REVIEW: A single lambdaRole is shared across student, instructor, admin, and file-operation
-    // Lambda functions. This means every function has the union of all permissions. Create separate
+    // REVIEW: A single lambdaRole is shared across student, instructor, authorizer and
+    // timeout-handler Lambda functions (admin has its own adminLambdaRole). This means every function has the union of all permissions. Create separate
     // roles per function group (studentRole, instructorRole, adminRole, fileOpsRole) to follow
     // least privilege. The EC2 network interface permissions (required for VPC Lambdas) can be
     // shared via a managed policy.
@@ -466,19 +490,16 @@ export class ApiServiceStack extends cdk.Stack {
       }
     );
 
-    // Secrets Manager: student, instructor and timeout-handler functions read the
-    // app_rw credential; the admin function reads app_tc. The JWT authorizers read
-    // no secrets. Because the role is shared, it holds the union of both.
-    // REVIEW: Moving the admin function (and the authorizers) onto their own roles
-    // would let this role drop app_tc and keep only db.secretPathUser.
+    // Secrets Manager: student, instructor and timeout-handler functions read only
+    // the app_rw credential. The JWT authorizers read no secrets. The admin
+    // function needs app_tc, so it runs on its own adminLambdaRole (below) and
+    // this shared role never holds the DDL-capable credential.
+    // REVIEW: The authorizers could also move to their own secret-free role.
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: ["secretsmanager:GetSecretValue"],
-        resources: [
-          db.secretPathUser.secretArn,
-          db.secretPathTableCreator.secretArn,
-        ],
+        resources: [db.secretPathUser.secretArn],
       })
     );
 
@@ -522,8 +543,69 @@ export class ApiServiceStack extends cdk.Stack {
       })
     );
 
-    // Grant access to Cognito AdminGetUser (used by admin function to validate users before elevation)
-    lambdaRole.addToPolicy(
+    // Dedicated role for the admin function. It is the only API function that
+    // reads the app_tc (table-creator) credential, so that secret is granted
+    // here and not on the shared lambdaRole. S3 grants made later via
+    // lambdaAdminFunction.grant*() land on this role too.
+    const adminLambdaRole = new iam.Role(
+      this,
+      `${id}-adminLambdaRole-${this.region}`,
+      {
+        roleName: `${id}-adminLambdaRole-${this.region}`,
+        assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      }
+    );
+
+    // Secrets Manager: only the app_tc credential (SM_DB_CREDENTIALS)
+    adminLambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathTableCreator.secretArn],
+      })
+    );
+
+    // VPC network interfaces (required for VPC Lambdas)
+    adminLambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "ec2:CreateNetworkInterface",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DeleteNetworkInterface",
+          "ec2:AssignPrivateIpAddresses",
+          "ec2:UnassignPrivateIpAddresses",
+        ],
+        resources: ["*"], // must be *
+      })
+    );
+
+    // Logs
+    adminLambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ],
+        resources: ["arn:aws:logs:*:*:*"],
+      })
+    );
+
+    // RDS proxy
+    adminLambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ["rds-db:connect"],
+        resources: [
+          `arn:aws:rds-db:${this.region}:${this.account}:dbuser:*/applicationUsername`,
+        ],
+      })
+    );
+
+    // Cognito AdminGetUser (admin function validates users before elevation)
+    adminLambdaRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: ["cognito-idp:AdminGetUser"],
@@ -644,7 +726,7 @@ export class ApiServiceStack extends cdk.Stack {
         functionName: `${id}-adminFunction`,
         memorySize: 256,
         layers: [postgres],
-        role: lambdaRole,
+        role: adminLambdaRole,
         logRetention: logs.RetentionDays.INFINITE,
       }
     );

@@ -80,7 +80,9 @@ Beyond the API Gateway authorizer (JWT validation), backend handlers perform a s
 
 ### CORS Origin Restriction
 
-Lambda responses use a configurable allowlist-based CORS policy via the `ALLOWED_ORIGINS` environment variable (comma-separated list). Wildcard subdomain matching is supported (e.g., `https://*.amplifyapp.com`). If `ALLOWED_ORIGINS` is not set or equals `*`, all origins are permitted (backwards-compatible default).
+Lambda responses use a configurable allowlist-based CORS policy via the `ALLOWED_ORIGINS` environment variable (comma-separated list). The CDK stack (`cdk/lib/api-service-stack.ts`) sets it to exact origins only: the deployed Amplify branch, the `SesVerifiedDomain` origins when set, plus any extras passed with `-c AllowedOrigins="https://a.example.com,https://b.example.com"`. Wildcards are rejected at synth time, because a pattern like `https://*.amplifyapp.com` would trust any other tenant's Amplify app. The Vite dev origins (`http://localhost:5173`, `:5174`) are only added with `-c AllowLocalhostOrigins=true`, which is meant for dev deployments.
+
+The CORS helpers still understand `*` subdomain patterns and an explicit `*` entry, but the stack no longer emits them. If `ALLOWED_ORIGINS` is unset or empty, the helpers fail closed.
 
 ### Shared Endpoints
 
