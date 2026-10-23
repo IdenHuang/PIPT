@@ -107,6 +107,7 @@ export class ApiServiceStack extends cdk.Stack {
       String(this.node.tryGetContext("AllowLocalhostOrigins") ?? "false") === "true";
 
     const allowedOrigins = [
+      "https://main.d3uv171xv91wfq.amplifyapp.com", 
       "https://main.d3sunerinpg5un.amplifyapp.com",
       //"https://genrx.pharmsci.ubc.ca",
       ...extraAllowedOrigins,
