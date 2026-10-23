@@ -82,12 +82,35 @@ export class ApiServiceStack extends cdk.Stack {
     this.layerList = {};
     this.dynamoTableName = `${id}-DynamoDB-Conversation-Table`;
 
+    // CORS allow-list: exact origins only. A wildcard such as
+    // "https://*.amplifyapp.com" would trust every tenant's Amplify app, since
+    // anyone can deploy to that shared domain.
+    //   -c AllowedOrigins="https://dev.<app-id>.amplifyapp.com,https://..."
+    //       extra exact origins (e.g. additional Amplify branches)
+    //   -c AllowLocalhostOrigins=true
+    //       adds the Vite dev server origins; use for dev deployments only
+    const extraAllowedOrigins: string[] = String(
+      this.node.tryGetContext("AllowedOrigins") ?? ""
+    )
+      .split(",")
+      .map((origin) => origin.trim())
+      .filter(Boolean);
+    const invalidOrigins = extraAllowedOrigins.filter(
+      (origin) => origin.includes("*") || !/^https:\/\/[^/]+$/.test(origin)
+    );
+    if (invalidOrigins.length > 0) {
+      throw new Error(
+        `AllowedOrigins must be exact https origins without wildcards or paths: ${invalidOrigins.join(", ")}`
+      );
+    }
+    const allowLocalhostOrigins =
+      String(this.node.tryGetContext("AllowLocalhostOrigins") ?? "false") === "true";
+
     const allowedOrigins = [
       "https://main.d3sunerinpg5un.amplifyapp.com",
       //"https://genrx.pharmsci.ubc.ca",
-      "https://*.amplifyapp.com",
-      "http://localhost:5173",
-      "http://localhost:5174",
+      ...extraAllowedOrigins,
+      ...(allowLocalhostOrigins ? ["http://localhost:5173", "http://localhost:5174"] : []),
       ...(sesVerifiedDomain ? [`https://${sesVerifiedDomain}`, `https://www.${sesVerifiedDomain}`] : []),
     ];
 
