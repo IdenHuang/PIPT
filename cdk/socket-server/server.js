@@ -686,7 +686,13 @@ io.on("connection", (socket) => {
   socket.on("text-generation", async (data) => {
     if (textGenInFlight) return;
     textGenInFlight = true;
-    console.log("🚀 Text generation request:", data);
+    // Log identifiers only: data.token is the caller's bearer token and
+    // data.message is student content, so neither may reach CloudWatch.
+    console.log("🚀 Text generation request:", {
+      session_id: data && data.session_id,
+      patient_id: data && data.patient_id,
+      simulation_group_id: data && data.simulation_group_id,
+    });
 
     const sessionId = data.session_id;
 
