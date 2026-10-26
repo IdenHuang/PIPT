@@ -6,7 +6,11 @@ import { ApiServiceStack } from "../lib/api-service-stack";
 import { DatabaseStack } from "../lib/database-stack";
 import { DBFlowStack } from "../lib/dbFlow-stack";
 import { VpcStack } from "../lib/vpc-stack";
-import { EcsSocketStack } from "../lib/ecs-socket-stack";
+import {
+  EcsSocketStack,
+  getSocketEcsClusterSsmParam,
+  getSocketEcsServiceSsmParam,
+} from "../lib/ecs-socket-stack";
 import { TurnServerStack } from "../lib/turn-server-stack";
 import { CICDStack } from "../lib/cicd-stack";
 import { CloudFrontWafStack } from "../lib/cloudfront-waf-stack";
@@ -42,7 +46,10 @@ const cicdStack = new CICDStack(app, `${StackPrefix}-CICD`, {
       name: "socketServer",
       functionName: `${StackPrefix}-EcsSocket-SocketServer`,
       sourceDir: "cdk/socket-server",
-      ecsClusterNamePrefix: `${StackPrefix}-EcsSocket-SocketCluster`,
+      ecsServiceSsmParams: {
+        cluster: getSocketEcsClusterSsmParam(StackPrefix),
+        service: getSocketEcsServiceSsmParam(StackPrefix),
+      },
     },
     {
       name: "voiceAgent",
@@ -111,7 +118,8 @@ const ecsSocketStack = new EcsSocketStack(
   StackPrefix,
   apiStack.getDynamoTableName(),
   cloudFrontWafStack.webAclArn,
-  { env, crossRegionReferences: true }
+  { env, crossRegionReferences: true },
+  cicdStack.buildRole
 );
 const dbFlowStack = new DBFlowStack(
   app,

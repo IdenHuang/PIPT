@@ -26,6 +26,16 @@ export const getSocketUrlSsmParam = (stackPrefix: string) => `/${stackPrefix}/so
 export const getSocketCallbackUrlSsmParam = (stackPrefix: string) =>
   `/${stackPrefix}/socket-callback-url`;
 
+/**
+ * SSM parameter names holding the exact socket ECS cluster and service names.
+ * The CI/CD build reads them to redeploy that one service after pushing a new
+ * image; its UpdateService permission is scoped to the same service ARN.
+ */
+export const getSocketEcsClusterSsmParam = (stackPrefix: string) =>
+  `/${stackPrefix}/socket-ecs-cluster`;
+export const getSocketEcsServiceSsmParam = (stackPrefix: string) =>
+  `/${stackPrefix}/socket-ecs-service`;
+
 export class EcsSocketStack extends Stack {
   public readonly socketUrl: string;
 
@@ -41,7 +51,9 @@ export class EcsSocketStack extends Stack {
     stackPrefix: string,
     dynamoTableName: string,
     cloudFrontWafArn: string,
-    props?: StackProps
+    props?: StackProps,
+    // CI/CD build role allowed to force a redeploy of the socket service.
+    deployRole?: iam.IRole
   ) {
     super(scope, id, props);
 
@@ -260,6 +272,34 @@ export class EcsSocketStack extends Stack {
       securityGroups: [socketServiceSg],
       circuitBreaker: { enable: true, rollback: true },
     });
+
+    // 5.0) Let the CI/CD build redeploy exactly this service after it pushes
+    // a new :latest image (ECS only pulls the image when a task starts).
+    const ecsClusterParam = new ssm.StringParameter(this, "SocketEcsClusterParam", {
+      parameterName: getSocketEcsClusterSsmParam(stackPrefix),
+      stringValue: cluster.clusterName,
+      description: "Socket server ECS cluster name, for CI/CD redeploys",
+    });
+    const ecsServiceParam = new ssm.StringParameter(this, "SocketEcsServiceParam", {
+      parameterName: getSocketEcsServiceSsmParam(stackPrefix),
+      stringValue: service.serviceName,
+      description: "Socket server ECS service name, for CI/CD redeploys",
+    });
+    if (deployRole) {
+      new iam.Policy(this, "SocketRedeployPolicy", {
+        roles: [deployRole],
+        statements: [
+          new iam.PolicyStatement({
+            actions: ["ecs:UpdateService", "ecs:DescribeServices"],
+            resources: [service.serviceArn],
+          }),
+          new iam.PolicyStatement({
+            actions: ["ssm:GetParameter"],
+            resources: [ecsClusterParam.parameterArn, ecsServiceParam.parameterArn],
+          }),
+        ],
+      });
+    }
 
     // 5.1) Allow the internal NLB to reach the service on port 80 (VPC traffic only)
     service.connections.allowFrom(
