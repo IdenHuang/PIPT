@@ -1,4 +1,4 @@
-import os, json, re
+import os, json, re, uuid
 import boto3
 import psycopg2
 from botocore.config import Config
@@ -83,6 +83,31 @@ def verify_instructor_ownership(user_email, simulation_group_id):
         logger.error(f"Error verifying instructor ownership: {e}")
         return False
 
+def persona_in_group(persona_id, simulation_group_id):
+    """True if the persona belongs to the simulation group. Fails closed."""
+    conn = connect_to_db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            'SELECT 1 FROM "personas" WHERE persona_id = %s AND simulation_group_id = %s',
+            (persona_id, simulation_group_id)
+        )
+        result = cur.fetchone()
+        cur.close()
+        return result is not None
+    except Exception as e:
+        cur.close()
+        conn.rollback()
+        logger.error(f"Error verifying persona/group binding: {e}")
+        return False
+
+def is_uuid(value):
+    """True only for a canonical UUID string, so IDs cannot inject extra key segments."""
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except (ValueError, AttributeError, TypeError):
+        return False
+
 def s3_key_exists(bucket, key):
     try:
         s3.head_object(Bucket=bucket, Key=key)
@@ -128,6 +153,14 @@ def lambda_handler(event, context):
             'body': json.dumps('Missing required parameter: file_name')
         }
 
+    # Both IDs are interpolated into the S3 key, so they must be plain UUIDs
+    if not is_uuid(simulation_group_id) or not is_uuid(persona_id):
+        return {
+            'statusCode': 400,
+            "headers": get_cors_headers(event),
+            'body': json.dumps('Invalid simulation_group_id or patient_id')
+        }
+
     # Validate file_name to prevent path traversal and special character issues
     if not SAFE_FILENAME.match(file_name):
         return {
@@ -146,6 +179,21 @@ def lambda_handler(event, context):
             'statusCode': 403,
             "headers": get_cors_headers(event),
             'body': json.dumps('Forbidden: You are not an instructor of this simulation group')
+        }
+
+    # The persona must belong to the verified group. Ingestion and retrieval key
+    # the pgvector collection by persona_id alone, so without this an instructor of
+    # group A could upload into a group-B persona's RAG collection.
+    if not persona_in_group(persona_id, simulation_group_id):
+        logger.warning("Persona does not belong to simulation group", extra={
+            "user_email": user_email,
+            "simulation_group_id": simulation_group_id,
+            "persona_id": persona_id,
+        })
+        return {
+            'statusCode': 403,
+            "headers": get_cors_headers(event),
+            'body': json.dumps('Forbidden: Patient does not belong to this simulation group')
         }
 
     # Allowed file types for documents with their corresponding MIME types
