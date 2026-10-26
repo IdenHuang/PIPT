@@ -143,6 +143,12 @@ app.get("/health", (req, res) => {
 // Maps sessionId → { socket, nonce }. A callback is relayed only when it carries
 // the per-request nonce minted at registration (see stream-relay.js).
 const textStreamSockets = new StreamRelayRegistry();
+// Upper bound for relaying after API Gateway gives up: the text-gen Lambda's
+// timeout (300s) plus slack.
+const TEXT_STREAM_MAX_MS = 310 * 1000;
+// Grace period after an "end" frame for the trailing "session_complete"
+// (the Lambda saves the message and joins matching threads in between).
+const TEXT_STREAM_TRAILING_MS = 15 * 1000;
 
 // Load the shared callback secret once at startup so header checks are free.
 let streamCallbackToken = null;
@@ -205,6 +211,17 @@ app.post("/stream-callback", (req, res) => {
     socket.emit("text-stream", data);
   } else {
     console.warn(`⚠️ Socket for session ${session_id} is disconnected`);
+  }
+
+  // After a 504 the request handler has already returned, so terminal frames
+  // drive the release: hold briefly after "end"/"error" for a trailing
+  // "session_complete". No-op for non-deferred registrations.
+  if (data.type === "end" || data.type === "error" || data.type === "session_complete") {
+    textStreamSockets.settle(
+      session_id,
+      req.headers["x-stream-nonce"],
+      data.type === "session_complete" ? 0 : TEXT_STREAM_TRAILING_MS,
+    );
   }
 
   res.status(200).json({ ok: true });
@@ -739,7 +756,12 @@ io.on("connection", (socket) => {
     // from SSM — the callback destination is never sent in the request.
     // The nonce is sent server-to-server only and must be echoed on every
     // callback; it never reaches the browser.
-    const streamNonce = textStreamSockets.register(sessionId, socket);
+    // textGenInFlight is cleared when the registration is released, which may
+    // be after this handler returns (see the 504 case below).
+    const streamNonce = textStreamSockets.register(sessionId, socket, () => {
+      textGenInFlight = false;
+    });
+    let deferRelease = false;
 
     try {
       const response = await fetch(
@@ -773,6 +795,20 @@ io.on("connection", (socket) => {
           return; // Don't throw — we've handled this error specifically
         }
 
+        if (response.status === 504) {
+          // API Gateway caps the integration at 29s, but the Lambda keeps
+          // running and keeps POSTing chunks. Keep the registration until its
+          // "end"/"error" callback arrives (or the Lambda's max runtime).
+          logger.warn("Text generation exceeded the API Gateway timeout; still relaying callbacks", {
+            component: "server",
+            operation: "text-generation",
+            sessionId,
+          });
+          deferRelease = true;
+          textStreamSockets.defer(sessionId, streamNonce, TEXT_STREAM_MAX_MS);
+          return;
+        }
+
         throw new Error(`HTTP ${response.status}`);
       }
 
@@ -786,8 +822,7 @@ io.on("connection", (socket) => {
         content: error.message || "Failed to generate response",
       });
     } finally {
-      textStreamSockets.release(sessionId, streamNonce);
-      textGenInFlight = false;
+      if (!deferRelease) textStreamSockets.release(sessionId, streamNonce);
     }
   });
 

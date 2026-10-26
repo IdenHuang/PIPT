@@ -32,13 +32,20 @@ function isValidNonce(nonce) {
 
 class StreamRelayRegistry {
   constructor() {
-    this._entries = new Map(); // sessionId -> { socket, nonce }
+    this._entries = new Map(); // sessionId -> { socket, nonce, onRelease, timer, deferred }
   }
 
-  /** Register a socket for a session and return the nonce the Lambda must echo. */
-  register(sessionId, socket) {
+  /**
+   * Register a socket for a session and return the nonce the Lambda must echo.
+   * `onRelease` runs exactly once, when this registration is released,
+   * superseded by a newer one, or its scheduled release fires.
+   */
+  register(sessionId, socket, onRelease) {
+    const previous = this._entries.get(sessionId);
+    if (previous) this._drop(sessionId, previous);
     const nonce = crypto.randomBytes(32).toString("hex");
-    this._entries.set(sessionId, { socket, nonce });
+    // settleMs: delay recorded by settle() once a terminal frame arrived.
+    this._entries.set(sessionId, { socket, nonce, onRelease, timer: null, deferred: false, settleMs: null });
     return nonce;
   }
 
@@ -48,7 +55,38 @@ class StreamRelayRegistry {
    */
   release(sessionId, nonce) {
     const entry = this._entries.get(sessionId);
-    if (entry && entry.nonce === nonce) this._entries.delete(sessionId);
+    if (entry && entry.nonce === nonce) this._drop(sessionId, entry);
+  }
+
+  /**
+   * Keep the registration alive after the HTTP call to the Lambda returned
+   * early (API Gateway's 29s integration timeout) while the Lambda is still
+   * streaming. It is released after `maxMs`, or sooner via settle().
+   */
+  defer(sessionId, nonce, maxMs) {
+    const entry = this._entries.get(sessionId);
+    if (!entry || entry.nonce !== nonce) return;
+    entry.deferred = true;
+    // A terminal frame may already have arrived just before the timeout.
+    this._schedule(sessionId, entry, entry.settleMs ?? maxMs);
+  }
+
+  /**
+   * Record a terminal frame: release `ms` later (time for a trailing frame
+   * such as session_complete). For a registration that isn't deferred yet
+   * the delay is only remembered, since the request handler releases it.
+   */
+  settle(sessionId, nonce, ms) {
+    const entry = this._entries.get(sessionId);
+    if (!entry || entry.nonce !== nonce) return;
+    entry.settleMs = ms;
+    if (entry.deferred) this._schedule(sessionId, entry, ms);
+  }
+
+  _schedule(sessionId, entry, ms) {
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => this.release(sessionId, entry.nonce), ms);
+    if (typeof entry.timer.unref === "function") entry.timer.unref();
   }
 
   /** Return the registered socket only when the presented nonce matches. */
@@ -57,6 +95,12 @@ class StreamRelayRegistry {
     const entry = this._entries.get(sessionId);
     if (!entry || !safeEqual(entry.nonce, nonce)) return null;
     return entry.socket;
+  }
+
+  _drop(sessionId, entry) {
+    if (entry.timer) clearTimeout(entry.timer);
+    this._entries.delete(sessionId);
+    if (typeof entry.onRelease === "function") entry.onRelease();
   }
 }
 

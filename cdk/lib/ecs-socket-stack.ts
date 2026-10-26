@@ -183,6 +183,11 @@ export class EcsSocketStack extends Stack {
       internetFacing: false,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [nlbSg],
+      // The service runs a single task, so most AZs have no local target.
+      // Without cross-zone, connections that DNS sends to those AZs' NLB
+      // nodes hang until the client's connect timeout (~5s per streamed
+      // chunk from the text-gen Lambda).
+      crossZoneEnabled: true,
     });
 
     // Finite retention + CMK for the socket task's log group.

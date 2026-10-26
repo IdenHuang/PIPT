@@ -652,6 +652,20 @@ def get_cognito_token():
         logger.error("❌ No Cognito token available in context")
         return None
 
+# Every streamed chunk is one POST, so per-request connection setup is paid
+# per token. A shared keep-alive session reuses the TCP connection across
+# chunks and warm invocations. The short connect timeout bounds the stall if
+# a connection attempt hangs (urllib3 then tries the next resolved address).
+_CALLBACK_TIMEOUT = (1.0, 5.0)  # (connect, read) seconds
+_callback_session = None
+
+def _get_callback_session():
+    global _callback_session
+    if _callback_session is None:
+        import requests
+        _callback_session = requests.Session()
+    return _callback_session
+
 def publish_to_appsync(session_id: str, data: dict):
     """Publish a streaming event to the frontend.
 
@@ -673,11 +687,11 @@ def publish_to_appsync(session_id: str, data: dict):
                 headers["x-stream-nonce"] = _stream_callback_nonce
             if _stream_callback_token:
                 headers["x-callback-token"] = _stream_callback_token
-            requests.post(
+            _get_callback_session().post(
                 f"{_stream_callback_url}/stream-callback",
                 json={"session_id": session_id, "data": data},
                 headers=headers,
-                timeout=5,
+                timeout=_CALLBACK_TIMEOUT,
             )
         except Exception as e:
             logger.error(f"Failed to POST stream event to callback URL: {e}")

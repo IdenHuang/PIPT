@@ -72,6 +72,81 @@ describe('StreamRelayRegistry', () => {
     expect(relay.resolve(SESSION_A, nonce)).toBeNull();
   });
 
+  test('onRelease runs once on release and when superseded', () => {
+    const relay = new StreamRelayRegistry();
+    const first = jest.fn();
+    const second = jest.fn();
+    const n1 = relay.register(SESSION_A, {}, first);
+    const n2 = relay.register(SESSION_A, {}, second);
+    expect(first).toHaveBeenCalledTimes(1);
+    relay.release(SESSION_A, n1);
+    expect(second).not.toHaveBeenCalled();
+    relay.release(SESSION_A, n2);
+    relay.release(SESSION_A, n2);
+    expect(second).toHaveBeenCalledTimes(1);
+  });
+
+  describe('deferred release after an API Gateway timeout', () => {
+    beforeEach(() => jest.useFakeTimers());
+    afterEach(() => jest.useRealTimers());
+
+    test('keeps relaying until the max, then releases', () => {
+      const relay = new StreamRelayRegistry();
+      const socket = { id: 'a' };
+      const onRelease = jest.fn();
+      const nonce = relay.register(SESSION_A, socket, onRelease);
+      relay.defer(SESSION_A, nonce, 300_000);
+      jest.advanceTimersByTime(299_000);
+      expect(relay.resolve(SESSION_A, nonce)).toBe(socket);
+      jest.advanceTimersByTime(1_000);
+      expect(relay.resolve(SESSION_A, nonce)).toBeNull();
+      expect(onRelease).toHaveBeenCalledTimes(1);
+    });
+
+    test('a terminal frame shortens the hold to the trailing grace period', () => {
+      const relay = new StreamRelayRegistry();
+      const onRelease = jest.fn();
+      const nonce = relay.register(SESSION_A, {}, onRelease);
+      relay.defer(SESSION_A, nonce, 300_000);
+      relay.settle(SESSION_A, nonce, 15_000);
+      jest.advanceTimersByTime(14_999);
+      expect(onRelease).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(1);
+      expect(onRelease).toHaveBeenCalledTimes(1);
+    });
+
+    test('a terminal frame that arrived before the timeout is honoured by defer', () => {
+      const relay = new StreamRelayRegistry();
+      const onRelease = jest.fn();
+      const nonce = relay.register(SESSION_A, {}, onRelease);
+      relay.settle(SESSION_A, nonce, 15_000);
+      expect(onRelease).not.toHaveBeenCalled(); // not deferred: handler releases
+      relay.defer(SESSION_A, nonce, 300_000);
+      jest.advanceTimersByTime(15_000);
+      expect(onRelease).toHaveBeenCalledTimes(1);
+    });
+
+    test('settle with a wrong nonce does not shorten the hold', () => {
+      const relay = new StreamRelayRegistry();
+      const onRelease = jest.fn();
+      const nonce = relay.register(SESSION_A, {}, onRelease);
+      relay.defer(SESSION_A, nonce, 300_000);
+      relay.settle(SESSION_A, 'f'.repeat(64), 0);
+      jest.advanceTimersByTime(1_000);
+      expect(onRelease).not.toHaveBeenCalled();
+    });
+
+    test('a newer registration is not released by the old timer', () => {
+      const relay = new StreamRelayRegistry();
+      const oldNonce = relay.register(SESSION_A, {});
+      relay.defer(SESSION_A, oldNonce, 1_000);
+      const socket = { id: 'new' };
+      const newNonce = relay.register(SESSION_A, socket);
+      jest.advanceTimersByTime(5_000);
+      expect(relay.resolve(SESSION_A, newNonce)).toBe(socket);
+    });
+  });
+
   test('rejects non-string session ids', () => {
     const relay = new StreamRelayRegistry();
     const nonce = relay.register(SESSION_A, {});
@@ -105,9 +180,11 @@ describe('server.js wiring', () => {
   test('text-generation registers with a nonce, sends it to the Lambda, and releases by nonce', () => {
     const start = server.indexOf('socket.on("text-generation"');
     const block = server.slice(start, server.indexOf('socket.on(', start + 1));
-    expect(block).toMatch(/const streamNonce = textStreamSockets\.register\(sessionId, socket\)/);
+    expect(block).toMatch(/const streamNonce = textStreamSockets\.register\(sessionId, socket,/);
     expect(block).toMatch(/"X-Stream-Nonce": streamNonce/);
-    expect(block).toMatch(/textStreamSockets\.release\(sessionId, streamNonce\)/);
+    expect(block).toMatch(/if \(!deferRelease\) textStreamSockets\.release\(sessionId, streamNonce\)/);
+    // A 504 from API Gateway keeps the registration instead of erroring out.
+    expect(block).toMatch(/response\.status === 504[\s\S]*?textStreamSockets\.defer\(sessionId, streamNonce, TEXT_STREAM_MAX_MS\)[\s\S]*?return;/);
     expect(block).not.toMatch(/textStreamSockets\.(set|delete)\(/);
     // Registration still happens only after the session guard has allowed it.
     expect(block.indexOf('authorizeSessionRequest(')).toBeLessThan(block.indexOf('textStreamSockets.register('));

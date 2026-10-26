@@ -19,9 +19,10 @@ URL = "http://internal-nlb.example"
 @pytest.fixture
 def posts(monkeypatch):
     calls = []
-    fake_requests = types.ModuleType("requests")
-    fake_requests.post = lambda url, **kw: calls.append((url, kw))
-    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+    fake_session = types.SimpleNamespace(post=lambda url, **kw: calls.append((url, kw)))
+    monkeypatch.setattr(chat, "_get_callback_session", lambda: fake_session)
+    # publish_to_appsync imports requests at call time; keep it importable.
+    monkeypatch.setitem(sys.modules, "requests", sys.modules.get("requests") or types.ModuleType("requests"))
     monkeypatch.setattr(chat, "_stream_callback_token", "shared-token")
     monkeypatch.setenv("APPSYNC_GRAPHQL_URL", "")
     yield calls
@@ -62,3 +63,26 @@ def test_reset_clears_previous_invocation_state(posts):
     chat.set_stream_callback_url(None)
     assert chat._stream_callback_url is None
     assert chat._stream_callback_nonce is None
+
+
+def test_callback_uses_short_connect_timeout(posts):
+    chat.set_stream_callback_url(URL, NONCE)
+    chat.publish_to_appsync("session-1", {"type": "chunk"})
+    connect_timeout, read_timeout = posts[0][1]["timeout"]
+    assert connect_timeout <= 1.0
+    assert read_timeout >= connect_timeout
+
+
+def test_callback_session_is_reused(monkeypatch):
+    created = []
+
+    class FakeSession:
+        def __init__(self):
+            created.append(self)
+
+    fake_requests = types.ModuleType("requests")
+    fake_requests.Session = FakeSession
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+    monkeypatch.setattr(chat, "_callback_session", None)
+    assert chat._get_callback_session() is chat._get_callback_session()
+    assert len(created) == 1
