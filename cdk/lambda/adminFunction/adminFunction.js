@@ -1532,10 +1532,13 @@ exports.handler = async (event, context) => {
         if (
           event.queryStringParameters != null &&
           event.queryStringParameters.question_id &&
+          event.queryStringParameters.organization_id &&
           event.body
         ) {
           try {
-            const { question_id } = event.queryStringParameters;
+            // Scope the write to the named organization so a question id alone can
+            // never touch another tenant's row (tenant isolation, f-edcbba0e).
+            const { question_id, organization_id } = event.queryStringParameters;
             const { title, question_text, evaluation_criteria, clinical_intent, category, difficulty_level, is_mandatory, weight, max_score, tags } = JSON.parse(event.body);
 
             const updated = await sqlConnectionTableCreator`
@@ -1552,6 +1555,7 @@ exports.handler = async (event, context) => {
                 max_score = COALESCE(${max_score !== undefined ? max_score : null}, max_score),
                 tags = COALESCE(${tags !== undefined ? tags : null}, tags)
               WHERE question_id = ${question_id}
+                AND organization_id = ${organization_id}
               RETURNING *;
             `;
 
@@ -1568,20 +1572,22 @@ exports.handler = async (event, context) => {
           }
         } else {
           response.statusCode = 400;
-          response.body = JSON.stringify({ error: "question_id and request body are required" });
+          response.body = JSON.stringify({ error: "question_id, organization_id, and request body are required" });
         }
         break;
       case "DELETE /admin/question_bank":
         if (
           event.queryStringParameters != null &&
-          event.queryStringParameters.question_id
+          event.queryStringParameters.question_id &&
+          event.queryStringParameters.organization_id
         ) {
           try {
-            const { question_id } = event.queryStringParameters;
+            const { question_id, organization_id } = event.queryStringParameters;
 
             const updated = await sqlConnectionTableCreator`
               DELETE FROM "question_bank"
               WHERE question_id = ${question_id}
+                AND organization_id = ${organization_id}
               RETURNING question_id;
             `;
 
@@ -1598,7 +1604,7 @@ exports.handler = async (event, context) => {
           }
         } else {
           response.statusCode = 400;
-          response.body = JSON.stringify({ error: "question_id is required" });
+          response.body = JSON.stringify({ error: "question_id and organization_id are required" });
         }
         break;
       // ── Message Limit ────────────────────────────────────────────────
@@ -1884,10 +1890,12 @@ exports.handler = async (event, context) => {
         if (
           event.queryStringParameters != null &&
           event.queryStringParameters.dtp_id &&
+          event.queryStringParameters.organization_id &&
           event.body
         ) {
           try {
-            const { dtp_id } = event.queryStringParameters;
+            // Scoped to the named organization (tenant isolation, f-edcbba0e).
+            const { dtp_id, organization_id } = event.queryStringParameters;
             const { title, expected_dtp_text, clinical_intent, evaluation_criteria, tags, is_required, is_active } = JSON.parse(event.body);
 
             const updated = await sqlConnectionTableCreator`
@@ -1901,6 +1909,7 @@ exports.handler = async (event, context) => {
                 is_required = COALESCE(${is_required !== undefined ? is_required : null}, is_required),
                 is_active = COALESCE(${is_active !== undefined ? is_active : null}, is_active)
               WHERE dtp_id = ${dtp_id}
+                AND organization_id = ${organization_id}
               RETURNING *;
             `;
 
@@ -1917,20 +1926,22 @@ exports.handler = async (event, context) => {
           }
         } else {
           response.statusCode = 400;
-          response.body = JSON.stringify({ error: "dtp_id and request body are required" });
+          response.body = JSON.stringify({ error: "dtp_id, organization_id, and request body are required" });
         }
         break;
       case "DELETE /admin/dtp_bank":
         if (
           event.queryStringParameters != null &&
-          event.queryStringParameters.dtp_id
+          event.queryStringParameters.dtp_id &&
+          event.queryStringParameters.organization_id
         ) {
           try {
-            const { dtp_id } = event.queryStringParameters;
+            const { dtp_id, organization_id } = event.queryStringParameters;
 
             const deleted = await sqlConnectionTableCreator`
               DELETE FROM "dtp_bank"
               WHERE dtp_id = ${dtp_id}
+                AND organization_id = ${organization_id}
               RETURNING dtp_id;
             `;
 
@@ -1947,7 +1958,7 @@ exports.handler = async (event, context) => {
           }
         } else {
           response.statusCode = 400;
-          response.body = JSON.stringify({ error: "dtp_id is required" });
+          response.body = JSON.stringify({ error: "dtp_id and organization_id are required" });
         }
         break;
       // ── Recommendations Bank CRUD ─────────────────────────────────────────
@@ -2036,10 +2047,12 @@ exports.handler = async (event, context) => {
         if (
           event.queryStringParameters != null &&
           event.queryStringParameters.recommendation_id &&
+          event.queryStringParameters.organization_id &&
           event.body
         ) {
           try {
-            const { recommendation_id } = event.queryStringParameters;
+            // Scoped to the named organization (tenant isolation, f-edcbba0e).
+            const { recommendation_id, organization_id } = event.queryStringParameters;
             const { title, recommendation_text, evaluation_criteria, rationale, tags, is_active } = JSON.parse(event.body);
 
             const updated = await sqlConnectionTableCreator`
@@ -2052,6 +2065,7 @@ exports.handler = async (event, context) => {
                 tags = COALESCE(${tags !== undefined ? tags : null}, tags),
                 is_active = COALESCE(${is_active !== undefined ? is_active : null}, is_active)
               WHERE recommendation_id = ${recommendation_id}
+                AND organization_id = ${organization_id}
               RETURNING *;
             `;
 
@@ -2068,20 +2082,22 @@ exports.handler = async (event, context) => {
           }
         } else {
           response.statusCode = 400;
-          response.body = JSON.stringify({ error: "recommendation_id and request body are required" });
+          response.body = JSON.stringify({ error: "recommendation_id, organization_id, and request body are required" });
         }
         break;
       case "DELETE /admin/recommendations_bank":
         if (
           event.queryStringParameters != null &&
-          event.queryStringParameters.recommendation_id
+          event.queryStringParameters.recommendation_id &&
+          event.queryStringParameters.organization_id
         ) {
           try {
-            const { recommendation_id } = event.queryStringParameters;
+            const { recommendation_id, organization_id } = event.queryStringParameters;
 
             const deleted = await sqlConnectionTableCreator`
               DELETE FROM "recommendations_bank"
               WHERE recommendation_id = ${recommendation_id}
+                AND organization_id = ${organization_id}
               RETURNING recommendation_id;
             `;
 
@@ -2098,7 +2114,7 @@ exports.handler = async (event, context) => {
           }
         } else {
           response.statusCode = 400;
-          response.body = JSON.stringify({ error: "recommendation_id is required" });
+          response.body = JSON.stringify({ error: "recommendation_id and organization_id are required" });
         }
         break;
       default:

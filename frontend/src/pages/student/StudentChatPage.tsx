@@ -14,13 +14,12 @@ import PhysicalAssessmentContent, { ImageViewer, isImageFile } from '@/component
 import ReportIssueDialog from '@/components/ReportIssueDialog';
 import AIDebriefDialog from '@/components/AIDebriefDialog';
 import { ConcludeModal } from '@/components/ConcludeModal';
-import type { UpdatedDebriefData, DebriefChunk1, DebriefChunk2 } from '@/services/studentService';
+import type { UpdatedDebriefData } from '@/services/studentService';
 import { useAuth } from '@/App';
 import { authService } from '@/lib/auth';
 import { supportsVoiceMode } from '@/lib/browser';
 import { useResizablePanel } from '@/hooks/useResizablePanel';
 import ResizeHandle from '@/components/ResizeHandle';
-import { extractDebriefFromRawJson } from '@/lib/debrief-parser';
 
 /**
  * StudentChatPage Component
@@ -727,333 +726,86 @@ function StudentChatPage() {
       return;
     }
 
-    // Listen for the debrief result via AppSync subscription
-    // The backend publishes a "debrief" event when generation is complete
+    // Wait for the backend's "debrief" frame, then load the debrief from
+    // GET /student/get_debrief. The frame is only a "ready" signal: its content
+    // is never rendered, because the REST endpoint enforces session ownership
+    // and is the authoritative copy (security finding f-dbe2bb23).
+    const loadDebrief = async () => {
+      try {
+        const data = await studentService.fetchDebrief(sessionId);
+        if (data) {
+          setDebriefData(data);
+          setIsAIDebriefOpen(true);
+        }
+      } catch (e) {
+        console.error('Failed to fetch debrief:', e);
+      } finally {
+        setSessionStatus('concluded');
+      }
+    };
+
     try {
       const { subscribeToTextStream } = await import('@/lib/appsync-client');
+      let handled = false;
       const unsubscribe = await subscribeToTextStream(sessionId, (event) => {
-        if (event.type === 'debrief') {
-          try {
-            let parsed = JSON.parse(event.content);
-            
-            // Safety net: if the backend JSON parse failed, the entire LLM output
-            // ends up in the "summary" field as a raw JSON string. Detect this and
-            // extract the structured data from it.
-            if (
-              parsed.summary &&
-              typeof parsed.summary === 'string' &&
-              parsed.summary.trimStart().startsWith('{') &&
-              (!parsed.questions_addressed || parsed.questions_addressed.length === 0)
-            ) {
-              const extracted = extractDebriefFromRawJson(parsed.summary);
-              if (extracted) {
-                parsed = extracted;
-              }
-            }
-
-            // questions_addressed may be strings (legacy) or objects with question_text (enhanced)
-            const addressedQuestions = (parsed.questions_addressed || []).map(
-              (q: string | { question_text?: string; quality_assessment?: string }) =>
-                typeof q === 'string' ? q : (q.question_text || 'Unknown question')
-            );
-            const missedQuestions = (parsed.questions_missed || []).map(
-              (q: string | { question_text?: string }) =>
-                typeof q === 'string' ? q : (q.question_text || 'Unknown question')
-            );
-            setDebriefData({
-              summary: parsed.summary || '',
-              questionsAddressed: addressedQuestions,
-              missedKeyQuestionsCount: missedQuestions.length,
-              missedQuestions: missedQuestions,
-              missedQuestionsGuidance: parsed.reasoning_gaps || '',
-              overallScore: typeof parsed.overall_score === 'number' ? parsed.overall_score : undefined,
-              recommendation: typeof parsed.recommendation === 'string' ? parsed.recommendation : undefined,
-              recommendationFeedback: {
-                strengths: parsed.recommendation_feedback?.strengths || [],
-                areasForImprovement: parsed.recommendation_feedback?.areas_for_improvement || [],
-              },
-              suggestedRewrites: (parsed.suggested_rewrites || []).map(
-                (r: { original_message?: string; suggested_rewrite?: string }) => ({
-                  original: r.original_message || '',
-                  suggested: r.suggested_rewrite || '',
-                })
-              ),
-              rubricDescription: 'Compare your recommendations with the answer key provided by your instructor.',
-              answerKeyComparison: parsed.answer_key_comparison ? {
-                answerKeyAvailable: parsed.answer_key_comparison.answer_key_available ?? false,
-                correctElements: parsed.answer_key_comparison.correct_elements,
-                missingElements: parsed.answer_key_comparison.missing_elements,
-                incorrectElements: parsed.answer_key_comparison.incorrect_elements,
-                overallAlignment: parsed.answer_key_comparison.overall_alignment,
-              } : undefined,
-            });
-            setSessionStatus('concluded');
-            setIsAIDebriefOpen(true);
-          } catch (e) {
-            console.error('Failed to parse debrief data:', e);
-            setSessionStatus('concluded');
-          }
-          unsubscribe();
-        }
+        if (event.type !== 'debrief' || handled) return;
+        handled = true;
+        unsubscribe();
+        void loadDebrief();
       });
     } catch (err) {
       console.error('Failed to subscribe for debrief:', err);
-      // Even if subscription fails, the session is concluded — debrief can be fetched later
-      setSessionStatus('concluded');
+      // Even if subscription fails, the session is concluded; poll REST instead.
+      await loadDebrief();
     }
   };
 
   /**
    * Handle the new two-step conclude modal completion.
    * Called after ConcludeModal successfully submits DTP + Recommendation data.
-   * Subscribes to AppSync for progressive debrief_chunk1 and debrief_chunk2 events.
+   * Subscribes to AppSync only to learn when the debrief is ready, then loads
+   * it from the REST endpoint.
    */
   const handleConcludeWithSubmissions = async (dtpSubmission: string[], recommendationSubmission: { recommendation: string; rationale: string }[]) => {
     if (!groupId || !patientId || !sessionId) return;
 
     setSessionStatus('generating_debrief');
 
-    try {
-      const { subscribeToTextStream } = await import('@/lib/appsync-client');
-      const unsubscribe = await subscribeToTextStream(sessionId, (event) => {
-        if (event.type === 'debrief_chunk1') {
-          try {
-            const content = typeof event.content === 'string' ? JSON.parse(event.content) : event.content;
-
-            // Parse chunk1 fields from the event payload
-            const questionsAddressed = (content.questions_addressed || []).map(
-              (q: string | { question_text?: string }) =>
-                typeof q === 'string' ? q : (q.question_text || 'Unknown question')
-            );
-
-            const chunk1: DebriefChunk1 = {
-              summary: typeof content.summary === 'string' ? content.summary : '',
-              questionsAddressed,
-              questionsAddressedCount: questionsAddressed.length,
-              questionsMissed: [],
-              questionsMissedCount: content.questions_missed_count ?? 0,
-              suggestedRewrites: (content.suggested_rewrites || []).map(
-                (r: { original_message?: string; suggested_rewrite?: string }) => ({
-                  original: r.original_message || '',
-                  suggested: r.suggested_rewrite || '',
-                })
-              ),
-              keyQuestionsScore: content.key_questions_score
-                ? {
-                    matched: content.key_questions_score.matched,
-                    total: content.key_questions_score.total,
-                    percentage: content.key_questions_score.percentage,
-                  }
-                : null,
-              guidanceKeyQuestions: content.guidance_key_questions || null,
-            };
-
-            // Set chunk1 immediately, chunk2 as null to trigger loading state
-            setUpdatedDebriefData({ chunk1, chunk2: null, dtpSubmission: dtpSubmission.length > 0 ? dtpSubmission : null, recommendationSubmission: recommendationSubmission.length > 0 ? recommendationSubmission : null });
-            setSessionStatus('concluded');
-            setIsAIDebriefOpen(true);
-          } catch (e) {
-            console.error('Failed to parse debrief_chunk1:', e);
-          }
-        } else if (event.type === 'debrief_chunk2') {
-          try {
-            const content = typeof event.content === 'string' ? JSON.parse(event.content) : event.content;
-
-            const dtpRaw = content.dtp_comparison || { matched: [], missed_count: 0, additional: [] };
-            const recRaw = content.recommendations_comparison || { matched: [], missed_count: 0, additional: [] };
-            const sectionScores = content.section_scores || {};
-            const guidanceData = content.guidance || {};
-
-            // Also check for inline score/guidance on the comparison objects
-            const dtpScore = dtpRaw.score || sectionScores.dtps || null;
-            const recScore = recRaw.score || sectionScores.recommendations || null;
-            const dtpGuidance = dtpRaw.guidance || guidanceData.dtps || null;
-            const recGuidance = recRaw.guidance || guidanceData.recommendations || null;
-
-            const chunk2: DebriefChunk2 = {
-              dtpComparison: {
-                overview: `You identified ${dtpRaw.matched?.length || 0} out of ${(dtpRaw.matched?.length || 0) + (dtpRaw.missed_count || 0)} expected drug therapy problems.`,
-                matched: (dtpRaw.matched || []).map((m: any) => ({
-                  dtpText: m.instructor_text || '',
-                  status: 'matched' as const,
-                  matchedWith: m.student_text || '',
-                })),
-                missed: Array.from({ length: dtpRaw.missed_count || 0 }, () => ({
-                  dtpText: '',
-                  status: 'missed' as const,
-                })),
-                additional: (dtpRaw.additional || []).map((m: any) => ({
-                  dtpText: m.student_text || '',
-                  status: 'additional' as const,
-                })),
-                score: dtpScore
-                  ? { matched: dtpScore.matched, total: dtpScore.total, percentage: dtpScore.percentage }
-                  : null,
-                guidance: dtpGuidance,
-              },
-              recommendationsComparison: {
-                overview: `You matched ${recRaw.matched?.length || 0} out of ${(recRaw.matched?.length || 0) + (recRaw.missed_count || 0)} expected recommendations.`,
-                matched: (recRaw.matched || []).map((m: any) => ({
-                  recommendationText: m.instructor_text || '',
-                  status: 'matched' as const,
-                  matchedWith: m.student_text || '',
-                  rationaleRating: m.rationale_rating || undefined,
-                  rationaleExplanation: m.rationale_explanation || undefined,
-                })),
-                missed: Array.from({ length: recRaw.missed_count || 0 }, () => ({
-                  recommendationText: '',
-                  status: 'missed' as const,
-                })),
-                additional: (recRaw.additional || []).map((m: any) => ({
-                  recommendationText: m.student_text || '',
-                  status: 'additional' as const,
-                })),
-                score: recScore
-                  ? { matched: recScore.matched, total: recScore.total, percentage: recScore.percentage }
-                  : null,
-                guidance: recGuidance,
-              },
-            };
-
-            // Merge chunk2 with existing chunk1 without re-rendering chunk1
-            setUpdatedDebriefData((prev) => {
-              if (!prev) return prev ?? undefined;
-              // Also update chunk1 with summary/rewrites/guidance from chunk2 if provided
-              const updatedChunk1 = { ...prev.chunk1 };
-              if (content.summary && typeof content.summary === 'string' && content.summary.length > 0) {
-                updatedChunk1.summary = content.summary;
-              }
-              if (content.suggested_rewrites && content.suggested_rewrites.length > 0) {
-                updatedChunk1.suggestedRewrites = content.suggested_rewrites.map(
-                  (r: { original_message?: string; suggested_rewrite?: string }) => ({
-                    original: r.original_message || '',
-                    suggested: r.suggested_rewrite || '',
-                  })
-                );
-              }
-              if (content.guidance_key_questions) {
-                updatedChunk1.guidanceKeyQuestions = content.guidance_key_questions;
-              }
-              return { chunk1: updatedChunk1, chunk2, dtpSubmission: prev.dtpSubmission ?? (dtpSubmission.length > 0 ? dtpSubmission : null), recommendationSubmission: prev.recommendationSubmission ?? (recommendationSubmission.length > 0 ? recommendationSubmission : null) };
-            });
-
-            // Unsubscribe after receiving chunk2 (final event)
-            unsubscribe();
-          } catch (e) {
-            console.error('Failed to parse debrief_chunk2:', e);
-          }
-        } else if (event.type === 'debrief') {
-          // Full debrief fallback — for late joiners or page refreshes
-          try {
-            const parsed = typeof event.content === 'string' ? JSON.parse(event.content) : event.content;
-
-            const questionsAddressed = (parsed.questions_addressed || []).map(
-              (q: string | { question_text?: string }) =>
-                typeof q === 'string' ? q : (q.question_text || 'Unknown question')
-            );
-            const questionsMissed = (parsed.questions_missed || []).map(
-              (q: string | { question_text?: string }) =>
-                typeof q === 'string' ? q : (q.question_text || 'Unknown question')
-            );
-            const sectionScores = parsed.section_scores || {};
-            const guidanceData = parsed.guidance || {};
-
-            const chunk1: DebriefChunk1 = {
-              summary: typeof parsed.summary === 'string' ? parsed.summary : '',
-              questionsAddressed,
-              questionsAddressedCount: questionsAddressed.length,
-              questionsMissed,
-              questionsMissedCount: questionsMissed.length,
-              suggestedRewrites: (parsed.suggested_rewrites || []).map(
-                (r: { original_message?: string; suggested_rewrite?: string }) => ({
-                  original: r.original_message || '',
-                  suggested: r.suggested_rewrite || '',
-                })
-              ),
-              keyQuestionsScore: sectionScores.key_questions
-                ? {
-                    matched: sectionScores.key_questions.matched,
-                    total: sectionScores.key_questions.total,
-                    percentage: sectionScores.key_questions.percentage,
-                  }
-                : null,
-              guidanceKeyQuestions: guidanceData.key_questions || null,
-            };
-
-            let chunk2: DebriefChunk2 | null = null;
-            if (parsed.dtp_comparison || parsed.recommendations_comparison) {
-              const dtpRaw = parsed.dtp_comparison || { matched: [], missed: [], additional: [] };
-              const recRaw = parsed.recommendations_comparison || { matched: [], missed: [], additional: [] };
-
-              chunk2 = {
-                dtpComparison: {
-                  overview: `You identified ${dtpRaw.matched?.length || 0} out of ${(dtpRaw.matched?.length || 0) + (dtpRaw.missed?.length || 0)} expected drug therapy problems.`,
-                  matched: (dtpRaw.matched || []).map((m: any) => ({
-                    dtpText: m.instructor_text || '',
-                    status: 'matched' as const,
-                    matchedWith: m.student_text || '',
-                  })),
-                  missed: (dtpRaw.missed || []).map((_m: any) => ({
-                    dtpText: '',
-                    status: 'missed' as const,
-                  })),
-                  additional: (dtpRaw.additional || []).map((m: any) => ({
-                    dtpText: m.student_text || '',
-                    status: 'additional' as const,
-                  })),
-                  score: sectionScores.dtps
-                    ? { matched: sectionScores.dtps.matched, total: sectionScores.dtps.total, percentage: sectionScores.dtps.percentage }
-                    : null,
-                  guidance: guidanceData.dtps || null,
-                },
-                recommendationsComparison: {
-                  overview: `You matched ${recRaw.matched?.length || 0} out of ${(recRaw.matched?.length || 0) + (recRaw.missed?.length || 0)} expected recommendations.`,
-                  matched: (recRaw.matched || []).map((m: any) => ({
-                    recommendationText: m.instructor_text || '',
-                    status: 'matched' as const,
-                    matchedWith: m.student_text || '',
-                    rationaleRating: m.rationale_rating || undefined,
-                    rationaleExplanation: m.rationale_explanation || undefined,
-                  })),
-                  missed: (recRaw.missed || []).map((_m: any) => ({
-                    recommendationText: '',
-                    status: 'missed' as const,
-                  })),
-                  additional: (recRaw.additional || []).map((m: any) => ({
-                    recommendationText: m.student_text || '',
-                    status: 'additional' as const,
-                  })),
-                  score: sectionScores.recommendations
-                    ? { matched: sectionScores.recommendations.matched, total: sectionScores.recommendations.total, percentage: sectionScores.recommendations.percentage }
-                    : null,
-                  guidance: guidanceData.recommendations || null,
-                },
-              };
-            }
-
-            setUpdatedDebriefData({ chunk1, chunk2, dtpSubmission: dtpSubmission.length > 0 ? dtpSubmission : null, recommendationSubmission: recommendationSubmission.length > 0 ? recommendationSubmission : null });
-            setSessionStatus('concluded');
-            setIsAIDebriefOpen(true);
-            unsubscribe();
-          } catch (e) {
-            console.error('Failed to parse full debrief:', e);
-            setSessionStatus('concluded');
-            unsubscribe();
-          }
-        }
-      });
-    } catch (err) {
-      console.error('Failed to subscribe for debrief chunks:', err);
-      // Fallback to polling approach if subscription fails
+    // Wait for the backend's final frame (debrief_chunk2, or the full "debrief"
+    // on the transcript fallback path), then load the debrief from
+    // GET /student/get_debrief. Frame content is never rendered: the REST
+    // endpoint enforces session ownership and is the authoritative copy
+    // (security finding f-dbe2bb23). debrief_chunk1 is ignored for the same
+    // reason; fetchUpdatedDebrief polls while the DB row is still being written.
+    const loadDebrief = async () => {
       try {
         const debrief = await studentService.fetchUpdatedDebrief(sessionId);
-        setUpdatedDebriefData(debrief);
-        setSessionStatus('concluded');
+        setUpdatedDebriefData({
+          ...debrief,
+          dtpSubmission: debrief.dtpSubmission ?? (dtpSubmission.length > 0 ? dtpSubmission : null),
+          recommendationSubmission: debrief.recommendationSubmission ?? (recommendationSubmission.length > 0 ? recommendationSubmission : null),
+        });
         setIsAIDebriefOpen(true);
       } catch (fetchErr) {
         console.error('Failed to fetch updated debrief:', fetchErr);
+      } finally {
         setSessionStatus('concluded');
       }
+    };
+
+    try {
+      const { subscribeToTextStream } = await import('@/lib/appsync-client');
+      let handled = false;
+      const unsubscribe = await subscribeToTextStream(sessionId, (event) => {
+        if ((event.type !== 'debrief_chunk2' && event.type !== 'debrief') || handled) return;
+        handled = true;
+        unsubscribe();
+        void loadDebrief();
+      });
+    } catch (err) {
+      console.error('Failed to subscribe for debrief chunks:', err);
+      // Fall back to polling the REST endpoint if the subscription fails
+      await loadDebrief();
     }
   };
 

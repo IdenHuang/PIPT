@@ -5999,6 +5999,12 @@ paths:
       operationId: admin_question_bank_PUT
       parameters:
         - in: query
+          name: organization_id
+          required: true
+          description: ID of the organization that owns the question
+          schema:
+            type: string
+        - in: query
           name: question_id
           required: true
           description: ID of the question to update
@@ -6056,6 +6062,12 @@ paths:
       summary: Delete a question from the question bank
       operationId: admin_question_bank_DELETE
       parameters:
+        - in: query
+          name: organization_id
+          required: true
+          description: ID of the organization that owns the question
+          schema:
+            type: string
         - in: query
           name: question_id
           required: true
@@ -6286,6 +6298,12 @@ paths:
       operationId: admin_dtp_bank_PUT
       parameters:
         - in: query
+          name: organization_id
+          required: true
+          description: ID of the organization that owns the DTP item
+          schema:
+            type: string
+        - in: query
           name: dtp_id
           required: true
           description: ID of the DTP item to update
@@ -6337,6 +6355,12 @@ paths:
       summary: Delete a DTP item
       operationId: admin_dtp_bank_DELETE
       parameters:
+        - in: query
+          name: organization_id
+          required: true
+          description: ID of the organization that owns the DTP item
+          schema:
+            type: string
         - in: query
           name: dtp_id
           required: true
@@ -6443,6 +6467,12 @@ paths:
       operationId: admin_recommendations_bank_PUT
       parameters:
         - in: query
+          name: organization_id
+          required: true
+          description: ID of the organization that owns the recommendation item
+          schema:
+            type: string
+        - in: query
           name: recommendation_id
           required: true
           description: ID of the recommendation item to update
@@ -6488,6 +6518,12 @@ paths:
       summary: Delete a recommendation item
       operationId: admin_recommendations_bank_DELETE
       parameters:
+        - in: query
+          name: organization_id
+          required: true
+          description: ID of the organization that owns the recommendation item
+          schema:
+            type: string
         - in: query
           name: recommendation_id
           required: true

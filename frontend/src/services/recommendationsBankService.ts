@@ -123,11 +123,12 @@ export async function createRecommendationItem(
  * Update an existing Recommendation item.
  */
 export async function updateRecommendationItem(
+  organizationId: string,
   itemId: string,
   data: Partial<Pick<RecommendationItem, 'title' | 'recommendationText' | 'evaluationCriteria' | 'rationale' | 'tags' | 'isActive'>>
 ): Promise<RecommendationItem> {
   const row = await apiClient.request<Record<string, unknown>>(
-    `admin/recommendations_bank?recommendation_id=${itemId}`,
+    `admin/recommendations_bank?organization_id=${encodeURIComponent(organizationId)}&recommendation_id=${encodeURIComponent(itemId)}`,
     {
       method: 'PUT',
       body: {
@@ -209,8 +210,8 @@ export async function updateRecommendationItemAsInstructor(
 /**
  * Delete a Recommendation item by ID.
  */
-export async function deleteRecommendationItem(itemId: string): Promise<void> {
-  await apiClient.request(`admin/recommendations_bank?recommendation_id=${itemId}`, {
+export async function deleteRecommendationItem(organizationId: string, itemId: string): Promise<void> {
+  await apiClient.request(`admin/recommendations_bank?organization_id=${encodeURIComponent(organizationId)}&recommendation_id=${encodeURIComponent(itemId)}`, {
     method: 'DELETE',
   });
 }

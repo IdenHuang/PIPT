@@ -134,7 +134,7 @@ function AdminRecommendationsBankPage() {
   const handleDeleteRecommendation = async () => {
     try {
       setError(null);
-      await deleteRecommendationItem(deleteConfirm.itemId);
+      await deleteRecommendationItem(organizationId || '', deleteConfirm.itemId);
       setRecommendationItems(prev => prev.filter(item => item.id !== deleteConfirm.itemId));
       if (expandedItemId === deleteConfirm.itemId) setExpandedItemId(null);
       if (editingItemId === deleteConfirm.itemId) setEditingItemId(null);
@@ -208,7 +208,7 @@ function AdminRecommendationsBankPage() {
     setEditSaving(true);
     setEditError(null);
     try {
-      const updated = await updateRecommendationItem(editingItemId, {
+      const updated = await updateRecommendationItem(organizationId || '', editingItemId, {
         title: editForm.title.trim(),
         recommendationText: editForm.recommendationText.trim(),
         evaluationCriteria: editForm.evaluationCriteria.trim(),

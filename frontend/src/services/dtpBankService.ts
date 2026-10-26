@@ -130,11 +130,12 @@ export async function createDTPItem(
  * Update an existing DTP item.
  */
 export async function updateDTPItem(
+  organizationId: string,
   itemId: string,
   data: Partial<Pick<DTPItem, 'title' | 'expectedDTPText' | 'clinicalIntent' | 'evaluationCriteria' | 'tags' | 'isRequired' | 'isActive'>>
 ): Promise<DTPItem> {
   const row = await apiClient.request<Record<string, unknown>>(
-    `admin/dtp_bank?dtp_id=${itemId}`,
+    `admin/dtp_bank?organization_id=${encodeURIComponent(organizationId)}&dtp_id=${encodeURIComponent(itemId)}`,
     {
       method: 'PUT',
       body: {
@@ -220,8 +221,8 @@ export async function updateDTPItemAsInstructor(
 /**
  * Delete a DTP item by ID.
  */
-export async function deleteDTPItem(itemId: string): Promise<void> {
-  await apiClient.request(`admin/dtp_bank?dtp_id=${itemId}`, {
+export async function deleteDTPItem(organizationId: string, itemId: string): Promise<void> {
+  await apiClient.request(`admin/dtp_bank?organization_id=${encodeURIComponent(organizationId)}&dtp_id=${encodeURIComponent(itemId)}`, {
     method: 'DELETE',
   });
 }
