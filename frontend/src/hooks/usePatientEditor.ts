@@ -640,7 +640,9 @@ export function usePatientEditor({
       showNotification({ message: 'Material saved successfully', type: 'success' });
     } catch (error) {
       console.error('Failed to save case material:', error);
-      showNotification({ message: 'Failed to save material', type: 'error' });
+      // Surface server-side validation errors (e.g. "url must be an https URL ...").
+      const detail = error instanceof Error && error.message ? `: ${error.message}` : '';
+      showNotification({ message: `Failed to save material${detail}`, type: 'error' });
     }
   };
 

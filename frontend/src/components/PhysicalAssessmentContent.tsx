@@ -1,108 +1,21 @@
 import { useMemo, useState } from 'react';
-import DOMPurify from 'dompurify';
 import { UI_COLORS } from '@/lib/colors';
 import { ZoomIn, ZoomOut, RotateCcw, ExternalLink } from 'lucide-react';
 import type { PersonaMedia } from '@/services/studentService';
+import {
+  extractSafeIframeSrc,
+  isEmbedCode,
+  sanitizeEmbedCode,
+  toAllowedIframeSrc,
+  toSafeHttpsUrl,
+} from '@/lib/embedSafety';
+import UnavailableContentNotice from '@/components/UnavailableContentNotice';
 
 interface PhysicalAssessmentContentProps {
   materials: PersonaMedia[];
   loading?: boolean;
 }
 
-/**
- * Allowed domains for iframe src attributes.
- * Extend this list as new embed providers are needed.
- */
-const ALLOWED_IFRAME_DOMAINS = [
-  'youtube.com',
-  'www.youtube.com',
-  'youtube-nocookie.com',
-  'www.youtube-nocookie.com',
-  'player.vimeo.com',
-  'vimeo.com',
-  'h5p.org',
-  'www.h5p.org',
-  'h5p.com',
-  'embed.h5p.com',
-  'apps.pharmacy.ubc.ca',
-  'docs.google.com',
-  'drive.google.com',
-  'open.spotify.com',
-  'w.soundcloud.com',
-  'codepen.io',
-  'codesandbox.io',
-  'loom.com',
-  'www.loom.com',
-];
-
-/**
- * Configure DOMPurify to only allow iframe elements with safe attributes.
- */
-function sanitizeEmbedCode(html: string): string {
-  // Allow only iframe tags
-  const clean = DOMPurify.sanitize(html, {
-    ALLOWED_TAGS: ['iframe'],
-    ALLOWED_ATTR: [
-      'src',
-      'width',
-      'height',
-      'allow',
-      'allowfullscreen',
-      'frameborder',
-      'title',
-      'style',
-      'loading',
-      'referrerpolicy',
-      'sandbox',
-    ],
-    ADD_TAGS: ['iframe'],
-    ADD_ATTR: ['allowfullscreen'],
-  });
-
-  // Validate that the iframe src is from an allowed domain
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(clean, 'text/html');
-  const iframe = doc.querySelector('iframe');
-
-  if (!iframe) return '';
-
-  const src = iframe.getAttribute('src') || '';
-  try {
-    const url = new URL(src, window.location.origin);
-    const hostname = url.hostname;
-    const isAllowed = ALLOWED_IFRAME_DOMAINS.some(
-      (domain) => hostname === domain || hostname.endsWith('.' + domain)
-    );
-    if (!isAllowed) return '';
-  } catch {
-    return '';
-  }
-
-  return clean;
-}
-
-/**
- * Detect whether a value is embed HTML (starts with <iframe) or a plain URL.
- */
-function isEmbedCode(value: string): boolean {
-  return value.trimStart().toLowerCase().startsWith('<iframe');
-}
-
-/**
- * Extract the iframe src from an embed HTML snippet, if present.
- * Used to offer an "open in new tab" link when the embed can't be rendered
- * inline (e.g. its domain isn't allowlisted).
- */
-function extractIframeSrc(html: string): string | null {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(html, 'text/html');
-  const src = doc.querySelector('iframe')?.getAttribute('src') || '';
-  try {
-    return new URL(src, window.location.origin).href;
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Extract width and height from an iframe's attributes to compute aspect ratio.
@@ -143,6 +56,12 @@ export function ImageViewer({ url, title }: { url: string; title: string }) {
   const zoomOut = () => setScale((s) => Math.max(s - 0.25, 0.5));
   const resetZoom = () => setScale(1);
 
+  // Only https URLs reach the <img src> / <a href> sinks.
+  const safeUrl = toSafeHttpsUrl(url);
+  if (!safeUrl) {
+    return <UnavailableContentNotice href={null} />;
+  }
+
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2">
@@ -180,7 +99,7 @@ export function ImageViewer({ url, title }: { url: string; title: string }) {
           <RotateCcw className="w-4 h-4" style={{ color: UI_COLORS.text.body }} />
         </button>
         <a
-          href={url}
+          href={safeUrl}
           target="_blank"
           rel="noopener noreferrer"
           className="p-1.5 rounded transition-colors ml-auto"
@@ -202,7 +121,7 @@ export function ImageViewer({ url, title }: { url: string; title: string }) {
         }}
       >
         <img
-          src={url}
+          src={safeUrl}
           alt={title}
           style={{
             transform: `scale(${scale})`,
@@ -253,36 +172,18 @@ function EmbedRenderer({ url, title }: { url: string; title: string }) {
   // would put the raw embed HTML into the src attribute and 404. Show a notice
   // with a link to open the source directly, if we can recover it.
   if (embedCode) {
-    const src = extractIframeSrc(url);
-    return (
-      <div
-        className="rounded-lg p-4 text-sm"
-        style={{
-          borderWidth: '1px',
-          borderStyle: 'solid',
-          borderColor: UI_COLORS.border.default,
-          backgroundColor: UI_COLORS.background.hoverLight,
-          color: UI_COLORS.text.muted,
-        }}
-      >
-        <p>This content can't be displayed here.</p>
-        {src && (
-          <a
-            href={src}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 mt-2 no-underline"
-            style={{ color: UI_COLORS.text.body }}
-          >
-            <ExternalLink className="w-3 h-3" />
-            Open content in a new tab
-          </a>
-        )}
-      </div>
-    );
+    return <UnavailableContentNotice href={extractSafeIframeSrc(url)} />;
   }
 
-  // Plain URL path — render in a 16:9 iframe wrapper (legacy behavior)
+  // Plain URL path: only an https URL on an allowlisted embed host may become
+  // an iframe src. Anything else (javascript:, data:, http:, unknown hosts)
+  // gets the notice, with a new-tab link only if it is at least https.
+  const iframeSrc = toAllowedIframeSrc(url);
+  if (!iframeSrc) {
+    return <UnavailableContentNotice href={toSafeHttpsUrl(url)} />;
+  }
+
+  // Render in a 16:9 iframe wrapper (legacy behavior)
   return (
     <div
       className="rounded-lg overflow-hidden"
@@ -297,7 +198,7 @@ function EmbedRenderer({ url, title }: { url: string; title: string }) {
       }}
     >
       <iframe
-        src={url}
+        src={iframeSrc}
         title={title}
         style={{
           position: 'absolute',
@@ -342,9 +243,9 @@ function PhysicalAssessmentContent({ materials, loading }: PhysicalAssessmentCon
             <h3 className="text-sm font-semibold" style={{ color: UI_COLORS.text.heading }}>
               {material.title}
             </h3>
-            {material.url && material.media_type !== 'image' && !isEmbedCode(material.url) && (
+            {material.media_type !== 'image' && !isEmbedCode(material.url) && toSafeHttpsUrl(material.url) && (
               <a
-                href={material.url}
+                href={toSafeHttpsUrl(material.url)!}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="flex items-center gap-1 text-xs px-2 py-1 rounded transition-colors no-underline"

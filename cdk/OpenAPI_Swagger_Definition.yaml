@@ -147,6 +147,16 @@ paths:
             type: string
             enum: ["true", "false"]
             default: "false"
+        - in: header
+          name: X-Stream-Nonce
+          required: false
+          description: >
+            Server-to-server only. Per-request nonce minted by the socket server when stream=true;
+            the Lambda echoes it on every /stream-callback POST so the socket server relays only into
+            the session it registered. Without a well-formed value (64 lowercase hex chars) streaming
+            falls back to AppSync.
+          schema:
+            type: string
         - in: query
           name: mode
           required: false

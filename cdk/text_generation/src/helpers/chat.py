@@ -31,11 +31,19 @@ _LOW_TIER_OFFSET = 0.25
 # socket server URL. Never set this from request input: the POST carries
 # the x-callback-token secret.
 _stream_callback_url: str | None = None
+# Per-request nonce minted by the socket server (X-Stream-Nonce). Echoed on
+# every callback so the server relays only into the session it registered.
+_stream_callback_nonce: str | None = None
 
-def set_stream_callback_url(url: str | None):
-    """Set the callback URL for streaming events. Called by main.py per request."""
-    global _stream_callback_url
-    _stream_callback_url = url
+def set_stream_callback_url(url: str | None, nonce: str | None = None):
+    """Set the callback URL and nonce for streaming events. Called by main.py per request.
+
+    Both are reset on every invocation so a warm container never reuses a
+    previous request's destination or nonce.
+    """
+    global _stream_callback_url, _stream_callback_nonce
+    _stream_callback_url = url if url and nonce else None
+    _stream_callback_nonce = nonce if url and nonce else None
 
 # Shared token for authenticating POSTs to /stream-callback. Loaded once at
 # cold start so every invocation pays only a dict lookup, not a network call.
@@ -646,7 +654,8 @@ def publish_to_appsync(session_id: str, data: dict):
 
     When a stream callback URL is configured (ECS Socket.IO server, from SSM),
     POST the event there — a fast, VPC-internal call authenticated with the
-    shared x-callback-token header.
+    shared x-callback-token header plus the per-request x-stream-nonce the
+    socket server minted for this session.
     Otherwise fall back to the legacy AppSync GraphQL mutation path.
     """
     import requests
@@ -656,7 +665,9 @@ def publish_to_appsync(session_id: str, data: dict):
     # ── Fast path: ECS callback ──────────────────────────────────────────
     if _stream_callback_url:
         try:
-            headers = {"x-callback-token": _stream_callback_token} if _stream_callback_token else {}
+            headers = {"x-stream-nonce": _stream_callback_nonce}
+            if _stream_callback_token:
+                headers["x-callback-token"] = _stream_callback_token
             requests.post(
                 f"{_stream_callback_url}/stream-callback",
                 json={"session_id": session_id, "data": data},

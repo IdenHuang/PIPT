@@ -5,6 +5,7 @@ const { getCorsHeaders } = require("./cors.js");
 const { authorizeInstructorRequest } = require("./instructorRoutePolicy.js");
 const { verifyBankItemsInGroupOrganization, verifyQuestionsAttachableToGroup } = require("./authz.js");
 const { validateTagsField, normalizeCreateFields } = require("./questionBankFields.js");
+const { validatePersonaMediaUrl } = require("./mediaUrlValidation.js");
 const {
   BANK_DESCRIPTORS,
   validateRequiredTextFields,
@@ -2781,7 +2782,16 @@ exports.handler = async (event, context) => {
         ) {
           try {
             const { persona_id } = event.queryStringParameters;
-            const { title, description, media_type, url } = JSON.parse(event.body);
+            const { title, description, media_type, url: rawUrl } = JSON.parse(event.body);
+
+            // Reject non-https URLs / unsafe embed code before storing.
+            const urlCheck = validatePersonaMediaUrl(rawUrl);
+            if (!urlCheck.ok) {
+              response.statusCode = 400;
+              response.body = JSON.stringify({ error: urlCheck.error });
+              break;
+            }
+            const url = urlCheck.value;
 
             const inserted = await sqlConnection`
               INSERT INTO "persona_media" (persona_id, title, description, media_type, url)
@@ -2809,7 +2819,16 @@ exports.handler = async (event, context) => {
         ) {
           try {
             const { media_id } = event.queryStringParameters;
-            const { title, description, media_type, url } = JSON.parse(event.body);
+            const { title, description, media_type, url: rawUrl } = JSON.parse(event.body);
+
+            // Reject non-https URLs / unsafe embed code before storing.
+            const urlCheck = validatePersonaMediaUrl(rawUrl);
+            if (!urlCheck.ok) {
+              response.statusCode = 400;
+              response.body = JSON.stringify({ error: urlCheck.error });
+              break;
+            }
+            const url = urlCheck.value;
 
             const updated = await sqlConnection`
               UPDATE "persona_media"
