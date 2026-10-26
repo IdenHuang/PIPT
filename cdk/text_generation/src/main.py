@@ -436,23 +436,10 @@ def handler(event, context):
     logger.info("🚀 STREAMING FUNCTION STARTED - Text Generation Lambda function is called!")
     initialize_constants()
 
-    # TODO(refactor): Extract auth token extraction and JWT parsing into a helper function
-    # Extract the user's Cognito token from the API Gateway event
-    from helpers.chat import get_cognito_token
-    # Clear any token left over from a previous warm invocation so a request
-    # without one can never publish with another user's token.
-    get_cognito_token.current_token = None
+    # The caller's Cognito token is not kept: AppSync publishes are SigV4-signed
+    # with this Lambda's role (publish_to_appsync in helpers/chat.py), because
+    # publishTextStream is IAM-only.
     headers = event.get('headers') or {}
-    auth_token = headers.get('Authorization') or headers.get('authorization')
-
-    if auth_token:
-        # Extract JWT token from Bearer format if present
-        jwt_token = auth_token[7:] if auth_token.startswith('Bearer ') else auth_token
-        # Store the JWT token for AppSync authentication
-        get_cognito_token.current_token = f"Bearer {jwt_token}"
-        logger.info("Cognito JWT present for AppSync authentication")
-    else:
-        logger.warning("No Authorization header found")
 
     # TODO(refactor): Extract parameter extraction and validation into a helper function
     query_params = event.get("queryStringParameters", {})

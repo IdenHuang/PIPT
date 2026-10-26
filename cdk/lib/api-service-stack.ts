@@ -1235,7 +1235,10 @@ export class ApiServiceStack extends cdk.Stack {
     // Create None data source for local resolvers
     const noneDataSource = this.appSyncApi.addNoneDataSource("NoneDataSource");
 
-    // Mutation resolver for publishing text streams
+    // Mutation resolver for publishing text streams. The passthrough is safe
+    // because schema.graphql makes publishTextStream @aws_iam only: AppSync
+    // rejects Cognito callers before this runs, so only the text-generation
+    // Lambda role (SigV4) can publish.
     noneDataSource.createResolver("PublishTextStreamResolver", {
       typeName: "Mutation",
       fieldName: "publishTextStream",
@@ -1249,6 +1252,129 @@ export class ApiServiceStack extends cdk.Stack {
     "sessionId": $ctx.args.sessionId,
     "data": $ctx.args.data
   })`),
+    });
+
+    /**
+     * Subscription authorization for onTextStream.
+     *
+     * Without a resolver, any user-pool member could subscribe to any chat_id
+     * and read that student's stream (debrief scores, answer-key comparison).
+     * This resolver runs when the client subscribes: it passes the caller's
+     * verified email claim and the requested sessionId to a Lambda that applies
+     * the same rule as the /student REST routes (admin bypass, otherwise
+     * verifySessionOwnership), and rejects the subscription unless it allows.
+     */
+    const textStreamAuthzRole = new iam.Role(
+      this,
+      `${id}-textStreamAuthzRole-${this.region}`,
+      {
+        roleName: `${id}-textStreamAuthzRole-${this.region}`,
+        assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      }
+    );
+
+    // Secrets Manager: only the app_rw credential (SM_DB_CREDENTIALS)
+    textStreamAuthzRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [db.secretPathUser.secretArn],
+      })
+    );
+
+    // VPC network interfaces (required for VPC Lambdas)
+    textStreamAuthzRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "ec2:CreateNetworkInterface",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DeleteNetworkInterface",
+          "ec2:AssignPrivateIpAddresses",
+          "ec2:UnassignPrivateIpAddresses",
+        ],
+        resources: ["*"], // must be *
+      })
+    );
+
+    // Logs
+    textStreamAuthzRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ],
+        resources: ["arn:aws:logs:*:*:*"],
+      })
+    );
+
+    // RDS proxy
+    textStreamAuthzRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ["rds-db:connect"],
+        resources: [
+          `arn:aws:rds-db:${this.region}:${this.account}:dbuser:*/applicationUsername`,
+        ],
+      })
+    );
+
+    const textStreamAuthzFunction = new lambda.Function(
+      this,
+      `${id}-textStreamAuthzFunction`,
+      {
+        runtime: lambda.Runtime.NODEJS_22_X,
+        code: lambda.Code.fromAsset("lambda/lib"),
+        handler: "textStreamAuthzFunction.handler",
+        timeout: Duration.seconds(10),
+        vpc: vpcStack.vpc,
+        securityGroups: [apiLambdaSg],
+        environment: {
+          SM_DB_CREDENTIALS: db.secretPathUser.secretName,
+          RDS_PROXY_ENDPOINT: db.rdsProxyEndpoint,
+        },
+        functionName: `${id}-textStreamAuthzFunction`,
+        memorySize: 256,
+        layers: [postgres],
+        role: textStreamAuthzRole,
+        logGroup: logProtection.lambdaLogGroup(`${id}-textStreamAuthzFunction`),
+      }
+    );
+
+    // addLambdaDataSource creates an AppSync service role scoped to invoking
+    // this one function.
+    const textStreamAuthzDataSource = this.appSyncApi.addLambdaDataSource(
+      "TextStreamAuthzDataSource",
+      textStreamAuthzFunction
+    );
+
+    textStreamAuthzDataSource.createResolver("OnTextStreamAuthzResolver", {
+      typeName: "Subscription",
+      fieldName: "onTextStream",
+      // Only a Cognito user-pool identity carries claims; anything else (or a
+      // token with no email claim) is rejected before the Lambda is invoked.
+      requestMappingTemplate: appsync.MappingTemplate.fromString(`
+  #if($util.isNull($ctx.identity) || $util.isNull($ctx.identity.claims) || $util.isNullOrEmpty($ctx.identity.claims.email))
+    $util.unauthorized()
+  #end
+  {
+    "version": "2018-05-29",
+    "operation": "Invoke",
+    "payload": {
+      "sessionId": $util.toJson($ctx.args.sessionId),
+      "email": $util.toJson($ctx.identity.claims.email)
+    }
+  }`),
+      // Fail closed: a Lambda error, a missing result or anything other than
+      // authorized === true rejects the subscription. Returning null lets the
+      // subscription start; events are then delivered from publishTextStream.
+      responseMappingTemplate: appsync.MappingTemplate.fromString(`
+  #if($ctx.error || $util.isNull($ctx.result) || $ctx.result.authorized != true)
+    $util.unauthorized()
+  #end
+  $util.toJson(null)`),
     });
 
     // Output the API URL and ID
@@ -1668,18 +1794,14 @@ export class ApiServiceStack extends cdk.Stack {
       })
     );
 
-    // Grant access to AppSync for streaming with comprehensive permissions
+    // AppSync: the text-gen Lambda signs publishTextStream with SigV4 (see
+    // publish_to_appsync in text_generation/src/helpers/chat.py). It may call
+    // only that mutation field; it must not be able to subscribe to streams.
     textGenLambdaDockerFunc.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          "appsync:GraphQL",
-          "appsync:GetGraphqlApi",
-          "appsync:ListGraphqlApis",
-        ],
+        actions: ["appsync:GraphQL"],
         resources: [
-          this.appSyncApi.arn,
-          this.appSyncApi.arn + "/*",
           this.appSyncApi.arn + "/types/Mutation/fields/publishTextStream",
         ],
       })

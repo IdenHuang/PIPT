@@ -642,15 +642,36 @@ def generate_streaming_response(
         publish_to_appsync(session_id, {"type": "error", "content": error_msg})
         return error_msg
 
-def get_cognito_token():
-    """Get the current user's Cognito JWT token from the Lambda event context."""
-    token = getattr(get_cognito_token, 'current_token', None)
-    if token:
-        logger.info("✅ Found Cognito JWT token")
-        return token
-    else:
-        logger.error("❌ No Cognito token available in context")
-        return None
+_APPSYNC_TIMEOUT = (2.0, 10.0)  # (connect, read) seconds
+
+
+def _sign_appsync_request(url: str, body: str) -> dict:
+    """Return headers for a SigV4-signed AppSync POST using the Lambda role.
+
+    publishTextStream is @aws_iam only (cdk/lib/schema.graphql), so the
+    backend must sign with its execution role rather than forward a user's
+    Cognito token. Credentials come from the Lambda environment.
+    https://docs.aws.amazon.com/appsync/latest/devguide/security-authz.html#aws-iam-authorization
+    """
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    session = boto3.session.Session()
+    credentials = session.get_credentials()
+    if credentials is None:
+        raise RuntimeError("No AWS credentials available to sign the AppSync request")
+    region = os.environ.get("AWS_REGION") or os.environ.get("REGION") or session.region_name
+    if not region:
+        raise RuntimeError("No AWS region available to sign the AppSync request")
+
+    request = AWSRequest(
+        method="POST",
+        url=url,
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    SigV4Auth(credentials.get_frozen_credentials(), "appsync", region).add_auth(request)
+    return dict(request.headers.items())
 
 # Every streamed chunk is one POST, so per-request connection setup is paid
 # per token. A shared keep-alive session reuses the TCP connection across
@@ -721,21 +742,26 @@ def publish_to_appsync(session_id: str, data: dict):
             }
         }
 
-        token = get_cognito_token()
-        if not token:
-            logger.error("No Cognito token available for AppSync authentication")
-            return
+        # Sign the exact bytes that are sent; SigV4 covers the body hash.
+        body = json.dumps(payload)
+        headers = _sign_appsync_request(appsync_url, body)
 
-        headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'Authorization': token
-        }
-
-        response = requests.post(appsync_url, data=json.dumps(payload), headers=headers)
+        response = requests.post(appsync_url, data=body, headers=headers, timeout=_APPSYNC_TIMEOUT)
 
         if response.status_code != 200:
             logger.error(f"AppSync publish failed: {response.status_code}")
+            return
+
+        # GraphQL reports authorization and resolver failures as 200 + errors.
+        try:
+            errors = response.json().get("errors")
+        except ValueError:
+            errors = None
+        if errors:
+            logger.error(
+                "AppSync publish returned errors: %s",
+                [e.get("errorType") or e.get("message") for e in errors if isinstance(e, dict)],
+            )
 
     except Exception as e:
         logger.error(f"Failed to publish to AppSync: {e}")

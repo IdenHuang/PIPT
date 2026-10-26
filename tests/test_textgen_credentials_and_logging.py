@@ -2,8 +2,8 @@
 Text-generation Lambda (cdk/text_generation/src/main.py):
   - DB secret caching survives the app_rw password rotation done by db_setup
     (TTL, refresh + single retry on authentication failure)
-  - the handler never logs the caller's JWT or the raw event, and never reuses
-    a previous invocation's token
+  - the handler never logs the caller's JWT or the raw event, and does not
+    keep the token (AppSync publishes are SigV4-signed with the Lambda role)
 
 main.py is loaded with its heavy dependencies (LangChain, chat helpers,
 psycopg) replaced by stubs; helpers/authz.py is the real module.
@@ -65,11 +65,7 @@ def main(monkeypatch):
     langchain_aws.BedrockEmbeddings = type("BedrockEmbeddings", (), {})
     monkeypatch.setitem(sys.modules, "langchain_aws", langchain_aws)
 
-    def get_cognito_token():
-        return getattr(get_cognito_token, "current_token", None)
-
     chat = types.ModuleType("helpers.chat")
-    chat.get_cognito_token = get_cognito_token
     chat.get_default_system_prompt = lambda name: f"system prompt for {name}"
     for name in ("get_bedrock_llm", "get_initial_student_query", "get_student_query", "set_stream_callback_url"):
         setattr(chat, name, lambda *a, **kw: None)
@@ -211,14 +207,15 @@ def test_handler_never_logs_the_token_or_raw_event(main, monkeypatch, caplog, he
     for fragment in (JWT[:12], JWT[-12:], "eyJ"):
         assert fragment not in logged
     assert "FULL EVENT" not in logged
-    assert main._chat_stub.get_cognito_token() == f"Bearer {JWT}"
 
 
-def test_handler_clears_token_from_previous_invocation(main, monkeypatch):
-    monkeypatch.setattr(main, "initialize_constants", lambda: None)
-    main._chat_stub.get_cognito_token.current_token = "Bearer someone-elses-token"
-    main.handler(_event({}), None)
-    assert main._chat_stub.get_cognito_token() is None
+def test_handler_does_not_keep_the_callers_token():
+    """AppSync publishes are SigV4-signed with the Lambda role, so the caller's
+    Cognito token must not be stashed for reuse (publishTextStream is IAM-only)."""
+    with open(os.path.join(_SRC, "main.py"), encoding="utf-8") as fh:
+        source = fh.read()
+    assert "get_cognito_token" not in source
+    assert "current_token" not in source
 
 
 def test_handler_tolerates_missing_headers(main, monkeypatch):

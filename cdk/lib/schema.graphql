@@ -1,15 +1,24 @@
-type TextStreamData {
+# Auth model (see the AppSync section of api-service-stack.ts):
+#   - publishTextStream is IAM-only: only the text-generation Lambda role
+#     (SigV4) may publish. End users cannot inject frames.
+#   - onTextStream is Cognito-only and has a resolver that checks the caller
+#     owns the named session (admins bypass) before the subscription starts.
+#   - TextStreamData carries both directives because the IAM publisher and the
+#     Cognito subscriber both read its fields.
+type TextStreamData @aws_iam @aws_cognito_user_pools {
   sessionId: String!
   data: AWSJSON!
 }
 
 type Mutation {
-  publishTextStream(sessionId: String!, data: AWSJSON!): TextStreamData @aws_iam @aws_cognito_user_pools
+  publishTextStream(sessionId: String!, data: AWSJSON!): TextStreamData @aws_iam
 }
 
 type Subscription {
+  # sessionId must stay non-null: AppSync uses it as the delivery filter, and an
+  # omitted argument would match every session.
   onTextStream(sessionId: String!): TextStreamData
-    @aws_subscribe(mutations: ["publishTextStream"]) @aws_iam @aws_cognito_user_pools
+    @aws_subscribe(mutations: ["publishTextStream"]) @aws_cognito_user_pools
 }
 
 type Query {
