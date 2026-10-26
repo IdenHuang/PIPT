@@ -973,7 +973,7 @@ The app will be available at `https://<BRANCH_NAME>.<APP_ID>.amplifyapp.com`.
 
 ### Create the First Admin User
 
-On a fresh deployment there are no admin users. Every account that signs up through the app is automatically assigned the **student** role by the post-confirmation Lambda. The CDK Api stack creates an `admin` Cognito group, but it starts empty — so the person who deployed the infrastructure must promote the first admin manually. There is no admin yet to do this from inside the app, so it has to be done from the AWS console (or CLI).
+On a fresh deployment there are no admin users. Every account that signs up through the app is automatically assigned the **student** role by the post-confirmation Lambda. There is no admin yet to promote anyone from inside the app, so the person who deployed the infrastructure creates the first admin by invoking the one-off `bootstrapAdmin` Lambda that the Api stack deploys.
 
 Once the first admin exists, they can promote existing users to instructors and manage the platform from the app UI — see the [Admin Workflow](./USER_GUIDE.md#admin-workflow) in the User Guide.
 
@@ -981,39 +981,25 @@ Once the first admin exists, they can promote existing users to instructors and 
 
 1. **Sign up through the app.** Open the deployed app URL and create the account you want to become the admin (using an email on one of your `AllowedEmailDomains`). Confirm the email and log in once so the user is fully created in Cognito. This account starts as a **student**.
 
-2. **Open the Cognito user pool.** In the AWS console, go to **Amazon Cognito** > **User pools** and select the pool named `{StackPrefix}-UserPool`.
+2. **Invoke the bootstrap Lambda** with that user's email. The function name is in the `{StackPrefix}-Api-BootstrapAdminFunctionName` CloudFormation output (it's `{StackPrefix}-Api-bootstrapAdmin` by default). The caller needs `lambda:InvokeFunction` on it; the function isn't reachable through API Gateway.
 
-3. **Add the user to the `admin` group.** Open the **Groups** tab, click the **admin** group, choose **Add user to group**, and select the user you just created.
+   ```bash
+   aws lambda invoke \
+     --function-name <YOUR-STACK-PREFIX>-Api-bootstrapAdmin \
+     --cli-binary-format raw-in-base64-out \
+     --payload '{"email":"<USER-EMAIL>"}' \
+     --region <YOUR-REGION> \
+     --profile <YOUR-AWS-PROFILE> \
+     bootstrap-admin-result.json
+   ```
 
-4. **Log out and log back in.** The role is carried in the `cognito:groups` claim of the user's token, which is only refreshed at login. The user **must** sign out of the app and sign back in for the admin role to take effect. Until they re-authenticate they'll still be treated as a student.
+   `bootstrap-admin-result.json` contains `{"ok": true, ...}` on success. It returns `ok: false` with a reason if the user hasn't signed in yet, or if **any admin already exists**; the function only creates the first admin.
 
-<details>
-<summary>Alternative: promote via AWS CLI</summary>
+3. **Reload the app.** Roles are read from the database on every request, so there's no need to log out; the admin views appear on the next page load.
 
-Look up the user pool ID (or grab it from the `{StackPrefix}-Api-UserPoolIdOutput` CloudFormation output), then add the user to the `admin` group:
-
-```bash
-# Find the user pool ID
-aws cognito-idp list-user-pools \
-  --max-results 60 \
-  --region <YOUR-REGION> \
-  --profile <YOUR-AWS-PROFILE> \
-  --query "UserPools[?contains(Name, '<YOUR-STACK-PREFIX>')].{Name:Name,Id:Id}"
-
-# Add the user to the admin group
-aws cognito-idp admin-add-user-to-group \
-  --user-pool-id <USER_POOL_ID> \
-  --username <USER-EMAIL> \
-  --group-name admin \
-  --region <YOUR-REGION> \
-  --profile <YOUR-AWS-PROFILE>
-```
-
-The user still needs to log out and log back in for the change to take effect.
-
-</details>
-
-> **Note: this is the only place the Cognito `admin` group is used.** It exists purely to bootstrap the first admin. When the user logs back in, the app detects the `admin` group claim once and persists `admin` into the database `users.roles` array. From that point on, the **database is the single source of truth** for authorization — all role checks (admin, instructor, student) read from `users.roles`, not from Cognito groups. Subsequent admins and instructors are managed entirely in-app and written to the database; you do not need to touch Cognito groups again. Removing a user from the Cognito `admin` group after bootstrap does **not** revoke their admin access, since the role now lives in the database.
+> **Note:** the **database is the single source of truth** for authorization. All role checks (admin, instructor, student) read `users.roles`; token claims such as `cognito:groups` are never consulted. After bootstrap, manage admins and instructors in-app. Demotions take effect on the user's next request, and every role change (including the bootstrap) is recorded in the `role_audit_log` table with who made it, the target, and the old and new roles.
+>
+> **Upgrading from a version that used the Cognito `admin` group:** that group is removed on deploy and no longer grants access. Users the old flow promoted keep `admin` in `users.roles`, so review who holds it after upgrading and demote anyone who shouldn't.
 
 ### Deploy the Voice Agent
 

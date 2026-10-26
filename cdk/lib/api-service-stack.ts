@@ -757,8 +757,9 @@ export class ApiServiceStack extends cdk.Stack {
       }
     );
 
-    // Grant access to Secret Manager: addStudentOnSignUp reads only the app_tc
-    // credential (SM_DB_CREDENTIALS). preSignupLambda reads no secrets (SSM only).
+    // Grant access to Secret Manager: addStudentOnSignUp and bootstrapAdmin read
+    // only the app_tc credential (SM_DB_CREDENTIALS). preSignupLambda reads no
+    // secrets (SSM only).
     coglambdaRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -866,13 +867,36 @@ export class ApiServiceStack extends cdk.Stack {
       AutoSignupLambda
     );
 
-    // Create 'admin' Cognito group for bootstrap admin access on fresh deployments.
-    // After deploying, run:
-    //   aws cognito-idp admin-add-user-to-group --user-pool-id <pool-id> --username <email> --group-name admin
-    new cognito.CfnUserPoolGroup(this, `${id}-AdminGroup`, {
-      userPoolId: this.userPool.userPoolId,
-      groupName: "admin",
-      description: "Organization administrators — grants admin API access via cognito:groups claim",
+    // One-off bootstrap of the first admin (replaces the former Cognito 'admin'
+    // group, whose cognito:groups claim granted admin outside the DB and could
+    // not be revoked in-app). Not wired to API Gateway: only principals with
+    // lambda:InvokeFunction on it can run it, and it refuses once any admin
+    // exists. Promotions are written to role_audit_log.
+    const bootstrapAdminLambda = new lambda.Function(
+      this,
+      `${id}-bootstrapAdmin`,
+      {
+        runtime: lambda.Runtime.NODEJS_22_X,
+        code: lambda.Code.fromAsset("lambda/lib"),
+        handler: "bootstrapAdmin.handler",
+        timeout: Duration.seconds(15),
+        environment: {
+          SM_DB_CREDENTIALS: db.secretPathTableCreator.secretName,
+          RDS_PROXY_ENDPOINT: db.rdsProxyEndpoint,
+        },
+        vpc: vpcStack.vpc,
+        securityGroups: [apiLambdaSg],
+        functionName: `${id}-bootstrapAdmin`,
+        memorySize: 128,
+        layers: [postgres],
+        role: coglambdaRole,
+        logGroup: logProtection.lambdaLogGroup(`${id}-bootstrapAdmin`),
+      }
+    );
+
+    new cdk.CfnOutput(this, `${id}-BootstrapAdminFunctionName`, {
+      value: bootstrapAdminLambda.functionName,
+      description: "Invoke once with {\"email\": \"...\"} to create the first admin",
     });
 
     // const authorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'apiAuthorizer', {

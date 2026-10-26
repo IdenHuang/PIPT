@@ -38,6 +38,41 @@ function validateThreshold(value, fieldName) {
   return num;
 }
 
+/**
+ * Updates a user's roles and records the change in role_audit_log in one
+ * transaction, so a role change never lands without its audit row. Also
+ * emits a structured ROLE_CHANGE log line for CloudWatch.
+ * @param {object} sql - postgres.js connection
+ * @param {{action: string, actor: {userId: string|null, email: string},
+ *   targetUserId: string|null, targetEmail: string,
+ *   oldRoles: string[], newRoles: string[]}} change
+ * @param {(tx: object) => Promise<void>} [extra] - further writes to run in the same transaction
+ */
+async function applyRoleChange(sql, change, extra) {
+  const { action, actor, targetUserId, targetEmail, oldRoles, newRoles } = change;
+  await sql.begin(async (tx) => {
+    await tx`
+      UPDATE "users"
+      SET roles = ${newRoles}
+      WHERE user_email = ${targetEmail};
+    `;
+    await tx`
+      INSERT INTO "role_audit_log"
+        (action, actor_user_id, actor_email, target_user_id, target_email, old_roles, new_roles)
+      VALUES
+        (${action}, ${actor.userId}, ${actor.email}, ${targetUserId}, ${targetEmail}, ${oldRoles}, ${newRoles});
+    `;
+    if (extra) await extra(tx);
+  });
+  logger.info("ROLE_CHANGE", {
+    action,
+    actorEmail: actor.email,
+    targetEmail,
+    oldRoles,
+    newRoles,
+  });
+}
+
 exports.handler = async (event, context) => {
   logger.init(event, context);
   // Log parameter names only; values can carry access codes and user data.
@@ -60,20 +95,19 @@ exports.handler = async (event, context) => {
   }
 
   // --- Role-based authorization ---
-  // Admin access is granted if the user has 'admin' in EITHER:
-  //   1. The Cognito 'admin' group (cognito:groups claim in the JWT), OR
-  //   2. The database roles array.
-  // This allows fresh deployers to bootstrap admin access via Cognito group
-  // without needing direct DB access.
+  // users.roles in the database is the single source of truth for admin
+  // access. Token claims (e.g. cognito:groups) are never consulted, so a
+  // demotion through lower_admin takes effect on the caller's next request.
+  // The first admin is created with the bootstrapAdmin Lambda (see
+  // docs/DEPLOYMENT_GUIDE.md), not through Cognito groups.
   const adminEmail = event.requestContext.authorizer.email;
-  const cognitoGroups = JSON.parse(event.requestContext.authorizer.cognitoGroups || "[]");
   const roleCheckResult = await sqlConnectionTableCreator`
-    SELECT roles FROM "users" WHERE user_email = ${adminEmail};
+    SELECT user_id, roles FROM "users" WHERE user_email = ${adminEmail};
   `;
   const userRoles = roleCheckResult[0]?.roles || [];
-  const hasAdminAccess = cognitoGroups.includes("admin") || userRoles.includes("admin");
-  if (!hasAdminAccess) {
-    logger.warn("Forbidden: user lacks admin role", { adminEmail, userRoles, cognitoGroups });
+  const actor = { userId: roleCheckResult[0]?.user_id || null, email: adminEmail };
+  if (!userRoles.includes("admin")) {
+    logger.warn("Forbidden: user lacks admin role", { adminEmail, userRoles });
     return {
       statusCode: 403,
       headers: getCorsHeaders(event),
@@ -649,11 +683,14 @@ exports.handler = async (event, context) => {
                   role === "student" ? "instructor" : role
                 );
 
-                await sqlConnectionTableCreator`
-                                UPDATE "users"
-                                SET roles = ${newRoles}
-                                WHERE user_email = ${instructorEmail};
-                            `;
+                await applyRoleChange(sqlConnectionTableCreator, {
+                  action: "elevate_instructor",
+                  actor,
+                  targetUserId: existingUser[0].user_id,
+                  targetEmail: instructorEmail,
+                  oldRoles: userRoles,
+                  newRoles,
+                });
 
                 response.statusCode = 200;
                 response.body = JSON.stringify({
@@ -712,18 +749,21 @@ exports.handler = async (event, context) => {
               .filter((role) => role !== "instructor")
               .concat("student");
 
-            // Update the roles in the database
-            await sqlConnectionTableCreator`
-                    UPDATE "users"
-                    SET roles = ${updatedRoles}
-                    WHERE user_email = ${userEmail};
-                  `;
-
-            // Delete all enrollments where the enrollment type is instructor
-            await sqlConnectionTableCreator`
-                    DELETE FROM "enrollments"
-                    WHERE user_id = ${userId} AND enrollment_type = 'instructor';
-                  `;
+            // Update the roles, record the change, and delete all instructor
+            // enrollments in one transaction.
+            await applyRoleChange(sqlConnectionTableCreator, {
+              action: "lower_instructor",
+              actor,
+              targetUserId: userId,
+              targetEmail: userEmail,
+              oldRoles: userRoles,
+              newRoles: updatedRoles,
+            }, async (tx) => {
+              await tx`
+                DELETE FROM "enrollments"
+                WHERE user_id = ${userId} AND enrollment_type = 'instructor';
+              `;
+            });
 
             response.statusCode = 200;
             response.body = JSON.stringify({
@@ -786,11 +826,14 @@ exports.handler = async (event, context) => {
               role === "instructor" ? "admin" : role
             );
 
-            await sqlConnectionTableCreator`
-              UPDATE "users"
-              SET roles = ${newRoles}
-              WHERE user_email = ${targetEmail};
-            `;
+            await applyRoleChange(sqlConnectionTableCreator, {
+              action: "elevate_admin",
+              actor,
+              targetUserId: existingUser[0].user_id,
+              targetEmail,
+              oldRoles: userRoles,
+              newRoles,
+            });
 
             response.statusCode = 200;
             response.body = JSON.stringify({
@@ -825,7 +868,7 @@ exports.handler = async (event, context) => {
 
           try {
             const userRoleData = await sqlConnectionTableCreator`
-              SELECT roles FROM "users"
+              SELECT user_id, roles FROM "users"
               WHERE user_email = ${targetEmail};
             `;
 
@@ -844,11 +887,14 @@ exports.handler = async (event, context) => {
               role === "admin" ? "instructor" : role
             );
 
-            await sqlConnectionTableCreator`
-              UPDATE "users"
-              SET roles = ${updatedRoles}
-              WHERE user_email = ${targetEmail};
-            `;
+            await applyRoleChange(sqlConnectionTableCreator, {
+              action: "lower_admin",
+              actor,
+              targetUserId: userRoleData[0].user_id,
+              targetEmail,
+              oldRoles: userRoles,
+              newRoles: updatedRoles,
+            });
 
             response.statusCode = 200;
             response.body = JSON.stringify({

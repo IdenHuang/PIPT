@@ -266,6 +266,8 @@ const APPLICATION_TABLE_PRIVILEGES = Object.freeze({
   question_bank: "SELECT, INSERT, UPDATE",
   question_interactions: "SELECT, INSERT",
   recommendations_bank: "SELECT, INSERT, UPDATE",
+  // Written only by adminFunction / bootstrapAdmin (app_tc); app_rw never writes it.
+  role_audit_log: "SELECT",
   rubrics: "SELECT",
   simulation_group_dtps: "SELECT, INSERT, UPDATE, DELETE",
   simulation_group_questions: "SELECT, INSERT, UPDATE, DELETE",

@@ -76,7 +76,7 @@ When no email query parameter is provided, the handler automatically uses the to
 Beyond the API Gateway authorizer (JWT validation), backend handlers perform a secondary role check against the database:
 
 - **Instructor endpoints** verify the authenticated user has `instructor` or `admin` in their DB `roles` array. If not, the request is rejected with **403 Forbidden**.
-- **Admin endpoints** grant access if the user has `admin` in EITHER the Cognito `admin` group (from `cognito:groups` JWT claim) OR the database `roles` array. This allows fresh deployers to bootstrap admin access via the Cognito group without needing direct DB access.
+- **Admin endpoints** verify the authenticated user has `admin` in their DB `roles` array. Token claims (including `cognito:groups`) are never used for authorization. The first admin is created with the `bootstrapAdmin` Lambda (see the Deployment Guide).
 
 ### CORS Origin Restriction
 
@@ -3645,7 +3645,7 @@ curl -X GET "https://api-id.execute-api.us-east-1.amazonaws.com/prod/instructor/
 
 # Admin Endpoints
 
-All admin endpoints require the `adminAuthorizer`. Additionally, the handler verifies admin access by checking if the user has `admin` in either the Cognito `admin` group (`cognito:groups` JWT claim) or the database `roles` array. This dual-source approach allows fresh deployers to bootstrap admin access via the Cognito group without needing direct DB access. If the check fails, the request is rejected with **403 Forbidden**.
+All admin endpoints require the `adminAuthorizer`. Additionally, the handler verifies admin access by checking that the user has `admin` in the database `roles` array (the only source of truth for roles). Role changes made through `elevate_instructor`, `lower_instructor`, `elevate_admin` and `lower_admin` are written to the `role_audit_log` table in the same transaction as the role update. If the check fails, the request is rejected with **403 Forbidden**.
 
 ## Instructor Management
 
