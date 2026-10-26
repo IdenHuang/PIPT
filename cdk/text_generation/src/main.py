@@ -465,13 +465,15 @@ def handler(event, context):
     # chunks to its /stream-callback route instead of going through AppSync.
     # The destination always comes from SSM config; any caller-supplied
     # stream_callback_url query parameter is intentionally ignored.
-    # The socket server also sends a per-request X-Stream-Nonce that must be
-    # echoed on every callback; without a well-formed nonce the socket path is
-    # disabled and events fall back to AppSync.
+    # The socket server also sends a per-request X-Stream-Nonce, echoed on every
+    # callback; the socket server rejects callbacks whose nonce doesn't match
+    # its registration. A malformed nonce is dropped rather than forwarded.
+    # (The frontend only listens on the socket, so there is no useful AppSync
+    # fallback for stream=true requests.)
     wants_socket_stream = query_params.get("stream", "false").lower() == "true"
     stream_nonce = _get_stream_nonce(headers) if wants_socket_stream else None
     set_stream_callback_url(
-        get_stream_callback_url() if stream_nonce else None,
+        get_stream_callback_url() if wants_socket_stream else None,
         stream_nonce,
     )
 

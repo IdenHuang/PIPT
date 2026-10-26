@@ -42,6 +42,7 @@ const cicdStack = new CICDStack(app, `${StackPrefix}-CICD`, {
       name: "socketServer",
       functionName: `${StackPrefix}-EcsSocket-SocketServer`,
       sourceDir: "cdk/socket-server",
+      ecsClusterNamePrefix: `${StackPrefix}-EcsSocket-SocketCluster`,
     },
     {
       name: "voiceAgent",

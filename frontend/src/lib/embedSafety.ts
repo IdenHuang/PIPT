@@ -60,14 +60,68 @@ function isAllowedIframeHost(hostname: string): boolean {
   return ALLOWED_IFRAME_DOMAINS.some((domain) => host === domain || host.endsWith('.' + domain));
 }
 
+const YOUTUBE_VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
+const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be', 'www.youtu.be']);
+
+/** Parse a YouTube `t`/`start` value ("90", "90s", "1m30s") into seconds. */
+function parseYouTubeStart(value: string | null): number | null {
+  if (!value) return null;
+  const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$/.exec(value);
+  if (!m || (!m[1] && !m[2] && !m[3])) return null;
+  const seconds = Number(m[1] ?? 0) * 3600 + Number(m[2] ?? 0) * 60 + Number(m[3] ?? 0);
+  return seconds > 0 ? seconds : null;
+}
+
+/**
+ * Rewrite share/watch page links to their embeddable player URL. YouTube and
+ * Vimeo watch pages send X-Frame-Options: SAMEORIGIN, so framing them shows
+ * "refused to connect"; their /embed and player URLs are meant to be framed.
+ * Anything not recognized is returned unchanged.
+ */
+function toEmbeddableUrl(url: URL): URL {
+  const host = url.hostname.toLowerCase();
+
+  if (YOUTUBE_HOSTS.has(host)) {
+    let id: string | null = null;
+    const segments = url.pathname.split('/').filter(Boolean);
+    if (host.endsWith('youtu.be')) {
+      id = segments[0] ?? null;
+    } else if (segments[0] === 'watch') {
+      id = url.searchParams.get('v');
+    } else if (segments[0] === 'shorts' || segments[0] === 'live') {
+      id = segments[1] ?? null;
+    }
+    if (id && YOUTUBE_VIDEO_ID.test(id)) {
+      const embed = new URL(`https://www.youtube.com/embed/${id}`);
+      const start = parseYouTubeStart(url.searchParams.get('t') ?? url.searchParams.get('start'));
+      if (start) embed.searchParams.set('start', String(start));
+      return embed;
+    }
+    return url;
+  }
+
+  if (host === 'vimeo.com' || host === 'www.vimeo.com') {
+    const m = /^\/(\d+)(?:\/([A-Za-z0-9]+))?\/?$/.exec(url.pathname);
+    if (m) {
+      const embed = new URL(`https://player.vimeo.com/video/${m[1]}`);
+      if (m[2]) embed.searchParams.set('h', m[2]); // unlisted-video hash
+      return embed;
+    }
+  }
+
+  return url;
+}
+
 /**
  * Returns the normalized URL when it is safe to use as an iframe src
- * (https and an allowlisted host), otherwise null.
+ * (https and an allowlisted host), otherwise null. YouTube/Vimeo page links
+ * are rewritten to their embed URL so they can be framed.
  */
 export function toAllowedIframeSrc(value: string | null | undefined): string | null {
   const href = toSafeHttpsUrl(value);
   if (!href) return null;
-  return isAllowedIframeHost(new URL(href).hostname) ? href : null;
+  const url = toEmbeddableUrl(new URL(href));
+  return isAllowedIframeHost(url.hostname) ? url.href : null;
 }
 
 /** Detect whether a value is embed HTML (starts with <iframe) rather than a plain URL. */

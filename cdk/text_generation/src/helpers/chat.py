@@ -39,11 +39,14 @@ def set_stream_callback_url(url: str | None, nonce: str | None = None):
     """Set the callback URL and nonce for streaming events. Called by main.py per request.
 
     Both are reset on every invocation so a warm container never reuses a
-    previous request's destination or nonce.
+    previous request's destination or nonce. The nonce is sent when present;
+    the socket server decides whether a callback without one is accepted, so
+    this Lambda keeps streaming during a rollout where it is deployed ahead of
+    the socket server.
     """
     global _stream_callback_url, _stream_callback_nonce
-    _stream_callback_url = url if url and nonce else None
-    _stream_callback_nonce = nonce if url and nonce else None
+    _stream_callback_url = url or None
+    _stream_callback_nonce = (nonce or None) if _stream_callback_url else None
 
 # Shared token for authenticating POSTs to /stream-callback. Loaded once at
 # cold start so every invocation pays only a dict lookup, not a network call.
@@ -665,7 +668,9 @@ def publish_to_appsync(session_id: str, data: dict):
     # ── Fast path: ECS callback ──────────────────────────────────────────
     if _stream_callback_url:
         try:
-            headers = {"x-stream-nonce": _stream_callback_nonce}
+            headers = {}
+            if _stream_callback_nonce:
+                headers["x-stream-nonce"] = _stream_callback_nonce
             if _stream_callback_token:
                 headers["x-callback-token"] = _stream_callback_token
             requests.post(

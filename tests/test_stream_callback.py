@@ -2,7 +2,8 @@
 Stream callback publishing (cdk/text_generation/src/helpers/chat.py):
   - every /stream-callback POST carries the shared token and the per-request
     X-Stream-Nonce minted by the socket server
-  - without both a URL and a nonce the socket path is disabled
+  - without a URL the socket path is disabled; without a nonce the header is
+    omitted and the socket server decides
 """
 import sys
 import types
@@ -37,9 +38,19 @@ def test_callback_carries_token_and_nonce(posts):
     assert kw["json"] == {"session_id": "session-1", "data": {"type": "chunk", "content": "hi"}}
 
 
-@pytest.mark.parametrize("url,nonce", [(URL, None), (URL, ""), (None, NONCE), (None, None)])
-def test_socket_path_disabled_without_url_and_nonce(posts, url, nonce):
-    chat.set_stream_callback_url(url, nonce)
+@pytest.mark.parametrize("nonce", [None, ""])
+def test_callback_without_nonce_omits_the_header(posts, nonce):
+    # Lets a Lambda deployed ahead of the socket server keep streaming; the
+    # updated socket server rejects these with 403.
+    chat.set_stream_callback_url(URL, nonce)
+    chat.publish_to_appsync("session-1", {"type": "chunk"})
+    assert len(posts) == 1
+    assert posts[0][1]["headers"] == {"x-callback-token": "shared-token"}
+
+
+@pytest.mark.parametrize("nonce", [None, NONCE])
+def test_socket_path_disabled_without_url(posts, nonce):
+    chat.set_stream_callback_url(None, nonce)
     assert chat._stream_callback_url is None
     assert chat._stream_callback_nonce is None
     chat.publish_to_appsync("session-1", {"type": "chunk"})

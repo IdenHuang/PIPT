@@ -153,8 +153,7 @@ paths:
           description: >
             Server-to-server only. Per-request nonce minted by the socket server when stream=true;
             the Lambda echoes it on every /stream-callback POST so the socket server relays only into
-            the session it registered. Without a well-formed value (64 lowercase hex chars) streaming
-            falls back to AppSync.
+            the session it registered. Values that aren't 64 lowercase hex chars are not forwarded.
           schema:
             type: string
         - in: query

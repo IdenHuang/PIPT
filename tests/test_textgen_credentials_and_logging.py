@@ -371,10 +371,12 @@ def test_handler_forwards_well_formed_nonce(main, stream_calls, header):
 
 
 @pytest.mark.parametrize("value", [None, "", "A" * 64, "a" * 63, "a" * 65, "g" * 64, NONCE + "\n", 123])
-def test_handler_disables_socket_path_without_valid_nonce(main, stream_calls, value):
+def test_handler_drops_missing_or_malformed_nonce_but_keeps_socket_path(main, stream_calls, value):
+    # The frontend only listens on the socket, so stream=true must keep posting
+    # there; the socket server is what rejects callbacks without a valid nonce.
     headers = {} if value is None else {"X-Stream-Nonce": value}
     main.handler(_stream_event(headers), None)
-    assert stream_calls == [(None, None)]
+    assert stream_calls == [(CALLBACK_URL, None)]
 
 
 def test_handler_ignores_nonce_when_not_streaming(main, stream_calls):

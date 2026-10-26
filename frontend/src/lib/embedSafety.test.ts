@@ -35,9 +35,36 @@ describe('toAllowedIframeSrc', () => {
   });
 
   it.each([
+    ['https://www.youtube.com/watch?v=dQw4w9WgXcQ', 'https://www.youtube.com/embed/dQw4w9WgXcQ'],
+    ['https://youtube.com/watch?v=dQw4w9WgXcQ&list=PL1&index=2', 'https://www.youtube.com/embed/dQw4w9WgXcQ'],
+    ['https://m.youtube.com/watch?v=dQw4w9WgXcQ', 'https://www.youtube.com/embed/dQw4w9WgXcQ'],
+    ['https://youtu.be/dQw4w9WgXcQ?si=abc', 'https://www.youtube.com/embed/dQw4w9WgXcQ'],
+    ['https://youtu.be/dQw4w9WgXcQ?t=90', 'https://www.youtube.com/embed/dQw4w9WgXcQ?start=90'],
+    ['https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1m30s', 'https://www.youtube.com/embed/dQw4w9WgXcQ?start=90'],
+    ['https://www.youtube.com/shorts/dQw4w9WgXcQ', 'https://www.youtube.com/embed/dQw4w9WgXcQ'],
+    ['https://www.youtube.com/embed/dQw4w9WgXcQ?start=5', 'https://www.youtube.com/embed/dQw4w9WgXcQ?start=5'],
+    ['https://vimeo.com/123456', 'https://player.vimeo.com/video/123456'],
+    ['https://vimeo.com/123456/abcdef12', 'https://player.vimeo.com/video/123456?h=abcdef12'],
+  ])('rewrites %s to its embed URL', (value, expected) => {
+    expect(toAllowedIframeSrc(value)).toBe(expected);
+  });
+
+  it.each([
+    'https://www.youtube.com/watch?v=bad',
+    'https://www.youtube.com/watch?v=dQw4w9WgXcQ"onload=x',
+  ])('leaves unrecognized YouTube links unchanged (%s)', (value) => {
+    expect(toAllowedIframeSrc(value)).toBe(new URL(value).href);
+  });
+
+  it('does not treat youtu.be as a framable host on its own', () => {
+    expect(toAllowedIframeSrc('https://youtu.be/not-a-video-id')).toBeNull();
+  });
+
+  it.each([
     'javascript:alert(1)',
     'data:text/html,<b>x</b>',
     'http://www.youtube.com/embed/abc',
+    'http://youtu.be/dQw4w9WgXcQ',
     'https://attacker.example/',
     'https://youtube.com.attacker.example/',
     'https://notyoutube.com/',
