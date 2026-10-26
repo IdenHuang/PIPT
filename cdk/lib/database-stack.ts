@@ -5,10 +5,10 @@ import { Duration } from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import * as ec2 from "aws-cdk-lib/aws-ec2";
-import * as logs from "aws-cdk-lib/aws-logs";
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 
 import { VpcStack } from './vpc-stack';
+import { resolveLogRetention } from './log-protection';
 
 export class DatabaseStack extends Stack {
     public readonly dbInstance: rds.DatabaseInstance;
@@ -110,7 +110,9 @@ export class DatabaseStack extends Stack {
             deletionProtection: true,
             databaseName: "pipt",
             publiclyAccessible: false,
-            cloudwatchLogsRetention: logs.RetentionDays.INFINITE,
+            // Only takes effect if cloudwatchLogsExports is enabled (it isn't today);
+            // kept finite so enabling exports later can't default to infinite retention.
+            cloudwatchLogsRetention: resolveLogRetention(this),
             storageEncrypted: true, // storage encryption at rest
             monitoringInterval: Duration.seconds(60), // enhanced monitoring interval
             parameterGroup: parameterGroup

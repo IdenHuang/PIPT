@@ -40,7 +40,10 @@ function validateThreshold(value, fieldName) {
 
 exports.handler = async (event, context) => {
   logger.init(event, context);
-  logger.info("Admin handler invoked", { queryStringParameters: event.queryStringParameters });
+  // Log parameter names only; values can carry access codes and user data.
+  logger.info("Admin handler invoked", {
+    queryParamKeys: Object.keys(event.queryStringParameters || {}),
+  });
 
   const response = {
     statusCode: 200,

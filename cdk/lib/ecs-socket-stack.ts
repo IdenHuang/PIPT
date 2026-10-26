@@ -12,6 +12,7 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import { VpcStack } from "./vpc-stack";
 import { DatabaseStack } from "./database-stack";
 import { TurnServerStack } from "./turn-server-stack";
+import { LogProtection } from "./log-protection";
 
 /** SSM parameter name where the socket URL is published for other stacks to read. */
 export const getSocketUrlSsmParam = (stackPrefix: string) => `/${stackPrefix}/socket-url`;
@@ -184,13 +185,16 @@ export class EcsSocketStack extends Stack {
       securityGroups: [nlbSg],
     });
 
+    // Finite retention + CMK for the socket task's log group.
+    const logProtection = new LogProtection(this, "SocketLogProtection");
+
     // 4) Container listening on port 80
-    taskDef.addContainer("SocketContainer", {
+    const socketContainer = taskDef.addContainer("SocketContainer", {
       image: ecs.ContainerImage.fromEcrRepository(socketServerRepo, "latest"),
       portMappings: [{ containerPort: 80 }],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: "Socket",
-        logRetention: logs.RetentionDays.INFINITE,
+        logRetention: logProtection.retention,
       }),
       environment: {
         NODE_ENV: "production",
@@ -218,6 +222,14 @@ export class EcsSocketStack extends Stack {
         TURN_SHARED_SECRET: ecs.Secret.fromSecretsManager(turnServerStack.turnSecret),
       },
     });
+
+    // The awslogs driver creates its log group at <container>/LogGroup. Encrypt
+    // that existing group in place rather than passing a new `logGroup`, which
+    // would orphan the old group (and the data already in it) with infinite
+    // retention.
+    const socketLogGroup = socketContainer.node.findChild("LogGroup") as logs.LogGroup;
+    (socketLogGroup.node.defaultChild as logs.CfnLogGroup).kmsKeyId =
+      logProtection.encryptionKey.keyArn;
 
     const socketServiceSg = new ec2.SecurityGroup(this, "SocketServiceSG", {
       vpc,

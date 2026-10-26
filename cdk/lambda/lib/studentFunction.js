@@ -15,7 +15,10 @@ let sqlConnection = global.sqlConnection;
 
 exports.handler = async (event, context) => {
   logger.init(event, context);
-  logger.info("Student handler invoked", { queryStringParameters: event.queryStringParameters });
+  // Log parameter names only: values include group_access_code (an enrollment credential).
+  logger.info("Student handler invoked", {
+    queryParamKeys: Object.keys(event.queryStringParameters || {}),
+  });
 
   const cognito_id = event.requestContext.authorizer.userId;
   const userEmailAttribute = event.requestContext.authorizer.email || null;

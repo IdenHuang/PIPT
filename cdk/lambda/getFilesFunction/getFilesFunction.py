@@ -316,11 +316,13 @@ def lambda_handler(event, context):
             profile_picture_key = f"{profile_picture_prefix}{profile_picture_files[0]}"
             profile_picture_url = generate_presigned_url(BUCKET, profile_picture_key)
 
+        # Log counts only: the presigned URLs are bearer links (answer keys are
+        # withheld from students below), so they must never reach CloudWatch.
         logger.info("Presigned URLs and metadata generated successfully", extra={
-            "document_files": document_files_urls,
-            "info_files": info_files_urls,
-            "answer_key_files": answer_key_files_urls,
-            "profile_picture": profile_picture_url,
+            "document_count": len(document_files_urls),
+            "info_count": len(info_files_urls),
+            "answer_key_count": len(answer_key_files_urls),
+            "has_profile_picture": profile_picture_url is not None,
         })
 
         # Exclude answer_key_files from student responses

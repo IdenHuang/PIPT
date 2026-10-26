@@ -35,6 +35,7 @@ import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ses from "aws-cdk-lib/aws-ses";
 import * as route53 from "aws-cdk-lib/aws-route53";
+import { LogProtection } from "./log-protection";
 
 export class ApiServiceStack extends cdk.Stack {
   private readonly api: apigateway.SpecRestApi;
@@ -638,6 +639,11 @@ export class ApiServiceStack extends cdk.Stack {
       "Allow API Lambda functions to access RDS Proxy"
     );
 
+    // Finite retention + CMK encryption for every Lambda log group in this stack.
+    // Each function writes to a new encrypted group; its original unencrypted
+    // group gets the same retention (expireLegacyLambdaLogGroups below).
+    const logProtection = new LogProtection(this, `${id}-LogProtection`);
+
     const lambdaStudentFunction = new lambda.Function(
       this,
       `${id}-studentFunction`,
@@ -657,7 +663,7 @@ export class ApiServiceStack extends cdk.Stack {
         memorySize: 256,
         layers: [postgres],
         role: lambdaRole,
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-studentFunction`),
       }
     );
 
@@ -691,7 +697,7 @@ export class ApiServiceStack extends cdk.Stack {
         memorySize: 256,
         layers: [postgres],
         role: lambdaRole,
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-instructorFunction`),
       }
     );
 
@@ -727,7 +733,7 @@ export class ApiServiceStack extends cdk.Stack {
         memorySize: 256,
         layers: [postgres],
         role: adminLambdaRole,
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-adminFunction`),
       }
     );
 
@@ -849,7 +855,7 @@ export class ApiServiceStack extends cdk.Stack {
         memorySize: 128,
         layers: [postgres],
         role: coglambdaRole,
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-addStudentOnSignUp`),
       }
     );
 
@@ -889,7 +895,7 @@ export class ApiServiceStack extends cdk.Stack {
       functionName: `${id}-preSignupLambda`,
       memorySize: 128,
       role: coglambdaRole,
-      logRetention: logs.RetentionDays.INFINITE,
+      logGroup: logProtection.lambdaLogGroup(`${id}-preSignupLambda`),
     });
     this.userPool.addTrigger(
       cognito.UserPoolOperation.PRE_SIGN_UP,
@@ -924,7 +930,7 @@ export class ApiServiceStack extends cdk.Stack {
         memorySize: 128,
         layers: [joseLayer],
         role: lambdaRole,
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-studentLambdaAuthorizer`),
       }
     );
 
@@ -963,7 +969,7 @@ export class ApiServiceStack extends cdk.Stack {
         memorySize: 128,
         layers: [joseLayer],
         role: lambdaRole,
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-instructorLambdaAuthorizer`),
       }
     );
 
@@ -1002,7 +1008,7 @@ export class ApiServiceStack extends cdk.Stack {
         memorySize: 128,
         layers: [joseLayer],
         role: lambdaRole,
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-adminLambdaAuthorizer`),
       }
     );
 
@@ -1037,7 +1043,7 @@ export class ApiServiceStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(300),
       functionName: `${id}-EnsureConversationTable`,
       memorySize: 128,
-      logRetention: logs.RetentionDays.INFINITE,
+      logGroup: logProtection.lambdaLogGroup(`${id}-EnsureConversationTable`),
       environment: {
         TABLE_NAME: dynamoTableName,
       },
@@ -1450,7 +1456,7 @@ export class ApiServiceStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(900),
       functionName: `${id}-EcrImageWaiter`,
       memorySize: 128,
-      logRetention: logs.RetentionDays.INFINITE,
+      logGroup: logProtection.lambdaLogGroup(`${id}-EcrImageWaiter`),
     });
 
     // Grant ECR read permissions
@@ -1541,6 +1547,7 @@ export class ApiServiceStack extends cdk.Stack {
           STREAM_CALLBACK_URL_PARAM: getSocketCallbackUrlSsmParam(stackPrefix),
           ALLOWED_ORIGINS: allowedOriginsEnv,
         },
+        logGroup: logProtection.lambdaLogGroup(`${id}-TextGenLambdaDockerFunction`),
       }
     );
 
@@ -1836,7 +1843,7 @@ export class ApiServiceStack extends cdk.Stack {
         },
         functionName: `${id}-GeneratePreSignedURLFunction`,
         layers: [psycopgLayer, powertoolsLayer, corsLayer],
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-GeneratePreSignedURLFunction`),
       }
     );
 
@@ -1981,10 +1988,12 @@ export class ApiServiceStack extends cdk.Stack {
       })
     );
 
-    // Create Log Group for dataIngestLambdaDockerFunc
+    // Create Log Group for dataIngestLambdaDockerFunc. CloudFormation already
+    // manages this group, so retention and the CMK are applied in place.
     const logGroup = new logs.LogGroup(this, `${id}-DataIngestLambdaLogGroup`, {
       logGroupName: `/aws/lambda/${dataIngestLambdaDockerFunc.functionName}`,
-      retention: logs.RetentionDays.INFINITE,
+      retention: logProtection.retention,
+      encryptionKey: logProtection.encryptionKey,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
@@ -2089,7 +2098,7 @@ export class ApiServiceStack extends cdk.Stack {
         functionName: `${id}-TimeoutHandlerLambda`,
         layers: [psycopgLayer, powertoolsLayer],
         role: lambdaRole,
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-TimeoutHandlerLambda`),
       }
     );
 
@@ -2140,7 +2149,7 @@ export class ApiServiceStack extends cdk.Stack {
         },
         functionName: `${id}-GetFilesFunction`,
         layers: [psycopgLayer, powertoolsLayer, rsaLayer, corsLayer],
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-GetFilesFunction`),
       }
     );
 
@@ -2195,7 +2204,7 @@ export class ApiServiceStack extends cdk.Stack {
         },
         functionName: `${id}-GetFilesFunctionStudent`,
         layers: [psycopgLayer, powertoolsLayer, rsaLayer, corsLayer],
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-GetFilesFunctionStudent`),
       }
     );
 
@@ -2250,7 +2259,7 @@ export class ApiServiceStack extends cdk.Stack {
         },
         functionName: `${id}-GetProfilePictures`,
         layers: [psycopgLayer, powertoolsLayer, rsaLayer, corsLayer],
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-GetProfilePictures`),
       }
     );
 
@@ -2302,7 +2311,7 @@ export class ApiServiceStack extends cdk.Stack {
         },
         functionName: `${id}-GetProfilePicturesStudent`,
         layers: [psycopgLayer, powertoolsLayer, rsaLayer, corsLayer],
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-GetProfilePicturesStudent`),
       }
     );
 
@@ -2348,7 +2357,7 @@ export class ApiServiceStack extends cdk.Stack {
       },
       functionName: `${id}-DeleteFileFunction`,
       layers: [psycopgLayer, powertoolsLayer, corsLayer],
-      logRetention: logs.RetentionDays.INFINITE,
+      logGroup: logProtection.lambdaLogGroup(`${id}-DeleteFileFunction`),
     });
 
     // Override the Logical ID of the Lambda Function to get ARN in OpenAPI
@@ -2398,7 +2407,7 @@ export class ApiServiceStack extends cdk.Stack {
         },
         functionName: `${id}-DeletePatientFunction`,
         layers: [psycopgLayer, powertoolsLayer, corsLayer],
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-DeletePatientFunction`),
       }
     );
 
@@ -2461,7 +2470,7 @@ export class ApiServiceStack extends cdk.Stack {
         },
         functionName: `${id}-DeleteLastMessage`,
         layers: [psycopgLayer, powertoolsLayer, corsLayer],
-        logRetention: logs.RetentionDays.INFINITE,
+        logGroup: logProtection.lambdaLogGroup(`${id}-DeleteLastMessage`),
       }
     );
 
@@ -2469,6 +2478,32 @@ export class ApiServiceStack extends cdk.Stack {
     const cfnDeleteLastMessage = deleteLastMessage.node
       .defaultChild as lambda.CfnFunction;
     cfnDeleteLastMessage.overrideLogicalId("DeleteLastMessage");
+
+    // Bound retention on the original unencrypted /aws/lambda/<fn> groups that
+    // hold logs written before the switch to encrypted groups. (DataIngest is
+    // excluded: its log group is managed above and encrypted in place.)
+    logProtection.expireLegacyLambdaLogGroups([
+      lambdaStudentFunction,
+      lambdaInstructorFunction,
+      lambdaAdminFunction,
+      AutoSignupLambda,
+      preSignupLambda,
+      authorizationFunction_student,
+      authorizationFunction_instructor,
+      authorizationFunction,
+      ensureTableFunction,
+      imageWaiterFunction,
+      textGenLambdaDockerFunc,
+      generatePreSignedURL,
+      timeoutHandlerLambda,
+      getFilesFunction,
+      getFilesFunctionStudent,
+      getProfilePictures,
+      getProfilePicturesStudent,
+      deleteFile,
+      deletePatientFunction,
+      deleteLastMessage,
+    ]);
 
     // Grant access to Secret Manager: app_rw credential only
     deleteLastMessage.addToRolePolicy(
