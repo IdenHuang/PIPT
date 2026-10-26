@@ -758,8 +758,8 @@ export class ApiServiceStack extends cdk.Stack {
     );
 
     // Grant access to Secret Manager: addStudentOnSignUp and bootstrapAdmin read
-    // only the app_tc credential (SM_DB_CREDENTIALS). preSignupLambda reads no
-    // secrets (SSM only).
+    // only the app_tc credential (SM_DB_CREDENTIALS). preSignupLambda uses its
+    // own role (preSignupRole) below.
     coglambdaRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -808,32 +808,53 @@ export class ApiServiceStack extends cdk.Stack {
       })
     );
 
-    // Grant permission to add users to an IAM group
-    coglambdaRole.addToPolicy(
+    // Dedicated role for the PRE_SIGN_UP trigger (f-1e7a0ac4). It runs for
+    // unauthenticated callers and only reads the allowed-email-domains SSM
+    // parameter, so it gets no DB secret, no RDS access and no IAM actions.
+    const allowedEmailDomainsParamName = `/${stackPrefix}/AllowedEmailDomains`;
+    const preSignupRole = new iam.Role(
+      this,
+      `${id}-preSignupRole-${this.region}`,
+      {
+        roleName: `${id}-preSignupRole-${this.region}`,
+        assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      }
+    );
+
+    // VPC-attached function: ENI management (must be *)
+    preSignupRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: ["iam:AddUserToGroup"],
-        resources: [
-          `arn:aws:iam::${this.account}:user/*`,
-          `arn:aws:iam::${this.account}:group/*`,
+        actions: [
+          "ec2:CreateNetworkInterface",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DeleteNetworkInterface",
+          "ec2:AssignPrivateIpAddresses",
+          "ec2:UnassignPrivateIpAddresses",
         ],
+        resources: ["*"], // must be *
       })
     );
 
-    coglambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ["ssm:GetParameter"],
-        resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter/*`],
-      })
-    );
-
-    // Grant access to RDS proxy
-    coglambdaRole.addToPolicy(
+    preSignupRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: ["rds-db:connect"],
+        actions: [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+        ],
+        resources: ["arn:aws:logs:*:*:*"],
+      })
+    );
+
+    // Only the single parameter preSignup.js reads (ALLOWED_EMAIL_DOMAINS)
+    preSignupRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ["ssm:GetParameter"],
         resources: [
-          `arn:aws:rds-db:${this.region}:${this.account}:dbuser:*/applicationUsername`,
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${allowedEmailDomainsParamName}`,
         ],
       })
     );
@@ -913,12 +934,12 @@ export class ApiServiceStack extends cdk.Stack {
       handler: "preSignup.handler",
       timeout: Duration.seconds(15),
       environment: {
-        ALLOWED_EMAIL_DOMAINS: `/${stackPrefix}/AllowedEmailDomains`,
+        ALLOWED_EMAIL_DOMAINS: allowedEmailDomainsParamName,
       },
       vpc: vpcStack.vpc,
       functionName: `${id}-preSignupLambda`,
       memorySize: 128,
-      role: coglambdaRole,
+      role: preSignupRole,
       logGroup: logProtection.lambdaLogGroup(`${id}-preSignupLambda`),
     });
     this.userPool.addTrigger(
