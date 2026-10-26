@@ -7,6 +7,7 @@ const WebSocket = require("ws");
 const { verifyToken } = require("./auth");
 const { verifySessionScope } = require("./session-auth");
 const { authorizeSessionRequest } = require("./session-guard");
+const { resolveRelayToken } = require("./relay-token");
 const { StreamRelayRegistry, safeEqual } = require("./stream-relay");
 const logger = require("./logger");
 const { SignatureV4 } = require("@smithy/signature-v4");
@@ -751,6 +752,28 @@ io.on("connection", (socket) => {
       return;
     }
 
+    // The upstream call must run as the user this socket authenticated as.
+    // data.token is verified and bound to the handshake identity before use.
+    const relayToken = await resolveRelayToken(
+      data && data.token,
+      { userId: socket.userId, userEmail: socket.userEmail },
+      verifyToken,
+    );
+    if (!relayToken.ok) {
+      logger.warn("Relay token rejected for text-generation", {
+        component: "server",
+        operation: "text-generation",
+        userEmail: socket.userEmail,
+        sessionId,
+      });
+      socket.emit("text-stream", {
+        type: "error",
+        content: relayToken.error,
+      });
+      textGenInFlight = false;
+      return;
+    }
+
     // Register this socket so /stream-callback can find it. With stream=true the
     // Lambda POSTs chunks back to this server's internal NLB URL, which it reads
     // from SSM — the callback destination is never sent in the request.
@@ -769,7 +792,7 @@ io.on("connection", (socket) => {
         {
           method: "POST",
           headers: {
-            Authorization: data.token,
+            Authorization: relayToken.token,
             "Content-Type": "application/json",
             "X-Stream-Nonce": streamNonce,
           },

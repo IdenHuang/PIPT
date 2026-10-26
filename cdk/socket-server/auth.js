@@ -17,6 +17,21 @@ function getKey(header, callback) {
   });
 }
 
+/**
+ * Same ID-token claim checks as the API Gateway authorizer: the socket server
+ * keys session authorization on the token's email, so it must be a Cognito ID
+ * token carrying a verified email.
+ * @param {object} decoded
+ * @returns {string|null} error message, or null when the claims are acceptable
+ */
+function idTokenClaimError(decoded) {
+  if (!decoded || decoded.token_use !== 'id') return 'token_use must be id';
+  if (decoded.email_verified !== true && decoded.email_verified !== 'true') return 'email not verified';
+  if (typeof decoded.email !== 'string' || !decoded.email) return 'email claim missing';
+  if (typeof decoded.sub !== 'string' || !decoded.sub) return 'sub claim missing';
+  return null;
+}
+
 function verifyToken(token) {
   return new Promise((resolve, reject) => {
     jwt.verify(token, getKey, {
@@ -24,9 +39,11 @@ function verifyToken(token) {
       issuer: `https://cognito-idp.${process.env.AWS_REGION}.amazonaws.com/${process.env.COGNITO_USER_POOL_ID}`,
       algorithms: ['RS256']
     }, (err, decoded) => {
-      if (err) {
-        logger.error("Token verification failed", { component: "auth", operation: "verifyToken", error: err.message });
-        reject(err);
+      const claimError = err ? null : idTokenClaimError(decoded);
+      if (err || claimError) {
+        const message = err ? err.message : claimError;
+        logger.error("Token verification failed", { component: "auth", operation: "verifyToken", error: message });
+        reject(err || new Error(claimError));
       } else {
         logger.info("Token verified successfully", { component: "auth", operation: "verifyToken", userId: decoded.sub });
         resolve(decoded);
@@ -35,4 +52,4 @@ function verifyToken(token) {
   });
 }
 
-module.exports = { verifyToken };
+module.exports = { verifyToken, idTokenClaimError };
