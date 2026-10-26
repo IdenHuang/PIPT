@@ -341,3 +341,51 @@ def test_cors_empty_config_matches_shared_python_cors_layer(monkeypatch, request
     spec.loader.exec_module(cors_helper)
     for origin in [PRIMARY_ORIGIN, "https://evil.example.com", ""]:
         assert main._get_cors_origin(_origin_event(origin)) == cors_helper._resolve_origin(origin) == "", origin
+
+
+# ── Stream callback nonce ───────────────────────────────────────────────────
+# The socket server relays /stream-callback POSTs only when they echo the
+# per-request X-Stream-Nonce it minted, so the Lambda must forward it and must
+# disable the socket path when it is missing or malformed.
+NONCE = "a" * 64
+CALLBACK_URL = "http://internal-nlb.example"
+
+
+@pytest.fixture
+def stream_calls(main, monkeypatch):
+    monkeypatch.setattr(main, "initialize_constants", lambda: None)
+    monkeypatch.setattr(main, "get_stream_callback_url", lambda: CALLBACK_URL)
+    calls = []
+    monkeypatch.setattr(main, "set_stream_callback_url", lambda url, nonce=None: calls.append((url, nonce)))
+    return calls
+
+
+def _stream_event(headers, stream="true"):
+    return {"headers": headers, "queryStringParameters": {"stream": stream}, "requestContext": {"authorizer": {}}}
+
+
+@pytest.mark.parametrize("header", ["X-Stream-Nonce", "x-stream-nonce"])
+def test_handler_forwards_well_formed_nonce(main, stream_calls, header):
+    main.handler(_stream_event({header: NONCE}), None)
+    assert stream_calls == [(CALLBACK_URL, NONCE)]
+
+
+@pytest.mark.parametrize("value", [None, "", "A" * 64, "a" * 63, "a" * 65, "g" * 64, NONCE + "\n", 123])
+def test_handler_drops_missing_or_malformed_nonce_but_keeps_socket_path(main, stream_calls, value):
+    # The frontend only listens on the socket, so stream=true must keep posting
+    # there; the socket server is what rejects callbacks without a valid nonce.
+    headers = {} if value is None else {"X-Stream-Nonce": value}
+    main.handler(_stream_event(headers), None)
+    assert stream_calls == [(CALLBACK_URL, None)]
+
+
+def test_handler_ignores_nonce_when_not_streaming(main, stream_calls):
+    main.handler(_stream_event({"X-Stream-Nonce": NONCE}, stream="false"), None)
+    assert stream_calls == [(None, None)]
+
+
+def test_handler_ignores_caller_supplied_callback_url(main, stream_calls):
+    event = _stream_event({"X-Stream-Nonce": NONCE})
+    event["queryStringParameters"]["stream_callback_url"] = "https://attacker.example"
+    main.handler(event, None)
+    assert stream_calls == [(CALLBACK_URL, NONCE)]

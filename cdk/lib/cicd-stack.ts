@@ -10,6 +10,11 @@ interface LambdaConfig {
   name: string;           // Module name (e.g., "textGeneration")
   functionName: string;   // Lambda function name (or ECS service identifier)
   sourceDir: string;      // Source directory for Docker build (relative to repo root)
+  // For ECS-hosted modules: SSM parameters (written by the owning ECS stack)
+  // holding the exact cluster and service names that run this repo's :latest
+  // image. After a successful push the build forces a new deployment of that
+  // one service so the running tasks pick up the image.
+  ecsServiceSsmParams?: { cluster: string; service: string };
 }
 
 interface CICDStackProps extends cdk.StackProps {
@@ -24,6 +29,8 @@ export class CICDStack extends cdk.Stack {
   public readonly ecrRepositories: { [key: string]: ecr.Repository } = {};
   public readonly buildProjects: { [key: string]: codebuild.IProject } = {};
   public readonly connectionArn: string;
+  /** Role shared by the CodeBuild projects; ECS stacks grant it redeploy rights. */
+  public readonly buildRole: iam.IRole;
 
   constructor(scope: Construct, id: string, props: CICDStackProps) {
     super(scope, id, props);
@@ -57,6 +64,11 @@ export class CICDStack extends cdk.Stack {
         ],
       })
     );
+
+    // ECS redeploy permissions are not granted here. The stack that owns each
+    // ECS service grants this role UpdateService on that exact service ARN
+    // (see EcsSocketStack), so the build can only redeploy that one service.
+    this.buildRole = codeBuildRole;
 
     // Create artifacts for pipeline
     const sourceOutput = new codepipeline.Artifact();
@@ -187,6 +199,8 @@ export class CICDStack extends cdk.Stack {
             ENVIRONMENT: { value: envName },
             MODULE_NAME: { value: lambdaConfig.name },
             LAMBDA_FUNCTION_NAME: { value: lambdaConfig.functionName },
+            ECS_CLUSTER_PARAM: { value: lambdaConfig.ecsServiceSsmParams?.cluster ?? "" },
+            ECS_SERVICE_PARAM: { value: lambdaConfig.ecsServiceSsmParams?.service ?? "" },
             REPO_NAME: { value: repoName },
             REPOSITORY_URI: { value: ecrRepo.repositoryUri },
             GITHUB_USERNAME: { value: username },
@@ -272,6 +286,25 @@ export class CICDStack extends cdk.Stack {
                     else
                       echo "Lambda function $LAMBDA_FUNCTION_NAME does not exist yet. Skipping update."
                     fi
+                  '`,
+                  // ECS services pull :latest only when a task starts, so a
+                  // pushed image is not live until the service is redeployed.
+                  `bash -c '
+                    set -euo pipefail
+                    if [ -z "$ECS_CLUSTER_PARAM" ] || [ -z "$ECS_SERVICE_PARAM" ]; then
+                      exit 0
+                    fi
+                    # Exact names come from SSM, written by the ECS stack that
+                    # also grants this role UpdateService on that one service.
+                    if ! CLUSTER=$(aws ssm get-parameter --name "$ECS_CLUSTER_PARAM" --query Parameter.Value --output text 2>/dev/null) \\
+                      || ! SERVICE=$(aws ssm get-parameter --name "$ECS_SERVICE_PARAM" --query Parameter.Value --output text 2>/dev/null); then
+                      echo "ECS service parameters not found (ECS stack not deployed yet?). Skipping redeploy."
+                      exit 0
+                    fi
+                    echo "Forcing new deployment of $SERVICE in $CLUSTER..."
+                    aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment --query "service.serviceName" --output text
+                    echo "Waiting for $SERVICE to stabilize..."
+                    aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
                   '`,
                 ],
               },

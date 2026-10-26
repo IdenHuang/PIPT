@@ -7,6 +7,7 @@ const WebSocket = require("ws");
 const { verifyToken } = require("./auth");
 const { verifySessionScope } = require("./session-auth");
 const { authorizeSessionRequest } = require("./session-guard");
+const { StreamRelayRegistry, safeEqual } = require("./stream-relay");
 const logger = require("./logger");
 const { SignatureV4 } = require("@smithy/signature-v4");
 const { HttpRequest } = require("@smithy/protocol-http");
@@ -139,8 +140,15 @@ app.get("/health", (req, res) => {
 
 // ─── Text Stream Callback ─────────────────────────────────────────────────────
 // The text generation Lambda POSTs streaming chunks here instead of AppSync.
-// Maps sessionId → Socket.IO socket so we can relay chunks to the right client.
-const textStreamSockets = new Map(); // sessionId -> socket
+// Maps sessionId → { socket, nonce }. A callback is relayed only when it carries
+// the per-request nonce minted at registration (see stream-relay.js).
+const textStreamSockets = new StreamRelayRegistry();
+// Upper bound for relaying after API Gateway gives up: the text-gen Lambda's
+// timeout (300s) plus slack.
+const TEXT_STREAM_MAX_MS = 310 * 1000;
+// Grace period after an "end" frame for the trailing "session_complete"
+// (the Lambda saves the message and joins matching threads in between).
+const TEXT_STREAM_TRAILING_MS = 15 * 1000;
 
 // Load the shared callback secret once at startup so header checks are free.
 let streamCallbackToken = null;
@@ -178,20 +186,42 @@ app.post("/stream-callback", (req, res) => {
   if (!streamCallbackToken) {
     return res.status(503).json({ error: "Stream callback authentication not configured" });
   }
-  if (req.headers["x-callback-token"] !== streamCallbackToken) {
+  if (!safeEqual(req.headers["x-callback-token"], streamCallbackToken)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { session_id, data } = req.body;
-  if (!session_id || !data) {
+  const { session_id, data } = req.body || {};
+  if (typeof session_id !== "string" || !session_id || !data || typeof data !== "object") {
     return res.status(400).json({ error: "session_id and data required" });
   }
 
-  const socket = textStreamSockets.get(session_id);
-  if (socket && socket.connected) {
+  // Entitlement: the caller must echo the nonce this server minted for the
+  // in-flight request on this session. The shared token alone is not enough.
+  const socket = textStreamSockets.resolve(session_id, req.headers["x-stream-nonce"]);
+  if (!socket) {
+    logger.warn("Rejected stream callback without a matching session nonce", {
+      component: "server",
+      operation: "stream-callback",
+      sessionId: session_id,
+    });
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (socket.connected) {
     socket.emit("text-stream", data);
   } else {
-    console.warn(`⚠️ No socket found for session ${session_id}`);
+    console.warn(`⚠️ Socket for session ${session_id} is disconnected`);
+  }
+
+  // After a 504 the request handler has already returned, so terminal frames
+  // drive the release: hold briefly after "end"/"error" for a trailing
+  // "session_complete". No-op for non-deferred registrations.
+  if (data.type === "end" || data.type === "error" || data.type === "session_complete") {
+    textStreamSockets.settle(
+      session_id,
+      req.headers["x-stream-nonce"],
+      data.type === "session_complete" ? 0 : TEXT_STREAM_TRAILING_MS,
+    );
   }
 
   res.status(200).json({ ok: true });
@@ -724,7 +754,14 @@ io.on("connection", (socket) => {
     // Register this socket so /stream-callback can find it. With stream=true the
     // Lambda POSTs chunks back to this server's internal NLB URL, which it reads
     // from SSM — the callback destination is never sent in the request.
-    textStreamSockets.set(sessionId, socket);
+    // The nonce is sent server-to-server only and must be echoed on every
+    // callback; it never reaches the browser.
+    // textGenInFlight is cleared when the registration is released, which may
+    // be after this handler returns (see the 504 case below).
+    const streamNonce = textStreamSockets.register(sessionId, socket, () => {
+      textGenInFlight = false;
+    });
+    let deferRelease = false;
 
     try {
       const response = await fetch(
@@ -734,6 +771,7 @@ io.on("connection", (socket) => {
           headers: {
             Authorization: data.token,
             "Content-Type": "application/json",
+            "X-Stream-Nonce": streamNonce,
           },
           body: JSON.stringify({ message_content: data.message }),
         },
@@ -757,6 +795,20 @@ io.on("connection", (socket) => {
           return; // Don't throw — we've handled this error specifically
         }
 
+        if (response.status === 504) {
+          // API Gateway caps the integration at 29s, but the Lambda keeps
+          // running and keeps POSTing chunks. Keep the registration until its
+          // "end"/"error" callback arrives (or the Lambda's max runtime).
+          logger.warn("Text generation exceeded the API Gateway timeout; still relaying callbacks", {
+            component: "server",
+            operation: "text-generation",
+            sessionId,
+          });
+          deferRelease = true;
+          textStreamSockets.defer(sessionId, streamNonce, TEXT_STREAM_MAX_MS);
+          return;
+        }
+
         throw new Error(`HTTP ${response.status}`);
       }
 
@@ -770,8 +822,7 @@ io.on("connection", (socket) => {
         content: error.message || "Failed to generate response",
       });
     } finally {
-      textStreamSockets.delete(sessionId);
-      textGenInFlight = false;
+      if (!deferRelease) textStreamSockets.release(sessionId, streamNonce);
     }
   });
 

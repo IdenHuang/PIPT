@@ -31,11 +31,22 @@ _LOW_TIER_OFFSET = 0.25
 # socket server URL. Never set this from request input: the POST carries
 # the x-callback-token secret.
 _stream_callback_url: str | None = None
+# Per-request nonce minted by the socket server (X-Stream-Nonce). Echoed on
+# every callback so the server relays only into the session it registered.
+_stream_callback_nonce: str | None = None
 
-def set_stream_callback_url(url: str | None):
-    """Set the callback URL for streaming events. Called by main.py per request."""
-    global _stream_callback_url
-    _stream_callback_url = url
+def set_stream_callback_url(url: str | None, nonce: str | None = None):
+    """Set the callback URL and nonce for streaming events. Called by main.py per request.
+
+    Both are reset on every invocation so a warm container never reuses a
+    previous request's destination or nonce. The nonce is sent when present;
+    the socket server decides whether a callback without one is accepted, so
+    this Lambda keeps streaming during a rollout where it is deployed ahead of
+    the socket server.
+    """
+    global _stream_callback_url, _stream_callback_nonce
+    _stream_callback_url = url or None
+    _stream_callback_nonce = (nonce or None) if _stream_callback_url else None
 
 # Shared token for authenticating POSTs to /stream-callback. Loaded once at
 # cold start so every invocation pays only a dict lookup, not a network call.
@@ -641,12 +652,27 @@ def get_cognito_token():
         logger.error("❌ No Cognito token available in context")
         return None
 
+# Every streamed chunk is one POST, so per-request connection setup is paid
+# per token. A shared keep-alive session reuses the TCP connection across
+# chunks and warm invocations. The short connect timeout bounds the stall if
+# a connection attempt hangs (urllib3 then tries the next resolved address).
+_CALLBACK_TIMEOUT = (1.0, 5.0)  # (connect, read) seconds
+_callback_session = None
+
+def _get_callback_session():
+    global _callback_session
+    if _callback_session is None:
+        import requests
+        _callback_session = requests.Session()
+    return _callback_session
+
 def publish_to_appsync(session_id: str, data: dict):
     """Publish a streaming event to the frontend.
 
     When a stream callback URL is configured (ECS Socket.IO server, from SSM),
     POST the event there — a fast, VPC-internal call authenticated with the
-    shared x-callback-token header.
+    shared x-callback-token header plus the per-request x-stream-nonce the
+    socket server minted for this session.
     Otherwise fall back to the legacy AppSync GraphQL mutation path.
     """
     import requests
@@ -656,12 +682,16 @@ def publish_to_appsync(session_id: str, data: dict):
     # ── Fast path: ECS callback ──────────────────────────────────────────
     if _stream_callback_url:
         try:
-            headers = {"x-callback-token": _stream_callback_token} if _stream_callback_token else {}
-            requests.post(
+            headers = {}
+            if _stream_callback_nonce:
+                headers["x-stream-nonce"] = _stream_callback_nonce
+            if _stream_callback_token:
+                headers["x-callback-token"] = _stream_callback_token
+            _get_callback_session().post(
                 f"{_stream_callback_url}/stream-callback",
                 json={"session_id": session_id, "data": data},
                 headers=headers,
-                timeout=5,
+                timeout=_CALLBACK_TIMEOUT,
             )
         except Exception as e:
             logger.error(f"Failed to POST stream event to callback URL: {e}")

@@ -12,6 +12,7 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import { VpcStack } from "./vpc-stack";
 import { DatabaseStack } from "./database-stack";
 import { TurnServerStack } from "./turn-server-stack";
+import { LogProtection } from "./log-protection";
 
 /** SSM parameter name where the socket URL is published for other stacks to read. */
 export const getSocketUrlSsmParam = (stackPrefix: string) => `/${stackPrefix}/socket-url`;
@@ -24,6 +25,16 @@ export const getSocketUrlSsmParam = (stackPrefix: string) => `/${stackPrefix}/so
  */
 export const getSocketCallbackUrlSsmParam = (stackPrefix: string) =>
   `/${stackPrefix}/socket-callback-url`;
+
+/**
+ * SSM parameter names holding the exact socket ECS cluster and service names.
+ * The CI/CD build reads them to redeploy that one service after pushing a new
+ * image; its UpdateService permission is scoped to the same service ARN.
+ */
+export const getSocketEcsClusterSsmParam = (stackPrefix: string) =>
+  `/${stackPrefix}/socket-ecs-cluster`;
+export const getSocketEcsServiceSsmParam = (stackPrefix: string) =>
+  `/${stackPrefix}/socket-ecs-service`;
 
 export class EcsSocketStack extends Stack {
   public readonly socketUrl: string;
@@ -40,7 +51,9 @@ export class EcsSocketStack extends Stack {
     stackPrefix: string,
     dynamoTableName: string,
     cloudFrontWafArn: string,
-    props?: StackProps
+    props?: StackProps,
+    // CI/CD build role allowed to force a redeploy of the socket service.
+    deployRole?: iam.IRole
   ) {
     super(scope, id, props);
 
@@ -182,15 +195,23 @@ export class EcsSocketStack extends Stack {
       internetFacing: false,
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       securityGroups: [nlbSg],
+      // The service runs a single task, so most AZs have no local target.
+      // Without cross-zone, connections that DNS sends to those AZs' NLB
+      // nodes hang until the client's connect timeout (~5s per streamed
+      // chunk from the text-gen Lambda).
+      crossZoneEnabled: true,
     });
 
+    // Finite retention + CMK for the socket task's log group.
+    const logProtection = new LogProtection(this, "SocketLogProtection");
+
     // 4) Container listening on port 80
-    taskDef.addContainer("SocketContainer", {
+    const socketContainer = taskDef.addContainer("SocketContainer", {
       image: ecs.ContainerImage.fromEcrRepository(socketServerRepo, "latest"),
       portMappings: [{ containerPort: 80 }],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: "Socket",
-        logRetention: logs.RetentionDays.INFINITE,
+        logRetention: logProtection.retention,
       }),
       environment: {
         NODE_ENV: "production",
@@ -219,6 +240,14 @@ export class EcsSocketStack extends Stack {
       },
     });
 
+    // The awslogs driver creates its log group at <container>/LogGroup. Encrypt
+    // that existing group in place rather than passing a new `logGroup`, which
+    // would orphan the old group (and the data already in it) with infinite
+    // retention.
+    const socketLogGroup = socketContainer.node.findChild("LogGroup") as logs.LogGroup;
+    (socketLogGroup.node.defaultChild as logs.CfnLogGroup).kmsKeyId =
+      logProtection.encryptionKey.keyArn;
+
     const socketServiceSg = new ec2.SecurityGroup(this, "SocketServiceSG", {
       vpc,
       description: "Security group for ECS socket service",
@@ -243,6 +272,34 @@ export class EcsSocketStack extends Stack {
       securityGroups: [socketServiceSg],
       circuitBreaker: { enable: true, rollback: true },
     });
+
+    // 5.0) Let the CI/CD build redeploy exactly this service after it pushes
+    // a new :latest image (ECS only pulls the image when a task starts).
+    const ecsClusterParam = new ssm.StringParameter(this, "SocketEcsClusterParam", {
+      parameterName: getSocketEcsClusterSsmParam(stackPrefix),
+      stringValue: cluster.clusterName,
+      description: "Socket server ECS cluster name, for CI/CD redeploys",
+    });
+    const ecsServiceParam = new ssm.StringParameter(this, "SocketEcsServiceParam", {
+      parameterName: getSocketEcsServiceSsmParam(stackPrefix),
+      stringValue: service.serviceName,
+      description: "Socket server ECS service name, for CI/CD redeploys",
+    });
+    if (deployRole) {
+      new iam.Policy(this, "SocketRedeployPolicy", {
+        roles: [deployRole],
+        statements: [
+          new iam.PolicyStatement({
+            actions: ["ecs:UpdateService", "ecs:DescribeServices"],
+            resources: [service.serviceArn],
+          }),
+          new iam.PolicyStatement({
+            actions: ["ssm:GetParameter"],
+            resources: [ecsClusterParam.parameterArn, ecsServiceParam.parameterArn],
+          }),
+        ],
+      });
+    }
 
     // 5.1) Allow the internal NLB to reach the service on port 80 (VPC traffic only)
     service.connections.allowFrom(

@@ -15,7 +15,10 @@ let sqlConnection = global.sqlConnection;
 
 exports.handler = async (event, context) => {
   logger.init(event, context);
-  logger.info("Student handler invoked", { queryStringParameters: event.queryStringParameters });
+  // Log parameter names only: values include group_access_code (an enrollment credential).
+  logger.info("Student handler invoked", {
+    queryParamKeys: Object.keys(event.queryStringParameters || {}),
+  });
 
   const cognito_id = event.requestContext.authorizer.userId;
   const userEmailAttribute = event.requestContext.authorizer.email || null;
@@ -2065,33 +2068,16 @@ exports.handler = async (event, context) => {
             break;
           }
 
-          let meUserData = await sqlConnection`
+          // Read-only: roles come from users.roles and are never derived from
+          // token claims. Role changes go through the audited /admin endpoints
+          // or the one-off bootstrapAdmin Lambda.
+          const meUserData = await sqlConnection`
             SELECT user_email, first_name, last_name, roles, organization_id
             FROM "users"
             WHERE user_email = ${meEmail};
           `;
 
           if (meUserData.length > 0) {
-            // Bootstrap admin: if the user belongs to the Cognito 'admin' group
-            // but the DB roles array does not yet include 'admin', persist it so
-            // the DB (the single source of truth for roles) reflects admin access.
-            // This lets fresh deployers elevate to admin via the Cognito group
-            // without direct DB access, and have it show up everywhere.
-            const cognitoGroups = JSON.parse(
-              event.requestContext.authorizer.cognitoGroups || "[]"
-            );
-            const currentRoles = meUserData[0].roles || [];
-            if (cognitoGroups.includes("admin") && !currentRoles.includes("admin")) {
-              const newRoles = [...currentRoles, "admin"];
-              logger.info("Bootstrapping admin role from Cognito group", { meEmail, newRoles });
-              meUserData = await sqlConnection`
-                UPDATE "users"
-                SET roles = ${newRoles}
-                WHERE user_email = ${meEmail}
-                RETURNING user_email, first_name, last_name, roles, organization_id;
-              `;
-            }
-
             response.statusCode = 200;
             response.body = JSON.stringify(meUserData[0]);
           } else {

@@ -154,6 +154,17 @@ def get_stream_callback_url():
             logger.error(f"Error fetching stream callback URL parameter {STREAM_CALLBACK_URL_PARAM}: {e}")
     return STREAM_CALLBACK_URL
 
+_STREAM_NONCE_RE = re.compile(r"^[0-9a-f]{64}$")
+
+def _get_stream_nonce(headers):
+    """Return the socket server's X-Stream-Nonce header if well-formed, else None."""
+    for key, value in (headers or {}).items():
+        if isinstance(key, str) and key.lower() == "x-stream-nonce":
+            if isinstance(value, str) and _STREAM_NONCE_RE.fullmatch(value):
+                return value
+            return None
+    return None
+
 def initialize_constants():
     global BEDROCK_LLM_ID, EMBEDDING_MODEL_ID, TABLE_NAME, embeddings
     BEDROCK_LLM_ID = get_parameter(BEDROCK_LLM_PARAM, BEDROCK_LLM_ID)
@@ -454,8 +465,17 @@ def handler(event, context):
     # chunks to its /stream-callback route instead of going through AppSync.
     # The destination always comes from SSM config; any caller-supplied
     # stream_callback_url query parameter is intentionally ignored.
+    # The socket server also sends a per-request X-Stream-Nonce, echoed on every
+    # callback; the socket server rejects callbacks whose nonce doesn't match
+    # its registration. A malformed nonce is dropped rather than forwarded.
+    # (The frontend only listens on the socket, so there is no useful AppSync
+    # fallback for stream=true requests.)
     wants_socket_stream = query_params.get("stream", "false").lower() == "true"
-    set_stream_callback_url(get_stream_callback_url() if wants_socket_stream else None)
+    stream_nonce = _get_stream_nonce(headers) if wants_socket_stream else None
+    set_stream_callback_url(
+        get_stream_callback_url() if wants_socket_stream else None,
+        stream_nonce,
+    )
 
     if not simulation_group_id or not session_id or not persona_id:
         return {

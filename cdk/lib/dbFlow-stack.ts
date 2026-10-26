@@ -6,12 +6,12 @@ import { Duration } from 'aws-cdk-lib';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import * as logs from 'aws-cdk-lib/aws-logs';
 
 // Stack import
 import { VpcStack } from './vpc-stack';
 import { DatabaseStack } from './database-stack';
 import { ApiServiceStack } from './api-service-stack';
+import { LogProtection } from './log-protection';
 
 export class DBFlowStack extends Stack {
     constructor(scope: Construct, id: string, vpcStack: VpcStack, db: DatabaseStack, apiStack: ApiServiceStack, props?: StackProps) {
@@ -83,6 +83,9 @@ export class DBFlowStack extends Stack {
             iam.ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMReadOnlyAccess")
         );
 
+        // Finite retention + CMK for the migration runner's log group.
+        const logProtection = new LogProtection(this, `${id}-LogProtection`);
+
         // REVIEW: The TriggerFunction runs on every CDK deployment (by design — the timestamp
         // in the description forces a new version). This is correct for running migrations, but
         // the 300-second timeout may be tight if migrations are complex. Consider increasing to 600s.
@@ -111,8 +114,10 @@ export class DBFlowStack extends Stack {
             code: lambda.Code.fromAsset("lambda/db_setup"),
             layers: [nodePgMigrateLayer],
             role: lambdaRole,
-            logRetention: logs.RetentionDays.INFINITE,
+            logGroup: logProtection.lambdaLogGroup(`${id}-initializerFunction`),
         });
+        // Bound retention on the original unencrypted /aws/lambda/<fn> group.
+        logProtection.expireLegacyLambdaLogGroups([initializerLambda]);
 
         // Create security group for Lambda to connect to RDS
         const lambdaSecurityGroup = new ec2.SecurityGroup(this, `${id}-lambda-sg`, {

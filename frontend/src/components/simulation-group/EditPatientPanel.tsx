@@ -1,5 +1,4 @@
 import { useState, useEffect } from 'react';
-import DOMPurify from 'dompurify';
 import { ArrowLeft, Search, Camera, Trash2, Upload, Plus, Eye, CheckCircle, Loader2, XCircle, FileText, Mic, MessageSquareText, Info } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -8,6 +7,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import UserAvatar from '@/components/UserAvatar';
 import VoicePreview from '@/components/prompt-playground/VoicePreview';
 import { UI_COLORS, SIMULATION_GROUP_COLOR_PALETTE } from '@/lib/colors';
+import { extractSafeIframeSrc, isEmbedCode, sanitizeEmbedCode, toAllowedIframeSrc, toSafeHttpsUrl } from '@/lib/embedSafety';
+import UnavailableContentNotice from '@/components/UnavailableContentNotice';
 import type { UsePatientEditorReturn } from '@/hooks/usePatientEditor';
 import { instructorService, type OrganizationLabels, type GlobalRubricQuestion, type CaseMaterial, type UploadedFileInfo } from '@/services/instructorService';
 import { useNotification } from '@/components/notifications';
@@ -1472,48 +1473,7 @@ function MaterialsTab({
                       <span className="font-medium" style={{ color: UI_COLORS.text.heading }}>Preview</span>
                     </div>
                     {material.embedLink ? (
-                      material.embedLink.trimStart().toLowerCase().startsWith('<iframe') ? (
-                        <div
-                          className="embed-responsive rounded-lg overflow-hidden"
-                          style={{
-                            position: 'relative',
-                            width: '100%',
-                            aspectRatio: (() => {
-                              const match = material.embedLink!.match(/width=["']?(\d+)["']?/i);
-                              const matchH = material.embedLink!.match(/height=["']?(\d+)["']?/i);
-                              const w = match ? parseInt(match[1], 10) : 0;
-                              const h = matchH ? parseInt(matchH[1], 10) : 0;
-                              return w > 0 && h > 0 ? `${w} / ${h}` : '16 / 9';
-                            })(),
-                            borderWidth: '1px',
-                            borderStyle: 'solid',
-                            borderColor: UI_COLORS.border.default,
-                          }}
-                          dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(material.embedLink, { ALLOWED_TAGS: ['iframe'], ALLOWED_ATTR: ['src', 'width', 'height', 'frameborder', 'allow', 'allowfullscreen', 'title', 'style'] }) }}
-                        />
-                      ) : (
-                        <div
-                          className="rounded-lg overflow-hidden"
-                          style={{
-                            position: 'relative',
-                            width: '100%',
-                            paddingBottom: '56.25%',
-                            height: 0,
-                            borderWidth: '1px',
-                            borderStyle: 'solid',
-                            borderColor: UI_COLORS.border.default,
-                          }}
-                        >
-                          <iframe
-                            src={material.embedLink}
-                            title={material.title || 'Preview'}
-                            style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', border: 0 }}
-                            allowFullScreen
-                            allow="autoplay *; fullscreen *; encrypted-media *"
-                            sandbox="allow-downloads allow-forms allow-same-origin allow-scripts allow-top-navigation allow-pointer-lock allow-popups allow-modals allow-orientation-lock allow-popups-to-escape-sandbox allow-presentation allow-top-navigation-by-user-activation"
-                          />
-                        </div>
-                      )
+                      <EmbedPreview value={material.embedLink} title={material.title || 'Preview'} />
                     ) : (
                       <div
                         className="border rounded-lg p-8 flex items-center justify-center"
@@ -1571,6 +1531,66 @@ function MaterialsTab({
 
 
 /* ─── Patient-Specific DTPs Tab ─── */
+
+/**
+ * Instructor-side preview of a case material's embed link or embed code.
+ * Uses the same guards as the student renderer (PhysicalAssessmentContent),
+ * so the preview shows exactly what students will see: only https URLs on
+ * allowlisted embed hosts become an iframe; everything else gets a notice.
+ */
+function EmbedPreview({ value, title }: { value: string; title: string }) {
+  if (isEmbedCode(value)) {
+    const sanitized = sanitizeEmbedCode(value);
+    if (!sanitized) {
+      return <UnavailableContentNotice href={extractSafeIframeSrc(value)} />;
+    }
+    const w = parseInt(value.match(/width=["']?(\d+)["']?/i)?.[1] ?? '', 10);
+    const h = parseInt(value.match(/height=["']?(\d+)["']?/i)?.[1] ?? '', 10);
+    return (
+      <div
+        className="embed-responsive rounded-lg overflow-hidden"
+        style={{
+          position: 'relative',
+          width: '100%',
+          aspectRatio: w > 0 && h > 0 ? `${w} / ${h}` : '16 / 9',
+          borderWidth: '1px',
+          borderStyle: 'solid',
+          borderColor: UI_COLORS.border.default,
+        }}
+        dangerouslySetInnerHTML={{ __html: sanitized }}
+      />
+    );
+  }
+
+  const iframeSrc = toAllowedIframeSrc(value);
+  if (!iframeSrc) {
+    return <UnavailableContentNotice href={toSafeHttpsUrl(value)} />;
+  }
+
+  return (
+    <div
+      className="rounded-lg overflow-hidden"
+      style={{
+        position: 'relative',
+        width: '100%',
+        paddingBottom: '56.25%',
+        height: 0,
+        borderWidth: '1px',
+        borderStyle: 'solid',
+        borderColor: UI_COLORS.border.default,
+      }}
+    >
+      <iframe
+        src={iframeSrc}
+        title={title}
+        style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', border: 0 }}
+        allowFullScreen
+        allow="autoplay *; fullscreen *; encrypted-media *"
+        sandbox="allow-downloads allow-forms allow-same-origin allow-scripts allow-top-navigation allow-pointer-lock allow-popups allow-modals allow-orientation-lock allow-popups-to-escape-sandbox allow-presentation allow-top-navigation-by-user-activation"
+      />
+    </div>
+  );
+}
 
 function PatientDTPsTab({
   patientEditor,

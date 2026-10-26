@@ -19,13 +19,74 @@
 
 const SERVICE = "socket-server";
 
+// Redaction mirrors cdk/lambda/lib/logger.js; keep the key lists in sync.
+// Every data object is redacted before
+// serialization so tokens, signed URLs and student content never reach
+// CloudWatch, even if a call site passes a whole socket payload.
+const REDACTED = "[REDACTED]";
+const MAX_DEPTH = 8;
+
+// Matched case-insensitively after stripping "-" and "_".
+const SENSITIVE_KEYS = new Set([
+  // Credentials and session material
+  "authorization",
+  "cookie",
+  "setcookie",
+  "password",
+  "secret",
+  "apikey",
+  "xapikey",
+  "xcallbacktoken",
+  "groupaccesscode",
+  "accesscode",
+  // Signed links (answer keys, documents)
+  "url",
+  "signedurl",
+  "presignedurl",
+  // Raw request material and student/clinical content
+  "headers",
+  "multivalueheaders",
+  "body",
+  "messagecontent",
+]);
+
+function isSensitiveKey(key) {
+  const normalized = String(key).toLowerCase().replace(/[-_]/g, "");
+  // Any *token key: token, idToken, access_token, refreshToken, x-callback-token...
+  return SENSITIVE_KEYS.has(normalized) || normalized.endsWith("token");
+}
+
+/**
+ * Returns a deep copy of `value` with sensitive keys replaced by "[REDACTED]".
+ * Handles arrays, Error objects and circular references; never mutates input.
+ */
+function redact(value, depth = 0, seen = new WeakSet()) {
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= MAX_DEPTH) return "[Truncated]";
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.map((item) => redact(item, depth + 1, seen));
+  }
+  if (value instanceof Error) {
+    return { name: value.name, message: value.message, stack: value.stack };
+  }
+
+  const out = {};
+  for (const [key, val] of Object.entries(value)) {
+    out[key] = isSensitiveKey(key) ? REDACTED : redact(val, depth + 1, seen);
+  }
+  return out;
+}
+
 function _log(level, message, data = {}) {
   const entry = {
     timestamp: new Date().toISOString(),
     level,
     service: SERVICE,
     message,
-    ...data,
+    ...redact(data),
   };
   let line;
   try {
@@ -53,4 +114,4 @@ function error(message, data) {
   _log("ERROR", message, data);
 }
 
-module.exports = { info, warn, error };
+module.exports = { info, warn, error, redact };

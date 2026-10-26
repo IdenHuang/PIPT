@@ -62,8 +62,8 @@ exports.handler = async (event, context) => {
 
     const email = payload.email || payload.sub;
 
-    // Extract Cognito groups from the token (present in ID tokens when user belongs to groups)
-    const cognitoGroups = payload["cognito:groups"] || [];
+    // cognito:groups is deliberately NOT forwarded: roles live only in the
+    // database, and no handler may authorize from a token claim.
 
     console.log(
       JSON.stringify({
@@ -77,7 +77,6 @@ exports.handler = async (event, context) => {
     return buildAllowPolicy(payload.sub, resource, {
       userId: payload.sub,
       email,
-      cognitoGroups: JSON.stringify(cognitoGroups),
     });
   } catch (error) {
     if (error.message !== "Unauthorized") {

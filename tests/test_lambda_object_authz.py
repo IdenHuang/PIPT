@@ -3,6 +3,7 @@ Object-level authorization for the Python file Lambdas:
   - cdk/lambda/getFilesFunction/getFilesFunction.py
   - cdk/lambda/getProfilePictures/getProfilePictures.py
   - cdk/lambda/deleteFile/deleteFile.py
+  - cdk/lambda/generatePreSignedURL/generatePreSignedURL.py
 
 Each module is loaded from its own directory with its Lambda-layer imports
 (psycopg2, rsa, powertools, cors_helper) stubbed, and its DB / S3 / signing
@@ -141,8 +142,9 @@ class FakeConnection:
 # ── Module loading with Lambda-layer stubs ──────────────────────────────────
 
 class _Logger:
-    def inject_lambda_context(self, fn):
-        return fn
+    def inject_lambda_context(self, fn=None, **_kwargs):
+        # Supports both @inject_lambda_context and @inject_lambda_context(log_event=True)
+        return fn if fn is not None else (lambda f: f)
 
     def __getattr__(self, _name):
         return lambda *a, **kw: None
@@ -365,3 +367,87 @@ def test_delete_file_instructor_of_group_can_delete(delete_file):
 def test_delete_file_non_instructor_is_denied(delete_file):
     assert _delete(delete_file, OTHER_INSTRUCTOR)["statusCode"] == 403
     assert delete_file._deleted == []
+
+
+# ── generatePreSignedURL ────────────────────────────────────────────────────
+
+@pytest.fixture
+def presign(monkeypatch, world):
+    mod = _load(monkeypatch, "generatePreSignedURL", "generatePreSignedURL.py")
+    conn = FakeConnection(world)
+    monkeypatch.setattr(mod, "connect_to_db", lambda: conn)
+    signed = []
+
+    def fake_post(**kw):
+        signed.append(kw["Key"])
+        return {"url": "https://bucket.s3", "fields": {"key": kw["Key"]}}
+
+    monkeypatch.setattr(mod, "s3", types.SimpleNamespace(generate_presigned_post=fake_post))
+    mod._signed = signed
+    return mod
+
+
+def _presign(mod, email, group=GROUP, persona=PERSONA, folder="documents"):
+    return mod.lambda_handler(
+        _event(
+            email,
+            simulation_group_id=group,
+            patient_id=persona,
+            file_name="notes",
+            file_type="pdf",
+            folder_type=folder,
+        ),
+        None,
+    )
+
+
+@pytest.mark.parametrize("email", [INSTRUCTOR, ADMIN])
+def test_presign_foreign_persona_is_denied(presign, email):
+    """Uploading into a group-B persona would poison its persona-keyed RAG collection."""
+    resp = _presign(presign, email, persona=OTHER_PERSONA)
+    assert resp["statusCode"] == 403
+    assert presign._signed == []
+
+
+@pytest.mark.parametrize("folder", ["documents", "info", "answer_key", "profile_picture"])
+def test_presign_instructor_of_group_gets_scoped_key(presign, folder):
+    file_type = "png" if folder == "profile_picture" else "pdf"
+    resp = presign.lambda_handler(
+        _event(
+            INSTRUCTOR,
+            simulation_group_id=GROUP,
+            patient_id=PERSONA,
+            file_name="notes",
+            file_type=file_type,
+            folder_type=folder,
+        ),
+        None,
+    )
+    assert resp["statusCode"] == 200
+    assert presign._signed == [f"{GROUP}/{PERSONA}/{folder}/notes.{file_type}"]
+
+
+def test_presign_instructor_of_other_group_is_denied(presign):
+    assert _presign(presign, OTHER_INSTRUCTOR)["statusCode"] == 403
+    assert presign._signed == []
+
+
+@pytest.mark.parametrize(
+    "group,persona",
+    [
+        (GROUP, f"{OTHER_GROUP}/{OTHER_PERSONA}"),
+        (GROUP, "../x"),
+        (f"{GROUP}/{OTHER_GROUP}", PERSONA),
+        ("not-a-uuid", PERSONA),
+    ],
+)
+def test_presign_rejects_non_uuid_ids(presign, group, persona):
+    resp = _presign(presign, ADMIN, group=group, persona=persona)
+    assert resp["statusCode"] == 400
+    assert presign._signed == []
+
+
+def test_presign_fails_closed_on_db_error(presign, world):
+    world.fail = True
+    assert _presign(presign, ADMIN)["statusCode"] == 403
+    assert presign._signed == []
