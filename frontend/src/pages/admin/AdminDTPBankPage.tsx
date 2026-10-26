@@ -143,7 +143,7 @@ function AdminDTPBankPage() {
   const handleDeleteDTP = async () => {
     try {
       setError(null);
-      await deleteDTPItem(deleteConfirm.itemId);
+      await deleteDTPItem(organizationId || '', deleteConfirm.itemId);
       setDtpItems(prev => prev.filter(item => item.id !== deleteConfirm.itemId));
       if (expandedItemId === deleteConfirm.itemId) setExpandedItemId(null);
       if (editingItemId === deleteConfirm.itemId) setEditingItemId(null);
@@ -227,7 +227,7 @@ function AdminDTPBankPage() {
         .filter(Boolean)
         .filter(t => t !== 'patient_specific');
       const finalTags = [...baseTag, ...userTags];
-      const updated = await updateDTPItem(editingItemId, {
+      const updated = await updateDTPItem(organizationId || '', editingItemId, {
         title: editForm.title.trim(),
         expectedDTPText: editForm.expectedDTPText.trim(),
         clinicalIntent: editForm.clinicalIntent.trim(),

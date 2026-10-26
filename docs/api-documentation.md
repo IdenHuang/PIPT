@@ -4534,6 +4534,7 @@ Update an existing question.
 
 **Query Parameters:**
 
+- `organization_id` (string, required): ID of the organization that owns the question. The update only matches a question in this organization; otherwise `404`.
 - `question_id` (string, required): ID of the question to update
 
 **Request Body:**
@@ -4558,7 +4559,7 @@ Update an existing question.
 **Example (cURL):**
 
 ```bash
-curl -X PUT "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/question_bank?question_id=uuid" \
+curl -X PUT "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/question_bank?organization_id=uuid&question_id=uuid" \
   -H "Authorization: eyJraWQiOiJ..." \
   -H "Content-Type: application/json" \
   -d '{"title": "Updated Title", "question_text": "Updated question", "is_mandatory": false}'
@@ -4574,6 +4575,7 @@ Delete a question from the question bank.
 
 **Query Parameters:**
 
+- `organization_id` (string, required): ID of the organization that owns the question. The delete only matches a question in this organization; otherwise `404`.
 - `question_id` (string, required): ID of the question to delete
 
 **Response:** `200 OK`
@@ -4581,7 +4583,7 @@ Delete a question from the question bank.
 **Example (cURL):**
 
 ```bash
-curl -X DELETE "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/question_bank?question_id=uuid" \
+curl -X DELETE "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/question_bank?organization_id=uuid&question_id=uuid" \
   -H "Authorization: eyJraWQiOiJ..."
 ```
 
@@ -4680,6 +4682,7 @@ Update an existing DTP item.
 
 **Query Parameters:**
 
+- `organization_id` (string, required): ID of the organization that owns the DTP item. The update only matches an item in this organization; otherwise `404`.
 - `dtp_id` (string, required): ID of the DTP item to update
 
 **Request Body:**
@@ -4701,7 +4704,7 @@ Update an existing DTP item.
 **Example (cURL):**
 
 ```bash
-curl -X PUT "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/dtp_bank?dtp_id=uuid" \
+curl -X PUT "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/dtp_bank?organization_id=uuid&dtp_id=uuid" \
   -H "Authorization: eyJraWQiOiJ..." \
   -H "Content-Type: application/json" \
   -d '{"title": "Updated Title", "is_active": true}'
@@ -4717,6 +4720,7 @@ Delete a DTP item.
 
 **Query Parameters:**
 
+- `organization_id` (string, required): ID of the organization that owns the DTP item. The delete only matches an item in this organization; otherwise `404`.
 - `dtp_id` (string, required): ID of the DTP item to delete
 
 **Response:** `200 OK`
@@ -4724,7 +4728,7 @@ Delete a DTP item.
 **Example (cURL):**
 
 ```bash
-curl -X DELETE "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/dtp_bank?dtp_id=uuid" \
+curl -X DELETE "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/dtp_bank?organization_id=uuid&dtp_id=uuid" \
   -H "Authorization: eyJraWQiOiJ..."
 ```
 
@@ -4817,6 +4821,7 @@ Update an existing recommendation item.
 
 **Query Parameters:**
 
+- `organization_id` (string, required): ID of the organization that owns the recommendation. The update only matches an item in this organization; otherwise `404`.
 - `recommendation_id` (string, required): ID of the recommendation to update
 
 **Request Body:**
@@ -4836,7 +4841,7 @@ Update an existing recommendation item.
 **Example (cURL):**
 
 ```bash
-curl -X PUT "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/recommendations_bank?recommendation_id=uuid" \
+curl -X PUT "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/recommendations_bank?organization_id=uuid&recommendation_id=uuid" \
   -H "Authorization: eyJraWQiOiJ..." \
   -H "Content-Type: application/json" \
   -d '{"title": "Updated Title", "is_active": true}'
@@ -4852,6 +4857,7 @@ Delete a recommendation item.
 
 **Query Parameters:**
 
+- `organization_id` (string, required): ID of the organization that owns the recommendation. The delete only matches an item in this organization; otherwise `404`.
 - `recommendation_id` (string, required): ID of the recommendation to delete
 
 **Response:** `200 OK`
@@ -4859,7 +4865,7 @@ Delete a recommendation item.
 **Example (cURL):**
 
 ```bash
-curl -X DELETE "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/recommendations_bank?recommendation_id=uuid" \
+curl -X DELETE "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/recommendations_bank?organization_id=uuid&recommendation_id=uuid" \
   -H "Authorization: eyJraWQiOiJ..."
 ```
 

@@ -35,9 +35,9 @@ import { AddQuestionDialog } from '@/components/AddQuestionDialog';
 import { AddPatientSpecificQuestionDialog } from '@/components/AddPatientSpecificQuestionDialog';
 import AIDebriefDialog from '../../components/AIDebriefDialog';
 import { useNotification } from '@/components/notifications';
-import { listDTPItemsAsInstructor, assignDTPToGroup, assignDTPToPatient, getAssignedDTPs, unassignDTP, createDTPItem, updateDTPItem } from '@/services/dtpBankService';
+import { listDTPItemsAsInstructor, assignDTPToGroup, assignDTPToPatient, getAssignedDTPs, unassignDTP, createDTPItemAsInstructor, updateDTPItemAsInstructor } from '@/services/dtpBankService';
 import type { DTPAssignment } from '@/services/dtpBankService';
-import { listRecommendationItemsAsInstructor, assignRecommendationToGroup, assignRecommendationToPatient, getAssignedRecommendations, unassignRecommendation, createRecommendationItem, updateRecommendationItem } from '@/services/recommendationsBankService';
+import { listRecommendationItemsAsInstructor, assignRecommendationToGroup, assignRecommendationToPatient, getAssignedRecommendations, unassignRecommendation, createRecommendationItemAsInstructor, updateRecommendationItemAsInstructor } from '@/services/recommendationsBankService';
 import type { RecommendationAssignment } from '@/services/recommendationsBankService';
 
 type ActiveSection = 'analytics' | 'patients' | 'students' | 'rubric' | 'questionBank' | 'dtpBank' | 'recommendationsBank' | 'prompt' | 'editPatient' | 'viewStudent';
@@ -354,7 +354,8 @@ function InstructorSimulationGroupPage() {
     const orgId = simulationGroup?.organization_id;
     if (!orgId || !groupId) return;
     try {
-      const created = await createDTPItem(orgId, data);
+      // Instructor-scoped route: /admin/* rejects callers without the admin role.
+      const created = await createDTPItemAsInstructor(orgId, data);
       const assignment = await assignDTPToPatient(created.id, groupId, patientId);
       setPatientDTPs(prev => [...prev, assignment]);
       showNotification({ message: 'DTP created and assigned to patient.', type: 'success' });
@@ -379,7 +380,8 @@ function InstructorSimulationGroupPage() {
     const orgId = simulationGroup?.organization_id;
     if (!orgId || !groupId) return;
     try {
-      const created = await createRecommendationItem(orgId, { ...data, tags: data.tags ?? [] });
+      // Instructor-scoped route: /admin/* rejects callers without the admin role.
+      const created = await createRecommendationItemAsInstructor(orgId, { ...data, tags: data.tags ?? [] });
       const assignment = await assignRecommendationToPatient(created.id, groupId, patientId);
       setPatientRecommendations(prev => [...prev, assignment]);
       showNotification({ message: 'Recommendation created and assigned to patient.', type: 'success' });
@@ -402,7 +404,9 @@ function InstructorSimulationGroupPage() {
 
   const handleUpdatePatientDTP = async (dtpId: string, data: { title: string; expectedDTPText: string; clinicalIntent: string; evaluationCriteria: string; tags: string[]; isRequired: boolean }) => {
     try {
-      await updateDTPItem(dtpId, data);
+      // The instructor route resolves the item's organization server-side and
+      // checks the caller's access to it (instructorRoutePolicy).
+      await updateDTPItemAsInstructor(dtpId, data);
       // Update local state to reflect the change
       setPatientDTPs(prev => prev.map(d => d.dtpId === dtpId ? { ...d, ...data } : d));
     } catch (err) {
@@ -414,7 +418,9 @@ function InstructorSimulationGroupPage() {
 
   const handleUpdatePatientRecommendation = async (recommendationId: string, data: { title: string; recommendationText: string; evaluationCriteria: string; rationale: string }) => {
     try {
-      await updateRecommendationItem(recommendationId, data);
+      // The instructor route resolves the item's organization server-side and
+      // checks the caller's access to it (instructorRoutePolicy).
+      await updateRecommendationItemAsInstructor(recommendationId, data);
       // Update local state to reflect the change
       setPatientRecommendations(prev => prev.map(r => r.recommendationId === recommendationId ? { ...r, ...data } : r));
     } catch (err) {

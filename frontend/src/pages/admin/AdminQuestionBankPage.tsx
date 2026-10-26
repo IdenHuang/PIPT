@@ -159,7 +159,7 @@ function AdminQuestionBankPage() {
   const handleDeleteQuestion = async () => {
     try {
       setError(null);
-      await deleteQuestionBankQuestion(deleteConfirm.itemId);
+      await deleteQuestionBankQuestion(organizationId || '', deleteConfirm.itemId);
       setQuestionItems(prev => prev.filter(item => item.id !== deleteConfirm.itemId));
       if (expandedItemId === deleteConfirm.itemId) setExpandedItemId(null);
       if (editingItemId === deleteConfirm.itemId) setEditingItemId(null);
@@ -280,7 +280,7 @@ function AdminQuestionBankPage() {
         .filter(Boolean)
         .filter(t => t !== 'patient_specific');
       const finalTags = [...baseTag, ...userTags];
-      const updated = await updateQuestionBankQuestion(editingItemId, {
+      const updated = await updateQuestionBankQuestion(organizationId || '', editingItemId, {
         title: editForm.title.trim(),
         question_text: editForm.questionText.trim(),
         clinical_intent: editForm.clinicalIntent.trim(),

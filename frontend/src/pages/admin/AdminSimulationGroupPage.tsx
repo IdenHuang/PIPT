@@ -791,7 +791,7 @@ function AdminSimulationGroupPage() {
 
   const handleUpdatePatientDTP = async (dtpId: string, data: { title: string; expectedDTPText: string; clinicalIntent: string; evaluationCriteria: string; tags: string[]; isRequired: boolean }) => {
     try {
-      await updateDTPItem(dtpId, data);
+      await updateDTPItem(organizationId || '', dtpId, data);
       setPatientDTPs(prev => prev.map(d => d.dtpId === dtpId ? { ...d, ...data } : d));
     } catch (err) {
       console.error('Failed to update patient DTP:', err);
@@ -802,7 +802,7 @@ function AdminSimulationGroupPage() {
 
   const handleUpdatePatientRecommendation = async (recommendationId: string, data: { title: string; recommendationText: string; evaluationCriteria: string; rationale: string }) => {
     try {
-      await updateRecommendationItem(recommendationId, data);
+      await updateRecommendationItem(organizationId || '', recommendationId, data);
       setPatientRecommendations(prev => prev.map(r => r.recommendationId === recommendationId ? { ...r, ...data } : r));
     } catch (err) {
       console.error('Failed to update patient Recommendation:', err);

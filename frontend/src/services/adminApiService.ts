@@ -459,11 +459,12 @@ export async function createQuestionBankQuestion(
  * Update an existing question bank question.
  */
 export async function updateQuestionBankQuestion(
+  organizationId: string,
   questionId: string,
   questionData: any
 ): Promise<QuestionBankItem> {
   const row = await apiClient.request<any>(
-    `admin/question_bank?question_id=${encodeURIComponent(questionId)}`,
+    `admin/question_bank?organization_id=${encodeURIComponent(organizationId)}&question_id=${encodeURIComponent(questionId)}`,
     {
       method: 'PUT',
       body: questionData,
@@ -476,10 +477,11 @@ export async function updateQuestionBankQuestion(
  * Delete (soft-delete) a question bank question.
  */
 export async function deleteQuestionBankQuestion(
+  organizationId: string,
   questionId: string
 ): Promise<{ message: string }> {
   return apiClient.request<{ message: string }>(
-    `admin/question_bank?question_id=${encodeURIComponent(questionId)}`,
+    `admin/question_bank?organization_id=${encodeURIComponent(organizationId)}&question_id=${encodeURIComponent(questionId)}`,
     { method: 'DELETE' }
   );
 }
