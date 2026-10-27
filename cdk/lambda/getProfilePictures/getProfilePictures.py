@@ -16,6 +16,10 @@ REGION = os.environ["REGION"]
 BUCKET = os.environ["BUCKET"]
 DB_SECRET_NAME = os.environ["SM_DB_CREDENTIALS"]
 RDS_PROXY_ENDPOINT = os.environ["RDS_PROXY_ENDPOINT"]
+# RDS Proxy presents an ACM certificate; verify it (and the hostname) against
+# the Amazon Trust Services roots in the OS trust store.
+# https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.howitworks.html#rds-proxy-security.tls
+DB_SSL_ROOT_CERT = os.environ.get("PGSSLROOTCERT", "/etc/pki/tls/certs/ca-bundle.crt")
 CLOUDFRONT_DOMAIN = os.environ["CLOUDFRONT_DOMAIN"]
 CLOUDFRONT_KEY_PAIR_ID = os.environ["CLOUDFRONT_KEY_PAIR_ID"]
 SM_CLOUDFRONT_PRIVATE_KEY = os.environ["SM_CLOUDFRONT_PRIVATE_KEY"]
@@ -61,7 +65,8 @@ def connect_to_db():
                 'password': secret["password"],
                 'host': RDS_PROXY_ENDPOINT,
                 'port': secret["port"],
-                'sslmode': 'require'
+                'sslmode': 'verify-full',
+                'sslrootcert': DB_SSL_ROOT_CERT,
             }
             connection_string = " ".join([f"{key}={value}" for key, value in connection_params.items()])
             connection = psycopg2.connect(connection_string)

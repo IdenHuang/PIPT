@@ -1,4 +1,5 @@
 import logging
+import os
 import boto3
 from typing import Dict, Optional, Tuple
 import psycopg2
@@ -13,6 +14,11 @@ s3 = boto3.client('s3')
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# RDS Proxy presents an ACM certificate; verify it (and the hostname) against
+# the Amazon Trust Services roots in the OS trust store.
+# https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.howitworks.html#rds-proxy-security.tls
+DB_SSL_ROOT_CERT = os.environ.get("PGSSLROOTCERT", "/etc/pki/tls/certs/ca-bundle.crt")
 
 # SQLSTATE invalid_password / invalid_authorization_specification
 _AUTH_SQLSTATES = ("28P01", "28000")
@@ -153,7 +159,8 @@ def get_vectorstore(
     """
     try:
         connection_string = (
-            f"postgresql+psycopg://{user}:{password}@{host}:{port}/{dbname}?sslmode=require"
+            f"postgresql+psycopg://{user}:{password}@{host}:{port}/{dbname}"
+            f"?sslmode=verify-full&sslrootcert={DB_SSL_ROOT_CERT}"
         )
 
         logger.info("Initializing the VectorStore")

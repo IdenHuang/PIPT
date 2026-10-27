@@ -4,6 +4,11 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import psycopg
 import os
 
+# RDS Proxy presents an ACM certificate; verify it (and the hostname) against
+# the Amazon Trust Services roots in the OS trust store.
+# https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.howitworks.html#rds-proxy-security.tls
+DB_SSL_ROOT_CERT = os.environ.get("PGSSLROOTCERT", "/etc/pki/tls/certs/ca-bundle.crt")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -802,7 +807,9 @@ def save_message_to_db(session_id: str, user_id: str, sender_type: str, message_
             port=secret['port'],
             dbname=secret['dbname'],
             user=secret['username'],
-            password=secret['password']
+            password=secret['password'],
+            sslmode='verify-full',
+            sslrootcert=DB_SSL_ROOT_CERT,
         )
         
         cursor = conn.cursor()
@@ -3655,7 +3662,9 @@ def _get_db_connection():
         port=secret['port'],
         dbname=secret['dbname'],
         user=secret['username'],
-        password=secret['password']
+        password=secret['password'],
+        sslmode='verify-full',
+        sslrootcert=DB_SSL_ROOT_CERT,
     )
 
 
@@ -3768,7 +3777,9 @@ def fetch_debrief_prompt(simulation_group_id: str) -> str:
             port=secret['port'],
             dbname=secret['dbname'],
             user=secret['username'],
-            password=secret['password']
+            password=secret['password'],
+            sslmode='verify-full',
+            sslrootcert=DB_SSL_ROOT_CERT,
         )
         cursor = conn.cursor()
         cursor.execute(
