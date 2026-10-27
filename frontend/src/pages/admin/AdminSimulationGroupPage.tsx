@@ -62,7 +62,7 @@ type ActiveSection = 'analytics' | 'patients' | 'students' | 'instructors' | 'pr
 function AdminSimulationGroupPage() {
   const navigate = useNavigate();
   const { organizationId, groupId } = useParams();
-  const { user: authUser } = useAuth();
+  const { user: authUser, signOut } = useAuth();
   const { showNotification } = useNotification();
 
   // Section navigation
@@ -324,7 +324,7 @@ function AdminSimulationGroupPage() {
   }, [activeSection, groupId]);
 
   // ── Navigation handlers ──
-  const handleSignOut = () => navigate('/login');
+  const handleSignOut = async () => { await signOut(); };
   const handleBackToAllGroups = () => navigate(`/admin/organization/${organizationId}`);
   const handleStudentView = async () => {
     const adminReturnUrl = `/admin/organization/${organizationId}/group/${groupId}`;

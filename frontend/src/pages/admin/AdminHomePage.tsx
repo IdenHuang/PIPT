@@ -11,6 +11,7 @@ import { getSimulationGroupColor, UI_COLORS } from '@/lib/colors';
 import * as adminApi from '@/services/adminApiService';
 import { OrganizationCardSkeleton } from '@/components/skeletons';
 import { useNotification } from '@/components/notifications';
+import { useAuth } from '@/App';
 
 /**
  * AdminHomePage Component
@@ -21,6 +22,7 @@ import { useNotification } from '@/components/notifications';
 function AdminHomePage() {
   const navigate = useNavigate();
   const { showNotification } = useNotification();
+  const { signOut } = useAuth();
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
   const [organizations, setOrganizations] = useState<adminApi.AdminOrganization[]>([]);
   const [loading, setLoading] = useState(true);
@@ -51,10 +53,10 @@ function AdminHomePage() {
       .finally(() => setLoading(false));
   }, []);
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
     try {
       console.log('Sign out clicked');
-      navigate('/login');
+      await signOut();
     } catch (error) {
       console.error('Error during sign out:', error);
     }

@@ -5,6 +5,7 @@
 
 import { signIn, signUp, signOut, fetchAuthSession, confirmSignUp, confirmSignIn, resetPassword, confirmResetPassword, resendSignUpCode } from 'aws-amplify/auth';
 import { appConfig } from '@/config/aws-config';
+import { clearCache } from '@/lib/dataCache';
 
 export interface AuthTokens {
   idToken: string;
@@ -47,13 +48,41 @@ class AuthService {
   // on every API request. Refreshed automatically as it nears expiry.
   private cachedToken: string | null = null;
   private cachedTokenExp = 0; // token expiry, epoch seconds
+  // Callbacks run whenever the session changes hands (sign-in / sign-out).
+  // Lets modules that auth.ts cannot import without a cycle (e.g. ApiClient)
+  // drop their own per-session state.
+  private sessionResetListeners = new Set<() => void>();
 
-  // Sign in with email and password
-  async signIn(email: string, password: string): Promise<AuthResult> {
-    // Clear cached profile and token on new sign-in
+  /** Register a callback that runs on every sign-in and sign-out. Returns an unsubscribe function. */
+  onSessionReset(listener: () => void): () => void {
+    this.sessionResetListeners.add(listener);
+    return () => this.sessionResetListeners.delete(listener);
+  }
+
+  /**
+   * Drop all client-side state tied to the current principal: cached profile,
+   * cached token, the shared navigation data cache, and any registered
+   * listeners' state. Sign-out navigates without a page reload, so without
+   * this the next user in the same tab would inherit the previous user's data.
+   */
+  private resetSession(): void {
     this.cachedUser = null;
     this.cachedToken = null;
     this.cachedTokenExp = 0;
+    clearCache();
+    for (const listener of this.sessionResetListeners) {
+      try {
+        listener();
+      } catch (error) {
+        console.error('Session reset listener failed:', error);
+      }
+    }
+  }
+
+  // Sign in with email and password
+  async signIn(email: string, password: string): Promise<AuthResult> {
+    // Clear everything cached for any previous principal on new sign-in
+    this.resetSession();
 
     const result = await signIn({ username: email, password });
 
@@ -125,9 +154,7 @@ class AuthService {
   // Uses global sign-out to revoke all refresh tokens server-side,
   // preventing stolen tokens from being used after the user logs out.
   async signOut(): Promise<void> {
-    this.cachedUser = null;
-    this.cachedToken = null;
-    this.cachedTokenExp = 0;
+    this.resetSession();
     await signOut({ global: true });
   }
 

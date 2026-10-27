@@ -33,7 +33,7 @@ function StudentChatPage() {
   const adminReturnUrl = (location.state as any)?.adminReturnUrl as string | undefined;
   
   // Load user data from auth context
-  const { user: authUser } = useAuth();
+  const { user: authUser, signOut } = useAuth();
   const user = { name: authUser?.email || 'Student', avatarUrl: undefined };
   
   // Patient data, case materials, and patient files loaded from API
@@ -697,8 +697,8 @@ function StudentChatPage() {
   /**
    * Handle sign out event
    */
-  const handleSignOut = () => {
-    navigate('/login');
+  const handleSignOut = async () => {
+    await signOut();
   };
 
   /**

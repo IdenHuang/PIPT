@@ -3,7 +3,7 @@ import { useNavigate, useParams, useLocation } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import PageContainer from '@/components/PageContainer';
 import UserAvatar from '@/components/UserAvatar';
-import { studentService, type Patient, type UserData } from '@/services/studentService';
+import { studentService, patientsCacheKey, type Patient, type UserData } from '@/services/studentService';
 import { ArrowLeft, CheckCircle, Loader, Circle, Clock, MessageSquare, BarChart3 } from 'lucide-react';
 import { UI_COLORS } from '@/lib/colors';
 import { PatientListSkeleton } from '@/components/skeletons';
@@ -41,12 +41,14 @@ function formatLastPracticed(dateStr: string | null): string {
 function PatientsPage() {
   const navigate = useNavigate();
   const { groupId } = useParams();
-  const { signOut } = useAuth();
+  const { signOut, user: authUser } = useAuth();
   const location = useLocation();
   const adminReturnUrl = (location.state as any)?.adminReturnUrl as string | undefined;
 
   // Seed from cache so returning to a group you already opened renders instantly.
-  const cachedPatients = groupId ? peekCached<Patient[]>(`student:patients:${groupId}`) : undefined;
+  // The key is bound to the signed-in user so another user's progress never seeds this view.
+  const cacheKey = groupId ? patientsCacheKey(authUser?.email, groupId) : undefined;
+  const cachedPatients = cacheKey ? peekCached<Patient[]>(cacheKey) : undefined;
   const [user, setUser] = useState<UserData>({ name: 'Loading...' });
   const [patients, setPatients] = useState<Patient[]>(cachedPatients ?? []);
   // Only show the skeleton on a true cold load (no cached data to show).

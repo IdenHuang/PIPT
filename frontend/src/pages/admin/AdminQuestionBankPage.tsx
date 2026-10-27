@@ -19,6 +19,7 @@ import { filterByTitle, paginate } from '@/lib/bankUtils';
 import LoadingIndicator from '@/components/LoadingIndicator';
 import { UI_COLORS, SIMULATION_GROUP_COLOR_PALETTE } from '@/lib/colors';
 import { useNotification } from '@/components/notifications';
+import { useAuth } from '@/App';
 
 /**
  * AdminQuestionBankPage Component
@@ -31,6 +32,7 @@ function AdminQuestionBankPage() {
   const navigate = useNavigate();
   const { organizationId } = useParams<{ organizationId: string }>();
   const { showNotification } = useNotification();
+  const { signOut } = useAuth();
 
   // Tab state
   const [questionBankTab, setQuestionBankTab] = useState<'global' | 'patientSpecific'>('global');
@@ -126,8 +128,8 @@ function AdminQuestionBankPage() {
 
   const isPatientSpecificTab = questionBankTab === 'patientSpecific';
 
-  const handleSignOut = () => {
-    navigate('/login');
+  const handleSignOut = async () => {
+    await signOut();
   };
 
   const handleSearchChange = (value: string) => {

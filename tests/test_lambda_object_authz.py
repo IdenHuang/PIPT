@@ -451,3 +451,37 @@ def test_presign_fails_closed_on_db_error(presign, world):
     world.fail = True
     assert _presign(presign, ADMIN)["statusCode"] == 403
     assert presign._signed == []
+
+
+# "_page" is reserved for ingestion's per-page temp keys (finding f-0eb77eb0).
+@pytest.mark.parametrize("file_name", ["notes.pdf_page_x", "notes_page", "a_page_1"])
+def test_presign_rejects_page_sentinel_in_file_name(presign, file_name):
+    resp = presign.lambda_handler(
+        _event(
+            INSTRUCTOR,
+            simulation_group_id=GROUP,
+            patient_id=PERSONA,
+            file_name=file_name,
+            file_type="pdf",
+            folder_type="documents",
+        ),
+        None,
+    )
+    assert resp["statusCode"] == 400
+    assert presign._signed == []
+
+
+@pytest.mark.parametrize("file_name", ["notes", "Page 1 notes", "pages-overview", "my_paper"])
+def test_presign_allows_names_without_page_sentinel(presign, file_name):
+    resp = presign.lambda_handler(
+        _event(
+            INSTRUCTOR,
+            simulation_group_id=GROUP,
+            patient_id=PERSONA,
+            file_name=file_name,
+            file_type="pdf",
+            folder_type="documents",
+        ),
+        None,
+    )
+    assert resp["statusCode"] == 200

@@ -230,3 +230,81 @@ def test_purge_failure_is_logged_not_raised(documents):
 
     assert purge("persona-1", conn) == 0
     assert conn.rolled_back and cur.closed
+
+
+# --- Chunk source id comes from the original key, not the page temp key (finding f-0eb77eb0) ---
+
+class _FakeChunk:
+    def __init__(self, text):
+        self.page_content = text
+        self.metadata = {}
+
+
+def _real_module(monkeypatch, documents, page_texts):
+    """Load an unstubbed copy of documents.py whose S3 and splitter are fakes.
+
+    page_texts maps a page temp key to the text stored under it.
+    """
+    spec = importlib.util.spec_from_file_location("_ingest_documents_chunks", os.path.join(_SRC, "processing", "documents.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def download_fileobj(bucket, key, buf):
+        buf.write(page_texts[key].encode("utf-8"))
+
+    monkeypatch.setattr(module, "s3", types.SimpleNamespace(download_fileobj=download_fileobj, delete_object=lambda **kw: None))
+    monkeypatch.setattr(module, "SemanticChunker", lambda _emb: types.SimpleNamespace(create_documents=lambda texts: [_FakeChunk(t) for t in texts]))
+    return module
+
+
+def _store_texts_returning(module, monkeypatch):
+    """Make store_doc_texts return the page keys ingestion would really write."""
+    def store_doc_texts(bucket, group, persona, filename, output_bucket, folder="documents"):
+        return [f"{group}/{persona}/{folder}/{filename}_page_1.txt"]
+
+    monkeypatch.setattr(module, "store_doc_texts", store_doc_texts)
+
+
+def _sources(chunks):
+    return {c.metadata["source"] for c in chunks}
+
+
+def test_page_sentinel_in_filename_does_not_collide_with_other_document(monkeypatch, documents):
+    legit_page = "group-1/persona-1/documents/notes.pdf_page_1.txt"
+    attacker_page = "group-1/persona-1/documents/notes.pdf_page_x.pdf_page_1.txt"
+    module = _real_module(monkeypatch, documents, {legit_page: "real", attacker_page: "fake"})
+    _store_texts_returning(module, monkeypatch)
+
+    legit = module.add_document(bucket="b", group="group-1", persona="persona-1", filename="notes.pdf", vectorstore=None, embeddings=None)
+    attacker = module.add_document(bucket="b", group="group-1", persona="persona-1", filename="notes.pdf_page_x.pdf", vectorstore=None, embeddings=None)
+
+    assert _sources(legit) == {"s3://embedding-bucket/group-1/persona-1/documents/notes.pdf"}
+    assert _sources(attacker) == {"s3://embedding-bucket/group-1/persona-1/documents/notes.pdf_page_x.pdf"}
+    assert _sources(legit).isdisjoint(_sources(attacker))
+
+
+def test_files_sharing_a_page_prefix_keep_distinct_sources(monkeypatch, documents):
+    """Case_page1.pdf and Case_page2.pdf used to both truncate to 'Case'."""
+    pages = {
+        "group-1/persona-1/info/Case_page1.pdf_page_1.txt": "one",
+        "group-1/persona-1/info/Case_page2.pdf_page_1.txt": "two",
+    }
+    module = _real_module(monkeypatch, documents, pages)
+    _store_texts_returning(module, monkeypatch)
+
+    one = module.add_document(bucket="b", group="group-1", persona="persona-1", filename="Case_page1.pdf", vectorstore=None, embeddings=None, folder="info")
+    two = module.add_document(bucket="b", group="group-1", persona="persona-1", filename="Case_page2.pdf", vectorstore=None, embeddings=None, folder="info")
+
+    assert _sources(one) == {"s3://embedding-bucket/group-1/persona-1/info/Case_page1.pdf"}
+    assert _sources(two) == {"s3://embedding-bucket/group-1/persona-1/info/Case_page2.pdf"}
+
+
+def test_normal_filename_source_is_unchanged(monkeypatch, documents):
+    """Existing embeddings must keep matching, so the source format for ordinary
+    names is the same as before the fix."""
+    page = "group-1/persona-1/documents/GroupCode_XXX_-_Group-Name.pdf_page_1.txt"
+    module = _real_module(monkeypatch, documents, {page: "text"})
+    _store_texts_returning(module, monkeypatch)
+
+    chunks = module.add_document(bucket="b", group="group-1", persona="persona-1", filename="GroupCode_XXX_-_Group-Name.pdf", vectorstore=None, embeddings=None)
+    assert _sources(chunks) == {"s3://embedding-bucket/group-1/persona-1/documents/GroupCode_XXX_-_Group-Name.pdf"}

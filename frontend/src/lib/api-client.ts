@@ -14,6 +14,14 @@ export class ApiClient {
 
   constructor() {
     this.baseUrl = appConfig.api.endpoint;
+    // In-flight GETs are keyed on endpoint only, so never let one started by a
+    // previous principal be handed to the next one after a session change.
+    authService.onSessionReset(() => this.reset());
+  }
+
+  /** Forget all in-flight GET de-duplication entries. */
+  reset(): void {
+    this.inFlightGets.clear();
   }
 
   private async getAuthHeaders(): Promise<Record<string, string>> {
@@ -42,8 +50,12 @@ export class ApiClient {
     if (method === 'GET') {
       const existing = this.inFlightGets.get(endpoint);
       if (existing) return existing as Promise<T>;
-      const pending = this.executeRequest<T>(endpoint, options).finally(() => {
-        this.inFlightGets.delete(endpoint);
+      const pending: Promise<T> = this.executeRequest<T>(endpoint, options).finally(() => {
+        // Only remove our own entry; after reset() a newer request for the
+        // same endpoint may own the slot.
+        if (this.inFlightGets.get(endpoint) === pending) {
+          this.inFlightGets.delete(endpoint);
+        }
       });
       this.inFlightGets.set(endpoint, pending as Promise<unknown>);
       return pending;

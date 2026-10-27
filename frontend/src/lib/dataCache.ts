@@ -6,8 +6,11 @@
  * This is a lightweight, dependency-free stand-in for a full query cache
  * (e.g. react-query) scoped to read-heavy navigation paths.
  *
- * The cache lives for the lifetime of the tab/session (module singleton) and
- * is intentionally NOT persisted — a full reload starts fresh.
+ * The cache lives for the lifetime of the tab (module singleton) and is
+ * intentionally NOT persisted — a full reload starts fresh. Because sign-out
+ * does not reload the page, entries holding per-user data must be keyed with
+ * the owning user's identity, and authService clears the whole cache on every
+ * sign-in and sign-out so a new principal never inherits a previous one's data.
  */
 
 interface CacheEntry<T> {
@@ -42,4 +45,9 @@ export function invalidateCache(keyOrPrefix: string): void {
       store.delete(key);
     }
   }
+}
+
+/** Remove every cache entry. Called at session boundaries (sign-in/sign-out). */
+export function clearCache(): void {
+  store.clear();
 }

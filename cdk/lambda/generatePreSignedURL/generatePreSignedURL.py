@@ -16,6 +16,8 @@ DB_SSL_ROOT_CERT = os.environ.get("PGSSLROOTCERT", "/etc/pki/tls/certs/ca-bundle
 
 # Allow alphanumeric, spaces, hyphens, underscores, dots, parentheses, commas
 SAFE_FILENAME = re.compile(r'^[a-zA-Z0-9_\-. (),]{1,200}$')
+# Reserved by data ingestion for per-page temp keys ({file_name}_page_{n}.txt)
+PAGE_SENTINEL = "_page"
 
 s3 = boto3.client(
     "s3",
@@ -172,6 +174,16 @@ def lambda_handler(event, context):
             'statusCode': 400,
             "headers": get_cors_headers(event),
             'body': json.dumps('Invalid file name. Only alphanumeric characters, spaces, hyphens, underscores, dots, parentheses, and commas are allowed (max 200 chars).')
+        }
+
+    # Ingestion writes each page as "{file_name}_page_{n}.txt", so "_page" is a
+    # reserved sentinel. Rejecting it keeps an upload from ever producing temp
+    # keys that look like another document's pages.
+    if PAGE_SENTINEL in file_name:
+        return {
+            'statusCode': 400,
+            "headers": get_cors_headers(event),
+            'body': json.dumps(f'Invalid file name. File names must not contain "{PAGE_SENTINEL}".')
         }
 
     # Verify the requesting instructor owns this simulation group

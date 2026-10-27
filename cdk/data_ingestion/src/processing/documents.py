@@ -209,7 +209,12 @@ def add_document(
         bucket=output_bucket,
         filenames=output_filenames,
         vectorstore=vectorstore,
-        embeddings=embeddings
+        embeddings=embeddings,
+        # The document's identity is its original object key, passed explicitly.
+        # It must not be re-derived from the per-page temp keys: a filename that
+        # itself contains "_page" would otherwise collide with another document's
+        # source id, and incremental cleanup would delete that document's embeddings.
+        source_key=f"{group}/{persona}/{folder}/{filename}",
     )
     
     return this_doc_chunks
@@ -218,7 +223,8 @@ def store_doc_chunks(
     bucket: str, 
     filenames: List[str],
     vectorstore: PGVector, 
-    embeddings: BedrockEmbeddings
+    embeddings: BedrockEmbeddings,
+    source_key: str,
 ) -> List[Document]:
     """
     Store chunks of documents in the vectorstore.
@@ -228,6 +234,10 @@ def store_doc_chunks(
     filenames (List[str]): A list of keys for the text files in the bucket.
     vectorstore (PGVector): The vectorstore instance.
     embeddings (BedrockEmbeddings): The embeddings instance.
+    source_key (str): Key of the original uploaded document
+        ({group}/{persona}/{folder}/{filename}). Every chunk's "source" metadata
+        is s3://{bucket}/{source_key}; this is the source_id_key used by
+        index() incremental cleanup, so it must uniquely identify one upload.
     
     Returns:
     List[Document]: A list of all document chunks for this document that were added to the vectorstore.
@@ -243,14 +253,11 @@ def store_doc_chunks(
         doc_texts = output_buffer.read().decode('utf-8')
         doc_chunks = text_splitter.create_documents([doc_texts])
         
-        head, _, _ = filename.partition("_page")
-        true_filename = head # Converts 'GroupCode_XXX_-_Group-Name.pdf_page_1.txt' to 'GroupCode_XXX_-_Group-Name.pdf'
-        
         doc_chunks = [x for x in doc_chunks if x.page_content]
         
         for doc_chunk in doc_chunks:
             if doc_chunk:
-                doc_chunk.metadata["source"] = f"s3://{bucket}/{true_filename}"
+                doc_chunk.metadata["source"] = f"s3://{bucket}/{source_key}"
                 doc_chunk.metadata["doc_id"] = this_uuid
                 
             else:
