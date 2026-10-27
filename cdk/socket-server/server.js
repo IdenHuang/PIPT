@@ -9,6 +9,7 @@ const { verifySessionScope } = require("./session-auth");
 const { authorizeSessionRequest } = require("./session-guard");
 const { resolveRelayToken } = require("./relay-token");
 const { StreamRelayRegistry, safeEqual } = require("./stream-relay");
+const { VoicePreviewLimiter, ConnectionLimiter, limiterKey, positiveIntEnv } = require("./voice-preview-limiter");
 const logger = require("./logger");
 const { SignatureV4 } = require("@smithy/signature-v4");
 const { HttpRequest } = require("@smithy/protocol-http");
@@ -246,24 +247,32 @@ function generateTurnCredentials(username, sharedSecret, ttlSeconds = 86400) { /
   return { username: turnUsername, credential: turnPassword };
 }
 
-// ─── Voice Preview Rate Limiting ──────────────────────────────────────────────
-const voicePreviewTimestamps = new Map(); // socket.id → number[]
-const RATE_LIMIT_MAX = 3;
-const RATE_LIMIT_WINDOW_MS = 60000;
+// ─── Voice Preview & Connection Limits ────────────────────────────────────────
+// Keyed on the authenticated identity (not socket.id) so reconnecting or
+// opening parallel sockets does not reset the budget. State outlives the
+// connection and is aged out by the prune interval below. This service runs
+// as a single task, so these limits also protect it from exhaustion.
 const TTS_TIMEOUT_MS = 90000;
+const voicePreviewLimiter = new VoicePreviewLimiter({
+  maxPerWindow: positiveIntEnv(process.env.VOICE_PREVIEW_MAX_PER_MINUTE, 5),
+  windowMs: 60000,
+  maxConcurrentPerUser: positiveIntEnv(process.env.VOICE_PREVIEW_MAX_CONCURRENT_PER_USER, 2),
+  maxConcurrentTotal: positiveIntEnv(process.env.VOICE_PREVIEW_MAX_CONCURRENT_TOTAL, 10),
+});
+const connectionLimiter = new ConnectionLimiter({
+  maxPerUser: positiveIntEnv(process.env.SOCKET_MAX_CONNECTIONS_PER_USER, 10),
+});
+setInterval(() => voicePreviewLimiter.prune(), 5 * 60 * 1000).unref();
 
-function isRateLimited(socketId) {
-  const now = Date.now();
-  const timestamps = voicePreviewTimestamps.get(socketId) || [];
-  const recent = timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
-  voicePreviewTimestamps.set(socketId, recent);
-  return recent.length >= RATE_LIMIT_MAX;
-}
-
-function recordVoicePreview(socketId) {
-  const timestamps = voicePreviewTimestamps.get(socketId) || [];
-  timestamps.push(Date.now());
-  voicePreviewTimestamps.set(socketId, timestamps);
+function voicePreviewRefusalMessage(result) {
+  if (result.reason === "rate") {
+    const seconds = Math.max(1, Math.ceil(result.retryAfterMs / 1000));
+    return `Rate limit exceeded. Please wait ${seconds}s before starting another voice preview.`;
+  }
+  if (result.reason === "concurrent") {
+    return "Too many voice previews are already running for your account. Stop one before starting another.";
+  }
+  return "Voice preview is busy right now. Please try again in a moment.";
 }
 
 // ─── Socket.IO Connection ─────────────────────────────────────────────────────
@@ -277,6 +286,12 @@ io.use(async (socket, next) => {
     const decoded = await verifyToken(token);
     socket.userId = decoded.sub;
     socket.userEmail = decoded.email;
+    // Early refusal with a clear connect_error; the authoritative count is
+    // taken in the connection handler so abandoned handshakes cannot leak.
+    if (connectionLimiter.isAtLimit(limiterKey(socket))) {
+      console.warn("⚠️ Connection limit reached for:", socket.userEmail);
+      return next(new Error("Too many open connections for this account"));
+    }
     console.log("🔐 User authenticated:", socket.userEmail);
     next();
   } catch (err) {
@@ -286,6 +301,14 @@ io.use(async (socket, next) => {
 });
 
 io.on("connection", (socket) => {
+  const releaseConnection = connectionLimiter.tryAdd(limiterKey(socket));
+  if (!releaseConnection) {
+    console.warn("⚠️ Connection limit reached for:", socket.userEmail);
+    socket.disconnect(true);
+    return;
+  }
+  socket.on("disconnect", releaseConnection);
+
   console.log("🔌 CLIENT CONNECTED:", socket.id, "User:", socket.userEmail);
   console.log(
     process.env.SM_DB_CREDENTIALS
@@ -871,41 +894,51 @@ io.on("connection", (socket) => {
   let ttsReady = false;
   let ttsTimeout = null;
 
+  // Stop this socket's TTS process (if any) and free its limiter slot right
+  // away, without waiting for the child to exit, so switching voices is not
+  // refused by the concurrency cap.
+  function stopTtsProcess() {
+    if (ttsTimeout) { clearTimeout(ttsTimeout); ttsTimeout = null; }
+    ttsReady = false;
+    if (!ttsProcess) return false;
+    const child = ttsProcess;
+    ttsProcess = null;
+    child.kill();
+    child.releaseVoiceSlot();
+    return true;
+  }
+
   socket.on("voice-preview", (config = {}) => {
     console.log("🎙️ Voice preview requested:", config.voice_id);
 
-    // Rate limit check
-    if (isRateLimited(socket.id)) {
-      console.log("⚠️ Voice preview rate limited for:", socket.id);
-      socket.emit("nova-error", { error: "Rate limit exceeded. Please wait before starting another voice preview." });
+    // Replace any previous TTS process for this socket before checking limits
+    stopTtsProcess();
+
+    const slot = voicePreviewLimiter.tryAcquire(limiterKey(socket));
+    if (!slot.allowed) {
+      console.log(`⚠️ Voice preview refused (${slot.reason}) for:`, socket.userEmail);
+      socket.emit("nova-error", { error: voicePreviewRefusalMessage(slot) });
       return;
     }
 
-    // Kill any previous TTS process for this socket
-    if (ttsProcess) {
-      if (ttsTimeout) { clearTimeout(ttsTimeout); ttsTimeout = null; }
-      ttsProcess.kill();
-      ttsProcess = null;
-    }
-    ttsReady = false;
-
-    // Record this voice preview request for rate limiting
-    recordVoicePreview(socket.id);
-
     const pythonCmd = process.env.PYTHON_CMD || "python3";
 
+    let child;
     try {
-      ttsProcess = spawn(pythonCmd, ["voice_preview_tts.py"], {
+      child = spawn(pythonCmd, ["voice_preview_tts.py"], {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
           ...process.env,
         },
       });
     } catch (error) {
+      slot.release();
       console.error("❌ Failed to spawn TTS process:", error.message);
       socket.emit("nova-error", { error: "Failed to start voice preview" });
       return;
     }
+    child.releaseVoiceSlot = slot.release; // idempotent
+    ttsProcess = child;
 
     // Send initial config (voice_id) — stdin stays open for audio
     ttsProcess.stdin.write(
@@ -914,14 +947,11 @@ io.on("connection", (socket) => {
 
     // Start 90s session timeout
     ttsTimeout = setTimeout(() => {
-      if (ttsProcess) {
-        ttsProcess.kill();
-        ttsProcess = null;
-        ttsReady = false;
+      ttsTimeout = null;
+      if (stopTtsProcess()) {
         socket.emit("voice-preview-done", {});
         console.log("⏰ Voice preview TTS process killed by 90s timeout");
       }
-      ttsTimeout = null;
     }, TTS_TIMEOUT_MS);
 
     // Read JSON lines from stdout
@@ -940,11 +970,7 @@ io.on("connection", (socket) => {
             socket.emit("nova-error", { error: msg.error });
             // The preview can't continue after an error (e.g. guardrail
             // unavailable); stop the process so no further audio is relayed.
-            if (ttsProcess) {
-              ttsProcess.kill();
-              ttsProcess = null;
-              ttsReady = false;
-            }
+            if (ttsProcess === child) stopTtsProcess();
           }
         } catch {
           console.log("[tts]", line);
@@ -958,14 +984,20 @@ io.on("connection", (socket) => {
 
     ttsProcess.on("error", (error) => {
       console.error("❌ TTS process error:", error.message);
+      child.releaseVoiceSlot();
       socket.emit("nova-error", { error: "Voice preview failed" });
     });
 
     ttsProcess.on("close", (code) => {
-      if (ttsTimeout) { clearTimeout(ttsTimeout); ttsTimeout = null; }
       console.log("🎙️ TTS process exited with code:", code);
-      ttsProcess = null;
-      ttsReady = false;
+      child.releaseVoiceSlot();
+      // A replaced process can exit after its successor started; only clear
+      // state that still belongs to this child.
+      if (ttsProcess === child) {
+        if (ttsTimeout) { clearTimeout(ttsTimeout); ttsTimeout = null; }
+        ttsProcess = null;
+        ttsReady = false;
+      }
     });
   });
 
@@ -991,11 +1023,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("stop-voice-preview", () => {
-    if (ttsTimeout) { clearTimeout(ttsTimeout); ttsTimeout = null; }
-    if (ttsProcess) {
-      ttsProcess.kill();
-      ttsProcess = null;
-      ttsReady = false;
+    if (stopTtsProcess()) {
       console.log("🛑 Voice preview stopped by client");
     }
   });
@@ -1026,15 +1054,9 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log("🔌 CLIENT DISCONNECTED:", socket.id);
 
-    // Clean up TTS preview process if present
-    if (ttsTimeout) { clearTimeout(ttsTimeout); ttsTimeout = null; }
-    if (ttsProcess) {
-      ttsProcess.kill();
-      ttsProcess = null;
-    }
-
-    // Clean up rate limit state for this connection
-    voicePreviewTimestamps.delete(socket.id);
+    // Clean up TTS preview process if present. Rate-limit history is keyed
+    // on the user and deliberately kept, so a reconnect does not reset it.
+    stopTtsProcess();
 
     // Clean up AgentCore WebSocket session if present
     if (socket.agentWs) {
