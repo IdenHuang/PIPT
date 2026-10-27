@@ -22,6 +22,8 @@ FILES = [
     "group-1/persona-1/documents/a.pdf",
     "group-1/persona-1/documents/b.txt",
 ]
+INFO_FILE = "group-1/persona-1/info/c.pdf"
+ANSWER_KEY_FILE = "group-1/persona-1/answer_key/key.pdf"
 
 
 class FakePaginator:
@@ -62,8 +64,9 @@ def documents(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    state = types.SimpleNamespace(events=[], statuses={})
-    monkeypatch.setattr(module, "s3", types.SimpleNamespace(get_paginator=lambda _: FakePaginator(FILES)))
+    state = types.SimpleNamespace(events=[], statuses={}, s3_keys=list(FILES), purged=[])
+    monkeypatch.setattr(module, "s3", types.SimpleNamespace(get_paginator=lambda _: FakePaginator(state.s3_keys)))
+    monkeypatch.setattr(module, "purge_answer_key_embeddings", lambda persona_id, conn: state.purged.append(persona_id) or 0)
     monkeypatch.setattr(module, "get_ingestion_status", lambda persona_id, file_path, conn: state.statuses.get(file_path, "processing"))
 
     def add_document(**kw):
@@ -139,3 +142,91 @@ def test_already_completed_files_are_skipped(documents, monkeypatch):
 
     added = [e[1] for e in documents._state.events if e[0] == "add"]
     assert added == ["b.txt"]
+
+
+# --- Answer keys stay out of the student-facing collection (finding f-7e54ad52) ---
+
+def test_answer_key_files_are_not_embedded(documents, monkeypatch):
+    documents._state.s3_keys = FILES + [INFO_FILE, ANSWER_KEY_FILE]
+    indexed = []
+    monkeypatch.setattr(documents, "index", lambda chunks, *a, **kw: indexed.extend(chunks))
+    _run(documents)
+
+    added = [e[1] for e in documents._state.events if e[0] == "add"]
+    assert added == ["a.pdf", "b.txt", "c.pdf"]
+    assert "chunk-of-key.pdf" not in indexed
+    assert ANSWER_KEY_FILE not in documents._state.statuses
+
+
+def test_embedded_folders_exclude_answer_key(documents):
+    assert "answer_key" not in documents.EMBEDDED_FOLDERS
+    assert set(documents.EMBEDDED_FOLDERS) == {"documents", "info"}
+
+
+def test_legacy_answer_key_embeddings_are_purged(documents, monkeypatch):
+    monkeypatch.setattr(documents, "index", lambda chunks, *a, **kw: None)
+    _run(documents)
+    assert documents._state.purged == ["persona-1"]
+
+
+class _FakeCursor:
+    def __init__(self, rowcount=0, fail=False):
+        self.rowcount = rowcount
+        self.fail = fail
+        self.executed = []
+        self.closed = False
+
+    def execute(self, sql, params):
+        if self.fail:
+            raise RuntimeError("db down")
+        self.executed.append((sql, params))
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeConnection:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.committed = False
+        self.rolled_back = False
+
+    def cursor(self):
+        return self._cursor
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+def _real_purge(documents):
+    """The fixture stubs purge_answer_key_embeddings; reload the real one."""
+    spec = importlib.util.spec_from_file_location("_ingest_documents_purge", os.path.join(_SRC, "processing", "documents.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.purge_answer_key_embeddings
+
+
+def test_purge_deletes_only_this_personas_answer_key_sources(documents):
+    purge = _real_purge(documents)
+    cur = _FakeCursor(rowcount=3)
+    conn = _FakeConnection(cur)
+
+    assert purge("persona-1", conn) == 3
+    sql, params = cur.executed[0]
+    assert "DELETE FROM langchain_pg_embedding" in sql
+    assert "cmetadata->>'source' LIKE %s" in sql
+    # Parameterized, scoped to the persona's collection and answer_key folder.
+    assert params == ("persona-1", "%/persona-1/answer_key/%")
+    assert conn.committed and cur.closed
+
+
+def test_purge_failure_is_logged_not_raised(documents):
+    purge = _real_purge(documents)
+    cur = _FakeCursor(fail=True)
+    conn = _FakeConnection(cur)
+
+    assert purge("persona-1", conn) == 0
+    assert conn.rolled_back and cur.closed

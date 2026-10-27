@@ -5,6 +5,28 @@ from langchain_classic.chains import create_history_aware_retriever
 
 from helpers.helper import get_vectorstore
 
+# Persona folders whose chunks the student-facing chat may retrieve. Must match
+# the folder segment of cmetadata["source"] written by data ingestion:
+# s3://{bucket}/{group}/{persona}/{folder}/{file}
+STUDENT_RETRIEVABLE_FOLDERS = ("documents", "info")
+
+
+def student_safe_source_filter(persona_id: str) -> Dict:
+    """
+    Build a PGVector metadata filter that matches only chunks whose source is
+    in one of STUDENT_RETRIEVABLE_FOLDERS for this persona.
+
+    Uses langchain-postgres JSONB filter syntax ($or / $like).
+    https://python.langchain.com/docs/integrations/vectorstores/pgvector/#filtering-support
+    """
+    return {
+        "$or": [
+            {"source": {"$like": f"%/{persona_id}/{folder}/%"}}
+            for folder in STUDENT_RETRIEVABLE_FOLDERS
+        ]
+    }
+
+
 def get_vectorstore_retriever(
     llm,
     vectorstore_config_dict: Dict[str, str],
@@ -31,7 +53,13 @@ def get_vectorstore_retriever(
         port=int(vectorstore_config_dict['port'])
     )
 
-    retriever = vectorstore.as_retriever()
+    # Only retrieve chunks from student-safe folders. The collection may still
+    # hold answer_key chunks embedded by earlier ingestion versions, and those
+    # must never reach the patient prompt. Allowlisting (rather than excluding
+    # answer_key) keeps any future instructor-only folder out by default.
+    retriever = vectorstore.as_retriever(
+        search_kwargs={"filter": student_safe_source_filter(vectorstore_config_dict['collection_name'])}
+    )
 
     # Contextualize question and create history-aware retriever
     contextualize_q_system_prompt = (
