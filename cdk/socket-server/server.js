@@ -8,6 +8,7 @@ const { verifyToken } = require("./auth");
 const { verifySessionScope } = require("./session-auth");
 const { authorizeSessionRequest } = require("./session-guard");
 const { resolveRelayToken } = require("./relay-token");
+const { fetchPatientContext } = require("./patient-context");
 const { StreamRelayRegistry, safeEqual } = require("./stream-relay");
 const { VoicePreviewLimiter, ConnectionLimiter, limiterKey, positiveIntEnv } = require("./voice-preview-limiter");
 const logger = require("./logger");
@@ -378,44 +379,46 @@ io.on("connection", (socket) => {
     }
     novaReady = false;
 
+    // ── Authoritative patient context (fail closed) ────────────────────────
+    // The persona, system prompt and completion rule come only from
+    // GET /student/patient_context, which verifies enrollment and that the
+    // persona belongs to the group. Client-supplied prompt fields
+    // (config.patient_prompt / system_prompt / patient_name / llm_completion)
+    // are never read: any failure here ends the session instead.
+    const patientContext = await fetchPatientContext({
+      endpoint: process.env.TEXT_GENERATION_ENDPOINT,
+      simulationGroupId: config.simulation_group_id,
+      patientId: config.patient_id,
+      token: socket.handshake.auth.token,
+    });
+    if (!patientContext.ok) {
+      logger.warn("Patient context unavailable for start-nova-sonic", {
+        component: "server",
+        operation: "start-nova-sonic",
+        userEmail: socket.userEmail,
+        sessionId,
+        reason: patientContext.reason,
+      });
+      socket.emit("nova-error", { error: "Could not load patient context for this session" });
+      return;
+    }
+    const voiceContext = patientContext.context;
+
     // ── AgentCore WebSocket path ──────────────────────────────────────────
     if (VOICE_AGENT_ARN) {
       console.log("🔀 Using AgentCore WebSocket for ARN:", VOICE_AGENT_ARN);
 
-      // Fetch full patient context from the API if we have IDs
-      let patientContext = {};
-      if (config.patient_id && config.simulation_group_id && process.env.TEXT_GENERATION_ENDPOINT) {
-        try {
-          const ctxUrl = `${process.env.TEXT_GENERATION_ENDPOINT}/student/patient_context?simulation_group_id=${encodeURIComponent(config.simulation_group_id)}&patient_id=${encodeURIComponent(config.patient_id)}`;
-          console.log("📋 Fetching patient context:", ctxUrl);
-          const ctxResp = await fetch(ctxUrl, {
-            headers: { Authorization: socket.handshake.auth.token || "" },
-          });
-          if (ctxResp.ok) {
-            patientContext = await ctxResp.json();
-            console.log("📋 Patient context loaded:", patientContext.patient_name);
-          } else {
-            console.warn("⚠️ Patient context fetch failed:", ctxResp.status);
-          }
-        } catch (err) {
-          console.warn("⚠️ Patient context fetch error:", err.message);
-        }
-      }
-
       try {
-        // For voice mode, prefer voice_persona_prompt when available, fall back to persona_prompt
-        const effectiveVoicePrompt = patientContext.voice_persona_prompt || patientContext.persona_prompt || config.patient_prompt || "";
-
         const agentWs = await connectToVoiceAgent({
           session_id: sessionId,
           voice_id: config.voice_id || "",
           user_id: socket.userId || "anonymous",
-          patient_name: patientContext.patient_name || config.patient_name || "",
-          patient_prompt: effectiveVoicePrompt,
+          patient_name: voiceContext.patient_name,
+          patient_prompt: voiceContext.patient_prompt,
           patient_id: config.patient_id || "",
           simulation_group_id: config.simulation_group_id || "",
-          llm_completion: patientContext.llm_completion || config.llm_completion || false,
-          system_prompt: patientContext.system_prompt || config.system_prompt || "",
+          llm_completion: voiceContext.llm_completion,
+          system_prompt: voiceContext.system_prompt,
           cognito_token: socket.handshake.auth.token || "",
           text_generation_endpoint: process.env.TEXT_GENERATION_ENDPOINT || "",
           // The voice agent runs outside CDK, so pass the guardrail it must apply.
@@ -512,9 +515,6 @@ io.on("connection", (socket) => {
     console.log(`🐍 Attempting to spawn: ${pythonCmd} nova_sonic.py`);
 
     try {
-      // For voice mode, prefer voice_persona_prompt when available, fall back to persona_prompt
-      const effectiveLocalVoicePrompt = patientContext.voice_persona_prompt || patientContext.persona_prompt || config.patient_prompt || "";
-
       novaProcess = spawn(pythonCmd, ["nova_sonic.py"], {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
@@ -524,12 +524,12 @@ io.on("connection", (socket) => {
           USER_ID: socket.userId || "anonymous",
           SM_DB_CREDENTIALS: process.env.SM_DB_CREDENTIALS || "",
           RDS_PROXY_ENDPOINT: process.env.RDS_PROXY_ENDPOINT || "",
-          PATIENT_NAME: config.patient_name || "",
-          PATIENT_PROMPT: effectiveLocalVoicePrompt,
+          PATIENT_NAME: voiceContext.patient_name,
+          PATIENT_PROMPT: voiceContext.patient_prompt,
           PATIENT_ID: config.patient_id || "",
           SIMULATION_GROUP_ID: config.simulation_group_id || "",
-          LLM_COMPLETION: config.llm_completion ? "true" : "false",
-          EXTRA_SYSTEM_PROMPT: config.system_prompt || "",
+          LLM_COMPLETION: voiceContext.llm_completion ? "true" : "false",
+          EXTRA_SYSTEM_PROMPT: voiceContext.system_prompt,
           APPSYNC_GRAPHQL_URL: process.env.APPSYNC_GRAPHQL_URL || "",
           COGNITO_TOKEN: socket.handshake.auth.token || "",
         },
@@ -655,12 +655,12 @@ io.on("connection", (socket) => {
               USER_ID: socket.userId || "anonymous",
               SM_DB_CREDENTIALS: process.env.SM_DB_CREDENTIALS || "",
               RDS_PROXY_ENDPOINT: process.env.RDS_PROXY_ENDPOINT || "",
-              PATIENT_NAME: config.patient_name || "",
-              PATIENT_PROMPT: effectiveLocalVoicePrompt,
+              PATIENT_NAME: voiceContext.patient_name,
+              PATIENT_PROMPT: voiceContext.patient_prompt,
               PATIENT_ID: config.patient_id || "",
               SIMULATION_GROUP_ID: config.simulation_group_id || "",
-              LLM_COMPLETION: config.llm_completion ? "true" : "false",
-              EXTRA_SYSTEM_PROMPT: config.system_prompt || "",
+              LLM_COMPLETION: voiceContext.llm_completion ? "true" : "false",
+              EXTRA_SYSTEM_PROMPT: voiceContext.system_prompt,
               APPSYNC_GRAPHQL_URL: process.env.APPSYNC_GRAPHQL_URL || "",
               COGNITO_TOKEN: socket.handshake.auth.token || "",
             },
