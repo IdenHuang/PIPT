@@ -7,18 +7,33 @@ const { SecretsManagerClient, GetSecretValueCommand } = require("@aws-sdk/client
 const secretsManager = new SecretsManagerClient();
 let sql;
 
+async function readCredentials(secretId) {
+  const secret = await secretsManager.send(new GetSecretValueCommand({ SecretId: secretId }));
+  return JSON.parse(secret.SecretString);
+}
+
 async function getSql(secretId, proxyEndpoint) {
   if (sql) return sql;
   if (!secretId || !proxyEndpoint) {
     throw new Error("Role lookup is not configured");
   }
-  const secret = await secretsManager.send(new GetSecretValueCommand({ SecretId: secretId }));
-  const credentials = JSON.parse(secret.SecretString);
+  const credentials = await readCredentials(secretId);
+  // postgres.js calls `password` for every new connection
+  // (https://github.com/porsager/postgres#connection-details). Re-read the secret
+  // after the first one so a connection reopened after db_setup rotates app_rw
+  // (every deploy) uses the new password, not the one cached at cold start.
+  let first = true;
   sql = postgres({
     host: proxyEndpoint,
     port: credentials.port,
     username: credentials.username,
-    password: credentials.password,
+    password: async () => {
+      if (first) {
+        first = false;
+        return credentials.password;
+      }
+      return (await readCredentials(secretId)).password;
+    },
     database: credentials.dbname,
     ssl: { rejectUnauthorized: true },
     // One authorizer invocation runs one query; keep the pool small.

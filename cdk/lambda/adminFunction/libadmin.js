@@ -4,27 +4,48 @@ const postgres = require("postgres");
 // Create a Secrets Manager client
 const secretsManager = new SecretsManagerClient();
 
+async function readCredentials(SM_DB_CREDENTIALS) {
+    const secretResponse = await secretsManager.send(
+        new GetSecretValueCommand({ SecretId: SM_DB_CREDENTIALS })
+    );
+    return JSON.parse(secretResponse.SecretString);
+}
+
+/**
+ * postgres.js `password` callback, called for every new pooled connection
+ * (https://github.com/porsager/postgres#connection-details). The first call
+ * reuses the credentials read at init; later calls re-read the secret so
+ * connections opened after db_setup rotates the app passwords (every deploy)
+ * use the new value instead of the one cached at cold start.
+ */
+function rotatingPassword(SM_DB_CREDENTIALS, initialCredentials) {
+    let first = true;
+    return async () => {
+        if (first) {
+            first = false;
+            return initialCredentials.password;
+        }
+        const credentials = await readCredentials(SM_DB_CREDENTIALS);
+        return credentials.password;
+    };
+}
+
 async function initializeConnection(SM_DB_CREDENTIALS, RDS_PROXY_ENDPOINT) {
     try {
         console.log(JSON.stringify({ level: "INFO", message: "Initializing admin database connection" }));
         // Retrieve the secret from AWS Secrets Manager
-        const getSecretValueCommand = new GetSecretValueCommand({ SecretId: SM_DB_CREDENTIALS });
-        const secretResponse = await secretsManager.send(getSecretValueCommand);
-
-        const credentials = JSON.parse(secretResponse.SecretString);
+        const credentials = await readCredentials(SM_DB_CREDENTIALS);
 
         const connectionConfig = {
             host: RDS_PROXY_ENDPOINT,
-            // host: credentials.host,
             port: credentials.port,
             username: credentials.username,
-            password: credentials.password,
+            password: rotatingPassword(SM_DB_CREDENTIALS, credentials),
             database: credentials.dbname,
             ssl: { rejectUnauthorized: true },
         };
 
-        // Create the PostgreSQL connection
-        // Global variable to hold the database connection
+        // Global variable to hold the database connection pool across warm invocations
         global.sqlConnectionTableCreator = postgres(connectionConfig);
 
         console.log(JSON.stringify({ level: "INFO", message: "Admin database connection initialized successfully" }));
@@ -34,4 +55,4 @@ async function initializeConnection(SM_DB_CREDENTIALS, RDS_PROXY_ENDPOINT) {
     }
 }
 
-module.exports = { initializeConnection };
+module.exports = { initializeConnection, rotatingPassword };
