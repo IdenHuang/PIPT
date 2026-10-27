@@ -955,37 +955,6 @@ curl -X POST "https://api-id.execute-api.us-east-1.amazonaws.com/prod/student/co
 
 ## Scoring & Completion
 
-### Update Patient Score
-
-Update the patient interaction score based on LLM verdict.
-
-**Endpoint:** `POST /student/update_persona_score`
-
-**Query Parameters:**
-
-- `patient_id` (string, required): ID of the patient
-- `student_email` (string, required): Email of the student (must match token email)
-- `simulation_group_id` (string, required): ID of the simulation group
-- `llm_verdict` (boolean, required): LLM verdict — `true` sets score to 100, `false` sets to 0
-
-**Response:**
-
-```json
-{
-  "message": "Student Interaction score updated successfully."
-}
-```
-
-**Example (cURL):**
-
-```bash
-curl -X POST "https://api-id.execute-api.us-east-1.amazonaws.com/prod/student/update_patient_score?patient_id=uuid&student_email=student@example.com&simulation_group_id=uuid&llm_verdict=true" \
-  -H "Authorization: eyJraWQiOiJ..." \
-  -H "Content-Type: application/json"
-```
-
----
-
 ### Get Completion Status
 
 Get completion status for all patient interactions in a simulation group.

@@ -1300,63 +1300,6 @@ paths:
         passthroughBehavior: "when_no_match"
         httpMethod: "POST"
         type: "aws_proxy"
-  /student/update_persona_score:
-    <<: *commonOptions
-    post:
-      tags:
-        - Student
-      summary: Update patient score based on LLM verdict
-      operationId: student_update_persona_score_POST
-      parameters:
-        - in: query
-          name: patient_id
-          required: true
-          schema:
-            type: string
-          description: ID of the simulation group patient
-        - in: query
-          name: simulation_group_id
-          required: true
-          schema:
-            type: string
-          description: ID of the simulation group
-        - in: query
-          name: llm_verdict
-          required: true
-          schema:
-            type: boolean
-          description: LLM verdict to determine the score of the student interaction
-      responses:
-        "200":
-          description: Student Interaction score updated successfully
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                    example: "Student Interaction score updated successfully."
-        "400":
-          description: Bad Request
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  error:
-                    type: string
-                    example: "Invalid query parameters."
-        "500":
-          description: Internal Server Error
-      security:
-        - studentAuthorizer: []
-      x-amazon-apigateway-integration:
-        uri:
-          Fn::Sub: "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${studentFunction.Arn}/invocations"
-        passthroughBehavior: "when_no_match"
-        httpMethod: "POST"
-        type: "aws_proxy"
   /student/get_all_files:
     <<: *commonOptions
     get:
