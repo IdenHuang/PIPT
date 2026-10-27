@@ -1442,6 +1442,34 @@ async function fetchUpdatedDebrief(sessionId: string): Promise<UpdatedDebriefDat
 }
 
 /**
+ * Empty chunk2 for a debrief that finished without any DTP/Rec comparison
+ * (no submissions, no instructor answers, matching failed, or the
+ * 0-key-questions short-circuit). The debrief dialog treats chunk2 === null
+ * as "still processing", so a completed debrief must never leave it null in
+ * the live conclude flow or the dialog spins forever.
+ */
+export function emptyDebriefChunk2(): DebriefChunk2 {
+  return {
+    dtpComparison: {
+      overview: 'You identified 0 out of 0 expected drug therapy problems.',
+      matched: [],
+      missed: [],
+      additional: [],
+      score: null,
+      guidance: null,
+    },
+    recommendationsComparison: {
+      overview: 'You matched 0 out of 0 expected recommendations.',
+      matched: [],
+      missed: [],
+      additional: [],
+      score: null,
+      guidance: null,
+    },
+  };
+}
+
+/**
  * Test helper — resets the in-memory conclude submissions store.
  * Only intended for use in tests.
  */

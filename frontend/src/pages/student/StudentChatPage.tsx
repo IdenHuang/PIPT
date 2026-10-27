@@ -2,7 +2,7 @@ import { useNavigate, useParams, useLocation } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import PageContainer from '@/components/PageContainer';
 import UserAvatar from '@/components/UserAvatar';
-import { studentService, type StudentChatMessage as Message, type PatientDetail, type StudentCaseMaterial, type PatientFile, type AIDebriefData, type PersonaMedia } from '@/services/studentService';
+import { studentService, emptyDebriefChunk2, type StudentChatMessage as Message, type PatientDetail, type StudentCaseMaterial, type PatientFile, type AIDebriefData, type PersonaMedia } from '@/services/studentService';
 import { ArrowLeft, Mic, MicOff, Send, FileText, User, CheckCircle, X, Menu, Stethoscope, Flag, ChevronRight, ChevronLeft, Eye, Loader2, ArrowLeftIcon, RotateCcw} from 'lucide-react';
 import { SIMULATION_GROUP_COLOR_PALETTE, UI_COLORS } from '@/lib/colors';
 import { useState, useRef, useEffect, useCallback } from 'react';
@@ -782,6 +782,9 @@ function StudentChatPage() {
         const debrief = await studentService.fetchUpdatedDebrief(sessionId);
         setUpdatedDebriefData({
           ...debrief,
+          // fetchUpdatedDebrief only returns once the debrief is saved, so a
+          // null chunk2 means "no comparison data", not "still processing".
+          chunk2: debrief.chunk2 ?? emptyDebriefChunk2(),
           dtpSubmission: debrief.dtpSubmission ?? (dtpSubmission.length > 0 ? dtpSubmission : null),
           recommendationSubmission: debrief.recommendationSubmission ?? (recommendationSubmission.length > 0 ? recommendationSubmission : null),
         });

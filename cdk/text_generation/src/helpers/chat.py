@@ -1249,8 +1249,12 @@ def get_cached_key_questions(
 # =============================================================================
 
 
-def fetch_instructor_dtps(simulation_group_id: str, persona_id: str) -> list[dict]:
-    """Fetch instructor DTPs assigned to this group/persona from simulation_group_dtps JOIN dtp_bank."""
+def fetch_instructor_dtps(simulation_group_id: str, persona_id: str, raise_on_error: bool = False) -> list[dict]:
+    """Fetch instructor DTPs assigned to this group/persona from simulation_group_dtps JOIN dtp_bank.
+
+    With raise_on_error=True a DB failure raises instead of returning [], so
+    callers can tell "nothing assigned" apart from "could not read".
+    """
     try:
         conn = _get_db_connection()
         cursor = conn.cursor()
@@ -1274,11 +1278,17 @@ def fetch_instructor_dtps(simulation_group_id: str, persona_id: str) -> list[dic
         } for r in rows]
     except Exception as e:
         logger.error(f"Error fetching instructor DTPs: {e}")
+        if raise_on_error:
+            raise
         return []
 
 
-def fetch_instructor_recommendations(simulation_group_id: str, persona_id: str) -> list[dict]:
-    """Fetch instructor recommendations assigned to this group/persona from simulation_group_recommendations JOIN recommendations_bank."""
+def fetch_instructor_recommendations(simulation_group_id: str, persona_id: str, raise_on_error: bool = False) -> list[dict]:
+    """Fetch instructor recommendations assigned to this group/persona from simulation_group_recommendations JOIN recommendations_bank.
+
+    With raise_on_error=True a DB failure raises instead of returning [], so
+    callers can tell "nothing assigned" apart from "could not read".
+    """
     try:
         conn = _get_db_connection()
         cursor = conn.cursor()
@@ -1303,6 +1313,8 @@ def fetch_instructor_recommendations(simulation_group_id: str, persona_id: str) 
         } for r in rows]
     except Exception as e:
         logger.error(f"Error fetching instructor recommendations: {e}")
+        if raise_on_error:
+            raise
         return []
 
 
@@ -1311,16 +1323,19 @@ def cache_instructor_dtp_embeddings(
     persona_id: str,
     embeddings_model,
     table_name: str,
+    dtps: list[dict] | None = None,
 ) -> list[dict]:
     """
-    Fetch instructor DTPs from PostgreSQL, batch-embed all expected_dtp_text
-    values (one Cohere v4 call), and store in DynamoDB.
+    Fetch instructor DTPs from PostgreSQL (unless already fetched and passed
+    as `dtps`), batch-embed all expected_dtp_text values (one Cohere v4 call),
+    and store in DynamoDB with a fingerprint of the source rows.
     Returns the list of DTPs with embeddings.
     """
     from datetime import datetime, timezone
-    from decimal import Decimal
 
-    dtps = fetch_instructor_dtps(simulation_group_id, persona_id)
+    if dtps is None:
+        dtps = fetch_instructor_dtps(simulation_group_id, persona_id)
+    fingerprint = instructor_items_fingerprint(dtps)
 
     cache_key = f"DTPCACHE#{simulation_group_id}#{persona_id}"
 
@@ -1332,6 +1347,7 @@ def cache_instructor_dtp_embeddings(
             table.put_item(Item={
                 "SessionId": cache_key,
                 "items": [],
+                "fingerprint": fingerprint,
                 "cached_at": datetime.now(timezone.utc).isoformat(),
                 "expireAt": int(time.time()) + (7 * 24 * 60 * 60),
             })
@@ -1373,6 +1389,7 @@ def cache_instructor_dtp_embeddings(
         table.put_item(Item={
             "SessionId": cache_key,
             "items": serializable_items,
+            "fingerprint": fingerprint,
             "cached_at": datetime.now(timezone.utc).isoformat(),
             "expireAt": int(time.time()) + (7 * 24 * 60 * 60),
         })
@@ -1388,16 +1405,19 @@ def cache_instructor_rec_embeddings(
     persona_id: str,
     embeddings_model,
     table_name: str,
+    recs: list[dict] | None = None,
 ) -> list[dict]:
     """
-    Fetch instructor recommendations from PostgreSQL, batch-embed all
-    recommendation_text values (one Cohere v4 call), and store in DynamoDB.
+    Fetch instructor recommendations from PostgreSQL (unless already fetched
+    and passed as `recs`), batch-embed all recommendation_text values (one
+    Cohere v4 call), and store in DynamoDB with a fingerprint of the source rows.
     Returns the list of recommendations with embeddings.
     """
     from datetime import datetime, timezone
-    from decimal import Decimal
 
-    recs = fetch_instructor_recommendations(simulation_group_id, persona_id)
+    if recs is None:
+        recs = fetch_instructor_recommendations(simulation_group_id, persona_id)
+    fingerprint = instructor_items_fingerprint(recs)
 
     cache_key = f"RECCACHE#{simulation_group_id}#{persona_id}"
 
@@ -1409,6 +1429,7 @@ def cache_instructor_rec_embeddings(
             table.put_item(Item={
                 "SessionId": cache_key,
                 "items": [],
+                "fingerprint": fingerprint,
                 "cached_at": datetime.now(timezone.utc).isoformat(),
                 "expireAt": int(time.time()) + (7 * 24 * 60 * 60),
             })
@@ -1452,6 +1473,7 @@ def cache_instructor_rec_embeddings(
         table.put_item(Item={
             "SessionId": cache_key,
             "items": serializable_items,
+            "fingerprint": fingerprint,
             "cached_at": datetime.now(timezone.utc).isoformat(),
             "expireAt": int(time.time()) + (7 * 24 * 60 * 60),
         })
@@ -1466,10 +1488,13 @@ def get_cached_instructor_dtps(
     simulation_group_id: str,
     persona_id: str,
     table_name: str,
+    fingerprint: str | None = None,
 ) -> list[dict] | None:
     """
     Read cached instructor DTP embeddings from DynamoDB.
     Returns the list of DTP dicts with embeddings, or None on cache miss/failure.
+    When `fingerprint` is given, a cache entry built from different source rows
+    (or written before fingerprints existed) is treated as a miss.
     """
     cache_key = f"DTPCACHE#{simulation_group_id}#{persona_id}"
 
@@ -1481,6 +1506,9 @@ def get_cached_instructor_dtps(
         item = response.get("Item")
         if item is None:
             logger.info(f"DTP cache miss for group={simulation_group_id}, persona={persona_id}")
+            return None
+        if fingerprint is not None and item.get("fingerprint") != fingerprint:
+            logger.info(f"DTP cache stale for group={simulation_group_id}, persona={persona_id}; re-embedding")
             return None
 
         items = item.get("items", [])
@@ -1506,10 +1534,13 @@ def get_cached_instructor_recs(
     simulation_group_id: str,
     persona_id: str,
     table_name: str,
+    fingerprint: str | None = None,
 ) -> list[dict] | None:
     """
     Read cached instructor recommendation embeddings from DynamoDB.
     Returns the list of recommendation dicts with embeddings, or None on cache miss/failure.
+    When `fingerprint` is given, a cache entry built from different source rows
+    (or written before fingerprints existed) is treated as a miss.
     """
     cache_key = f"RECCACHE#{simulation_group_id}#{persona_id}"
 
@@ -1521,6 +1552,9 @@ def get_cached_instructor_recs(
         item = response.get("Item")
         if item is None:
             logger.info(f"Recommendation cache miss for group={simulation_group_id}, persona={persona_id}")
+            return None
+        if fingerprint is not None and item.get("fingerprint") != fingerprint:
+            logger.info(f"Recommendation cache stale for group={simulation_group_id}, persona={persona_id}; re-embedding")
             return None
 
         items = item.get("items", [])
@@ -1541,6 +1575,81 @@ def get_cached_instructor_recs(
     except Exception as e:
         logger.warning(f"Failed to read cached instructor recommendations from DynamoDB: {e}")
         return None
+
+
+def instructor_items_fingerprint(items: list[dict]) -> str:
+    """Stable hash of the instructor rows an embedding cache was built from.
+
+    Covers ids and every text field used in matching/grading, so assigning,
+    removing, or editing a DTP/recommendation changes the fingerprint and the
+    cached embeddings are rebuilt on the next debrief. Embedding vectors are
+    excluded (they are derived from these fields).
+    """
+    import hashlib
+
+    canonical = [
+        {k: v for k, v in sorted(item.items()) if k != "embedding"}
+        for item in items
+    ]
+    payload = json.dumps(canonical, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def load_instructor_dtps(
+    simulation_group_id: str,
+    persona_id: str,
+    embeddings_model,
+    table_name: str,
+) -> list[dict]:
+    """Return instructor DTPs with embeddings, reusing the cache only if current.
+
+    The DB is the source of truth: the cache is keyed per group+persona and
+    nothing invalidates it when an instructor assigns or edits DTPs, so it is
+    validated against a fingerprint of the current rows. If the DB read fails,
+    fall back to whatever is cached rather than overwriting it with nothing.
+    """
+    try:
+        dtps = fetch_instructor_dtps(simulation_group_id, persona_id, raise_on_error=True)
+    except Exception:
+        cached = get_cached_instructor_dtps(simulation_group_id, persona_id, table_name)
+        return cached or []
+
+    cached = get_cached_instructor_dtps(
+        simulation_group_id, persona_id, table_name,
+        fingerprint=instructor_items_fingerprint(dtps),
+    )
+    if cached is not None:
+        return cached
+    return cache_instructor_dtp_embeddings(
+        simulation_group_id, persona_id, embeddings_model, table_name, dtps=dtps
+    )
+
+
+def load_instructor_recs(
+    simulation_group_id: str,
+    persona_id: str,
+    embeddings_model,
+    table_name: str,
+) -> list[dict]:
+    """Return instructor recommendations with embeddings, reusing the cache only if current.
+
+    Same contract as load_instructor_dtps.
+    """
+    try:
+        recs = fetch_instructor_recommendations(simulation_group_id, persona_id, raise_on_error=True)
+    except Exception:
+        cached = get_cached_instructor_recs(simulation_group_id, persona_id, table_name)
+        return cached or []
+
+    cached = get_cached_instructor_recs(
+        simulation_group_id, persona_id, table_name,
+        fingerprint=instructor_items_fingerprint(recs),
+    )
+    if cached is not None:
+        return cached
+    return cache_instructor_rec_embeddings(
+        simulation_group_id, persona_id, embeddings_model, table_name, recs=recs
+    )
 
 
 # =============================================================================
@@ -4077,11 +4186,9 @@ def generate_debrief(
             try:
                 submissions = fetch_student_submissions(session_id, tracker=tracker)
                 if submissions["dtp_entries"] or submissions["rec_entries"]:
-                    cached_dtps = get_cached_instructor_dtps(simulation_group_id, persona_id, ddb_table_name)
-                    if cached_dtps is None:
-                        cached_dtps = cache_instructor_dtp_embeddings(
-                            simulation_group_id, persona_id, embeddings_model, ddb_table_name
-                        )
+                    cached_dtps = load_instructor_dtps(
+                        simulation_group_id, persona_id, embeddings_model, ddb_table_name
+                    )
                     # Detect silent DTP embed failure: student submitted DTPs but no instructor items available
                     if submissions["dtp_entries"] and not cached_dtps:
                         tracker.record(
@@ -4089,11 +4196,9 @@ def generate_debrief(
                             "returned_empty_despite_student_submissions",
                             "score_may_be_affected",
                         )
-                    cached_recs = get_cached_instructor_recs(simulation_group_id, persona_id, ddb_table_name)
-                    if cached_recs is None:
-                        cached_recs = cache_instructor_rec_embeddings(
-                            simulation_group_id, persona_id, embeddings_model, ddb_table_name
-                        )
+                    cached_recs = load_instructor_recs(
+                        simulation_group_id, persona_id, embeddings_model, ddb_table_name
+                    )
                     # Detect silent Rec embed failure: student submitted recs but no instructor items available
                     if submissions["rec_entries"] and not cached_recs:
                         tracker.record(
@@ -4439,12 +4544,10 @@ The following is the instructor's answer key for this simulation case. Compare t
             submissions = fetch_student_submissions(session_id, tracker=tracker)
 
             if submissions["dtp_entries"] or submissions["rec_entries"]:
-                # Get pre-cached instructor DTP embeddings (lazy-cache on first use)
-                cached_dtps = get_cached_instructor_dtps(simulation_group_id, persona_id, ddb_table_name)
-                if cached_dtps is None:
-                    cached_dtps = cache_instructor_dtp_embeddings(
-                        simulation_group_id, persona_id, embeddings_model, ddb_table_name
-                    )
+                # Instructor DTP embeddings (cache reused only if it matches the DB)
+                cached_dtps = load_instructor_dtps(
+                    simulation_group_id, persona_id, embeddings_model, ddb_table_name
+                )
 
                 # Detect silent DTP embed failure: student submitted DTPs but no instructor items available
                 if submissions["dtp_entries"] and not cached_dtps:
@@ -4454,12 +4557,10 @@ The following is the instructor's answer key for this simulation case. Compare t
                         "score_may_be_affected",
                     )
 
-                # Get pre-cached instructor Recommendation embeddings (lazy-cache on first use)
-                cached_recs = get_cached_instructor_recs(simulation_group_id, persona_id, ddb_table_name)
-                if cached_recs is None:
-                    cached_recs = cache_instructor_rec_embeddings(
-                        simulation_group_id, persona_id, embeddings_model, ddb_table_name
-                    )
+                # Instructor recommendation embeddings (cache reused only if it matches the DB)
+                cached_recs = load_instructor_recs(
+                    simulation_group_id, persona_id, embeddings_model, ddb_table_name
+                )
 
                 # Detect silent Rec embed failure: student submitted recs but no instructor items available
                 if submissions["rec_entries"] and not cached_recs:
