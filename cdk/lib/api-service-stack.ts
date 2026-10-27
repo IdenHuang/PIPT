@@ -2283,8 +2283,10 @@ export class ApiServiceStack extends cdk.Stack {
           source: ["aws.cloudwatch"],
           detailType: ["CloudWatch Alarm State Change"],
           resources: [timeoutAlarm.alarmArn],
+          // ALARM only: the alarm returning to OK is not a timeout and must
+          // not trigger another sweep.
           detail: {
-            state: { value: ["ALARM", "OK"] },
+            state: { value: ["ALARM"] },
           },
         },
       }
@@ -2305,6 +2307,14 @@ export class ApiServiceStack extends cdk.Stack {
         environment: {
           SM_DB_CREDENTIALS: db.secretPathUser.secretName,
           RDS_PROXY_ENDPOINT: db.rdsProxyEndpoint,
+          // The handler ignores any event not from this alarm.
+          TIMEOUT_ALARM_NAME: timeoutAlarm.alarmName,
+          // Rows younger than the ingestion timeout belong to a run that may
+          // still finish. 60s margin covers the gap between invocation start
+          // and the row being registered.
+          STUCK_AFTER_SECONDS: String(
+            (dataIngestLambdaDockerFunc.timeout ?? cdk.Duration.seconds(900)).toSeconds() - 60
+          ),
         },
         functionName: `${id}-TimeoutHandlerLambda`,
         layers: [psycopgLayer, powertoolsLayer],
