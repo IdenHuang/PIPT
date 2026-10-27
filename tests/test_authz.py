@@ -46,6 +46,7 @@ class FakeCursor:
             CHAT: (PERSONA, GROUP, STUDENT),
             OTHER_CHAT: (PERSONA, GROUP, OTHER_STUDENT),
         }
+        self.concluded = set()
         self.executed = []
         self._row = None
 
@@ -63,6 +64,8 @@ class FakeCursor:
             return (group, email) in self.instructors
         if 'FROM "personas"' in sql:
             return tuple(params) in self.personas
+        if 'FROM "chats"' in sql and "status = 'concluded'" in sql:
+            return params[0] in self.concluded
         if 'FROM "chats"' in sql:
             chat = self.chats.get(params[0])
             if chat is None:
@@ -124,6 +127,34 @@ def test_admin_still_needs_consistent_ids():
 )
 def test_own_session_with_foreign_persona_or_group_is_denied(persona, group):
     d = decide(persona=persona, group=group)
+    assert not d.allowed and d.status_code == 403
+
+
+# ── Concluded sessions ─────────────────────────────────────────
+
+def concluded_cursor():
+    cur = FakeCursor()
+    cur.concluded.add(CHAT)
+    return cur
+
+
+@pytest.mark.parametrize("email", [STUDENT, ADMIN])
+@pytest.mark.parametrize("mode", ["chat", "unknown_mode"])
+def test_chat_on_concluded_session_is_409(mode, email):
+    d = decide(mode=mode, email=email, cur=concluded_cursor())
+    assert not d.allowed and d.status_code == 409
+
+
+@pytest.mark.parametrize("mode", ["match", "debrief"])
+def test_post_conclude_modes_still_allowed(mode):
+    assert decide(mode=mode, cur=concluded_cursor()).allowed
+
+
+def test_concluded_check_does_not_bypass_ownership():
+    """Another user's concluded session is still a 403, not a 409 status leak."""
+    cur = FakeCursor()
+    cur.concluded.add(OTHER_CHAT)
+    d = decide(session=OTHER_CHAT, cur=cur)
     assert not d.allowed and d.status_code == 403
 
 

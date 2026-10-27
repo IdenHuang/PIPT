@@ -745,7 +745,7 @@ exports.handler = async (event, context) => {
             // never the caller-supplied simulation_group_id. Fail closed if the
             // chat cannot be resolved to a group.
             const groupSettings = await sqlConnection`
-              SELECT sg.max_messages_per_chat
+              SELECT sg.max_messages_per_chat, c.status AS chat_status
               FROM "chats" c
               JOIN "student_interactions" si ON si.student_interaction_id = c.student_interaction_id
               JOIN "enrollments" e ON e.enrollment_id = si.enrollment_id
@@ -755,6 +755,13 @@ exports.handler = async (event, context) => {
             if (groupSettings.length === 0) {
               response.statusCode = 403;
               response.body = JSON.stringify({ error: "Forbidden" });
+              break;
+            }
+            // A concluded chat is read-only: the debrief has been graded, so new
+            // turns must not be appended (security finding f-7d966e0e).
+            if (groupSettings[0].chat_status === 'concluded') {
+              response.statusCode = 409;
+              response.body = JSON.stringify({ error: "Session already concluded." });
               break;
             }
             // NULL cap on an existing group means "unlimited" (see adminFunction.js)
@@ -1690,6 +1697,9 @@ exports.handler = async (event, context) => {
             // dtp_submission and recommendation_submission are null for interview_practice
             // patients (no modal step). For full_assessment patients, they contain the
             // structured entries the debrief Lambda will match against instructor items.
+            // Conclude is one-way: the status precondition makes the transition atomic,
+            // so a concluded chat cannot be re-concluded to generate a fresh debrief
+            // after the student has read the graded one (security finding f-7d966e0e).
             const updatedChat = await sqlConnection`
               UPDATE "chats"
               SET recommendation = ${recommendation},
@@ -1699,12 +1709,15 @@ exports.handler = async (event, context) => {
                   status = 'concluded',
                   last_accessed = CURRENT_TIMESTAMP
               WHERE chat_id = ${sessionId}
+                AND status IS DISTINCT FROM 'concluded'
               RETURNING *;
             `;
 
             if (updatedChat.length === 0) {
-              response.statusCode = 404;
-              response.body = JSON.stringify({ error: "Session not found." });
+              // sessionBinding above proved the chat exists, so no row means it
+              // was already concluded.
+              response.statusCode = 409;
+              response.body = JSON.stringify({ error: "Session already concluded." });
               break;
             }
 
