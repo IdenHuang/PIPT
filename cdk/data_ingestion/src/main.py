@@ -23,6 +23,10 @@ REGION = os.environ["REGION"]
 DATA_INGESTION_BUCKET = os.environ["BUCKET"]
 EMBEDDING_BUCKET_NAME = os.environ["EMBEDDING_BUCKET_NAME"]
 RDS_PROXY_ENDPOINT = os.environ["RDS_PROXY_ENDPOINT"]
+# RDS Proxy presents an ACM certificate; verify it (and the hostname) against
+# the Amazon Trust Services roots in the OS trust store.
+# https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.howitworks.html#rds-proxy-security.tls
+DB_SSL_ROOT_CERT = os.environ.get("PGSSLROOTCERT", "/etc/pki/tls/certs/ca-bundle.crt")
 EMBEDDING_MODEL_PARAM = os.environ["EMBEDDING_MODEL_PARAM"]
 
 # AWS Clients
@@ -97,7 +101,8 @@ def _open_connection():
             'password': secret["password"],
             'host': RDS_PROXY_ENDPOINT,
             'port': secret["port"],
-            'sslmode': 'require'
+            'sslmode': 'verify-full',
+            'sslrootcert': DB_SSL_ROOT_CERT,
         }
         conn = psycopg2.connect(**connection_params)
         conn.autocommit = True

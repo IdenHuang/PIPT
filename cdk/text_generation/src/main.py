@@ -57,6 +57,10 @@ def _get_cors_origin(event):
     # Fallback: return first allowed origin (won't match but is safe)
     return _ALLOWED_ORIGINS[0]
 RDS_PROXY_ENDPOINT = os.environ["RDS_PROXY_ENDPOINT"]
+# RDS Proxy presents an ACM certificate; verify it (and the hostname) against
+# the Amazon Trust Services roots in the OS trust store.
+# https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.howitworks.html#rds-proxy-security.tls
+DB_SSL_ROOT_CERT = os.environ.get("PGSSLROOTCERT", "/etc/pki/tls/certs/ca-bundle.crt")
 BEDROCK_LLM_PARAM = os.environ["BEDROCK_LLM_PARAM"]
 EMBEDDING_MODEL_PARAM = os.environ["EMBEDDING_MODEL_PARAM"]
 TABLE_NAME_PARAM = os.environ["TABLE_NAME_PARAM"]
@@ -209,7 +213,8 @@ def _open_connection():
             user=secret["username"],
             password=secret["password"],
             autocommit=True,
-            sslmode="require",
+            sslmode="verify-full",
+            sslrootcert=DB_SSL_ROOT_CERT,
         )
 
     try:

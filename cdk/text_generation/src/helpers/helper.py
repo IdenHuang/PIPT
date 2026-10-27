@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional
 
 from langchain_aws import BedrockEmbeddings
@@ -7,6 +8,11 @@ from langchain_postgres import PGVector
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# RDS Proxy presents an ACM certificate; verify it (and the hostname) against
+# the Amazon Trust Services roots in the OS trust store.
+# https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.howitworks.html#rds-proxy-security.tls
+DB_SSL_ROOT_CERT = os.environ.get("PGSSLROOTCERT", "/etc/pki/tls/certs/ca-bundle.crt")
 
 def get_vectorstore(
     collection_name: str, 
@@ -35,6 +41,7 @@ def get_vectorstore(
     try:
         connection_string = (
             f"postgresql+psycopg://{user}:{password}@{host}:{port}/{dbname}"
+            f"?sslmode=verify-full&sslrootcert={DB_SSL_ROOT_CERT}"
         )
 
         logger.info("Initializing the VectorStore")

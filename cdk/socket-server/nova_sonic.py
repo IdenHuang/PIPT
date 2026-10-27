@@ -192,6 +192,11 @@ class AudioGate:
             self._pending_bytes += len(b64)
         return False
 
+# RDS Proxy presents an ACM certificate; verify it (and the hostname) against
+# the OS trust store. The Dockerfile points PGSSLROOTCERT at Alpine's bundle.
+# https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.howitworks.html#rds-proxy-security.tls
+DB_SSL_ROOT_CERT = os.environ.get("PGSSLROOTCERT", "/etc/ssl/certs/ca-certificates.crt")
+
 # Connection pool for better performance
 pg_conn_pool = None
 from threading import Lock
@@ -231,7 +236,8 @@ def get_pg_connection():
                 database=secret['dbname'],
                 user=secret['username'],
                 password=secret['password'],
-                sslmode='require'
+                sslmode='verify-full',
+                sslrootcert=DB_SSL_ROOT_CERT,
             )
         
         return pg_conn_pool.getconn()
@@ -884,7 +890,10 @@ VOICE MODE OVERRIDE (IMPORTANT):
                                     embeddings = BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0", client=bedrock_client)
                                     
                                     # Connect to vectorstore
-                                    connection_string = f"postgresql://{secret['username']}:{secret['password']}@{rds_endpoint}:{secret['port']}/{secret['dbname']}"
+                                    connection_string = (
+                                        f"postgresql://{secret['username']}:{secret['password']}@{rds_endpoint}:{secret['port']}/{secret['dbname']}"
+                                        f"?sslmode=verify-full&sslrootcert={DB_SSL_ROOT_CERT}"
+                                    )
                                     vectorstore = PGVector(embedding_function=embeddings, collection_name=self.patient_id or 'default', connection_string=connection_string)
                                     
                                     # Search for relevant documents
