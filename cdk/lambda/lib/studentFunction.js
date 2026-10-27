@@ -937,13 +937,31 @@ exports.handler = async (event, context) => {
             break;
           }
 
-          // Read optional enrollment_type, default to 'student'
-          const VALID_ENROLLMENT_TYPES = ['student', 'preview'];
-          const enrollment_type = VALID_ENROLLMENT_TYPES.includes(event.queryStringParameters.enrollment_type)
-            ? event.queryStringParameters.enrollment_type
-            : 'student';
-
           try {
+            // Determine enrollment_type on the server. A 'preview' enrollment is hidden
+            // from instructor rosters/analytics and from delete_student, so it is only
+            // granted to callers whose DB roles include instructor or admin (the DB is the
+            // source of truth, as in instructorFunction.js). Anyone else asking for a
+            // preview is rejected; every other request becomes a normal 'student' row.
+            let enrollment_type = 'student';
+            if (event.queryStringParameters.enrollment_type === 'preview') {
+              const callerRolesResult = userEmailAttribute
+                ? await sqlConnection`
+                    SELECT roles FROM "users" WHERE user_email = ${userEmailAttribute} LIMIT 1;
+                  `
+                : [];
+              const callerRoles = callerRolesResult[0]?.roles || [];
+              if (!callerRoles.includes('instructor') && !callerRoles.includes('admin')) {
+                logger.warn("Forbidden: preview enrollment requested without instructor/admin role", {
+                  userEmailAttribute,
+                });
+                response.statusCode = 403;
+                response.body = JSON.stringify({ error: "Forbidden" });
+                break;
+              }
+              enrollment_type = 'preview';
+            }
+
             // Step 1: Retrieve the user ID using the student_email
             const userResult = await sqlConnection`
                   SELECT user_id
