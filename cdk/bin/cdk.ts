@@ -14,6 +14,7 @@ import {
 import { TurnServerStack } from "../lib/turn-server-stack";
 import { CICDStack } from "../lib/cicd-stack";
 import { CloudFrontWafStack } from "../lib/cloudfront-waf-stack";
+import { AuditTrailStack } from "../lib/audit-trail-stack";
 
 const app = new cdk.App();
 
@@ -156,3 +157,11 @@ cdk.Tags.of(apiStack).add("Project", StackPrefix);
 cdk.Tags.of(turnServerStack).add("Project", StackPrefix);
 cdk.Tags.of(dbFlowStack).add("Project", StackPrefix);
 cdk.Tags.of(amplifyStack).add("Project", StackPrefix);
+
+// Optional CloudTrail trail. Off by default because most accounts already have
+// an organization or Control Tower trail, and a second copy is billed.
+// Enable with: cdk deploy -c EnableCloudTrail=true
+if (String(app.node.tryGetContext("EnableCloudTrail")) === "true") {
+  const auditTrailStack = new AuditTrailStack(app, `${StackPrefix}-AuditTrail`, { env });
+  cdk.Tags.of(auditTrailStack).add("Project", StackPrefix);
+}

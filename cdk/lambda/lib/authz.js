@@ -5,7 +5,32 @@
  *
  * Provides helper functions to verify resource ownership before allowing access.
  * All functions follow a fail-closed pattern: any database error returns { authorized: false }.
+ *
+ * Every denial is logged as a structured AUTHZ_DENY line (see logDenial), so
+ * ownership-check failures, the main signal of IDOR probing, can be searched
+ * and alarmed on in CloudWatch. Database errors are logged at ERROR level so
+ * an outage is not mistaken for ordinary 403s.
  */
+
+const logger = require("./logger");
+
+/**
+ * Logs one authorization denial.
+ *
+ * @param {string} check - Name of the helper that denied (e.g. "verifySessionOwnership")
+ * @param {"not_authorized"|"invalid_input"|"error"} reason
+ * @param {object} details - Actor email and the target identifiers; never request content
+ * @param {Error} [error] - Set when the denial is caused by a failure, not a missing grant
+ */
+function logDenial(check, reason, details, error) {
+  const data = { check, reason, ...details };
+  if (error) {
+    // Message only: stacks and SQL text are not needed to triage and may carry values.
+    logger.error("AUTHZ_DENY", { ...data, error: error.message });
+  } else {
+    logger.warn("AUTHZ_DENY", data);
+  }
+}
 
 /**
  * Verify that the authenticated user owns the given chat session.
@@ -31,8 +56,10 @@ async function verifySessionOwnership(sqlConnection, sessionId, userEmail) {
     if (result.length > 0) {
       return { authorized: true, userId: result[0].user_id };
     }
+    logDenial("verifySessionOwnership", "not_authorized", { userEmail, sessionId });
     return { authorized: false };
   } catch (error) {
+    logDenial("verifySessionOwnership", "error", { userEmail, sessionId }, error);
     return { authorized: false };
   }
 }
@@ -73,8 +100,12 @@ async function verifyGroupOwnership(sqlConnection, simulationGroupId, userEmail)
         );
     `;
 
+    if (result.length === 0) {
+      logDenial("verifyGroupOwnership", "not_authorized", { userEmail, simulationGroupId });
+    }
     return { authorized: result.length > 0 };
   } catch (error) {
+    logDenial("verifyGroupOwnership", "error", { userEmail, simulationGroupId }, error);
     return { authorized: false };
   }
 }
@@ -100,8 +131,10 @@ async function verifyEnrollment(sqlConnection, simulationGroupId, userEmail) {
     if (result.length > 0) {
       return { authorized: true, enrollmentId: result[0].enrollment_id };
     }
+    logDenial("verifyEnrollment", "not_authorized", { userEmail, simulationGroupId });
     return { authorized: false };
   } catch (error) {
+    logDenial("verifyEnrollment", "error", { userEmail, simulationGroupId }, error);
     return { authorized: false };
   }
 }
@@ -128,8 +161,12 @@ async function verifyPersonaEnrollment(sqlConnection, personaId, userEmail) {
         AND u.user_email = ${userEmail};
     `;
 
+    if (result.length === 0) {
+      logDenial("verifyPersonaEnrollment", "not_authorized", { userEmail, personaId });
+    }
     return { authorized: result.length > 0 };
   } catch (error) {
+    logDenial("verifyPersonaEnrollment", "error", { userEmail, personaId }, error);
     return { authorized: false };
   }
 }
@@ -161,8 +198,12 @@ async function verifySessionScope(sqlConnection, sessionId, personaId, simulatio
         AND u.user_email = ${userEmail};
     `;
 
+    if (result.length === 0) {
+      logDenial("verifySessionScope", "not_authorized", { userEmail, sessionId, personaId, simulationGroupId });
+    }
     return { authorized: result.length > 0 };
   } catch (error) {
+    logDenial("verifySessionScope", "error", { userEmail, sessionId, personaId, simulationGroupId }, error);
     return { authorized: false };
   }
 }
@@ -206,8 +247,12 @@ async function verifyPersonaOwnership(sqlConnection, personaId, userEmail) {
         );
     `;
 
+    if (result.length === 0) {
+      logDenial("verifyPersonaOwnership", "not_authorized", { userEmail, personaId });
+    }
     return { authorized: result.length > 0 };
   } catch (error) {
+    logDenial("verifyPersonaOwnership", "error", { userEmail, personaId }, error);
     return { authorized: false };
   }
 }
@@ -257,8 +302,12 @@ async function verifyOrganizationMembership(sqlConnection, organizationId, userE
         );
     `;
 
+    if (result.length === 0) {
+      logDenial("verifyOrganizationMembership", "not_authorized", { userEmail, organizationId });
+    }
     return { authorized: result.length > 0 };
   } catch (error) {
+    logDenial("verifyOrganizationMembership", "error", { userEmail, organizationId }, error);
     return { authorized: false };
   }
 }
@@ -350,10 +399,14 @@ async function resolveParentId(sqlConnection, kind, childId) {
         `;
         break;
       default:
+        logDenial("resolveParentId", "invalid_input", { kind, childId });
         return null;
     }
+    // A missing row is not logged here: the caller decides whether it is a
+    // denial (non-admins) or a 404 (admins), and logs accordingly.
     return rows.length > 0 && rows[0].parent_id ? rows[0].parent_id : null;
   } catch (error) {
+    logDenial("resolveParentId", "error", { kind, childId }, error);
     return null;
   }
 }
@@ -401,20 +454,27 @@ const ORG_SCOPED_BANK_QUERIES = Object.freeze({
  * @returns {Promise<{authorized: boolean}>}
  */
 async function verifyBankItemsInGroupOrganization(sqlConnection, kind, itemIds, simulationGroupId) {
+  const check = "verifyBankItemsInGroupOrganization";
   const query = ORG_SCOPED_BANK_QUERIES[kind];
   if (!query || !Array.isArray(itemIds) || itemIds.length === 0) {
+    logDenial(check, "invalid_input", { kind, simulationGroupId });
     return { authorized: false };
   }
   if (!itemIds.every((id) => typeof id === "string" && id.length > 0)) {
+    logDenial(check, "invalid_input", { kind, simulationGroupId });
     return { authorized: false };
   }
   try {
     for (const itemId of new Set(itemIds)) {
       const rows = await query(sqlConnection, itemId, simulationGroupId);
-      if (rows.length === 0) return { authorized: false };
+      if (rows.length === 0) {
+        logDenial(check, "not_authorized", { kind, itemId, simulationGroupId });
+        return { authorized: false };
+      }
     }
     return { authorized: true };
   } catch (error) {
+    logDenial(check, "error", { kind, simulationGroupId }, error);
     return { authorized: false };
   }
 }
@@ -449,12 +509,19 @@ async function verifyQuestionsAttachableToGroup(
   userEmail,
   callerIsAdmin
 ) {
+  const check = "verifyQuestionsAttachableToGroup";
   if (!Array.isArray(questionIds) || questionIds.length === 0) {
+    logDenial(check, "invalid_input", { userEmail, simulationGroupId });
     return { authorized: false };
   }
   if (!questionIds.every((id) => typeof id === "string" && id.length > 0)) {
+    logDenial(check, "invalid_input", { userEmail, simulationGroupId });
     return { authorized: false };
   }
+  const deny = (questionId) => {
+    logDenial(check, "not_authorized", { userEmail, questionId, simulationGroupId });
+    return { authorized: false };
+  };
   try {
     // Organizations already confirmed for an org-less group, so a batch of
     // questions from the same organization costs one membership lookup.
@@ -467,23 +534,24 @@ async function verifyQuestionsAttachableToGroup(
         WHERE q.question_id = ${questionId}
           AND sg.simulation_group_id = ${simulationGroupId};
       `;
-      if (rows.length === 0) return { authorized: false };
+      if (rows.length === 0) return deny(questionId);
 
       const { question_org: questionOrg, group_org: groupOrg } = rows[0];
-      if (!questionOrg) return { authorized: false };
+      if (!questionOrg) return deny(questionId);
 
       if (groupOrg) {
-        if (groupOrg !== questionOrg) return { authorized: false };
+        if (groupOrg !== questionOrg) return deny(questionId);
         continue;
       }
 
       if (callerIsAdmin === true || memberOrgs.has(questionOrg)) continue;
       const membership = await verifyOrganizationMembership(sqlConnection, questionOrg, userEmail);
-      if (!membership.authorized) return { authorized: false };
+      if (!membership.authorized) return deny(questionId);
       memberOrgs.add(questionOrg);
     }
     return { authorized: true };
   } catch (error) {
+    logDenial(check, "error", { userEmail, simulationGroupId }, error);
     return { authorized: false };
   }
 }
@@ -508,6 +576,8 @@ async function isAdmin(sqlConnection, userEmail) {
     }
     return false;
   } catch (error) {
+    // A non-admin result is normal and not logged; only the failure is.
+    logDenial("isAdmin", "error", { userEmail }, error);
     return false;
   }
 }

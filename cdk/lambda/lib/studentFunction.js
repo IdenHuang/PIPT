@@ -35,7 +35,14 @@ exports.handler = async (event, context) => {
     (userEmail && userEmail !== userEmailAttribute);
 
   if (isUnauthorized) {
-    logger.warn("Unauthorized access attempt", { queryEmail, studentEmail, userEmail, userEmailAttribute });
+    logger.warn("AUTHZ_DENY", {
+      check: "emailParamMatchesToken",
+      reason: "not_authorized",
+      queryEmail,
+      studentEmail,
+      userEmail,
+      userEmailAttribute,
+    });
     return {
       statusCode: 401,
       headers: getCorsHeaders(event),
@@ -1457,6 +1464,12 @@ exports.handler = async (event, context) => {
             `;
 
             if (ownerCheck.length === 0) {
+              logger.warn("AUTHZ_DENY", {
+                check: "chatOwnership",
+                reason: "not_authorized",
+                userEmail: userEmailAttribute,
+                sessionId,
+              });
               response.statusCode = 403;
               response.body = JSON.stringify({
                 error: "Forbidden: you do not have access to this chat.",
@@ -1608,6 +1621,14 @@ exports.handler = async (event, context) => {
                 AND e.simulation_group_id = ${simulationGroupId};
             `;
             if (sessionBinding.length === 0) {
+              logger.warn("AUTHZ_DENY", {
+                check: "sessionBinding",
+                reason: "not_authorized",
+                userEmail: userEmailAttribute,
+                sessionId,
+                personaId: patientId,
+                simulationGroupId,
+              });
               response.statusCode = 403;
               response.body = JSON.stringify({ error: "Forbidden" });
               break;

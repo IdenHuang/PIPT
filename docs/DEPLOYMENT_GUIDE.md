@@ -581,6 +581,8 @@ cdk deploy --all \
 
 > **First deploy to a brand-new AWS account?** If this account has never used RDS before, add `-c createRdsServiceLinkedRole=true` to the command above. This creates the required `AWSServiceRoleForRDS` service-linked role. Omit this flag on subsequent deploys or if the account already has RDS resources.
 
+> **Audit logging and CloudTrail.** Every deploy turns on API Gateway access logs (`/aws/apigateway/<StackPrefix>-Api-API/access`), WAF request logs (`aws-waf-logs-*` log groups; the CloudFront one is in `us-east-1`), and S3 server access and CloudFront standard logs (the `<StackPrefix>-Api-AccessLogsBucket*` bucket). Lambda handlers write structured `AUDIT` lines for every POST/PUT/DELETE and `AUTHZ_DENY` lines for every authorization denial. Query them with CloudWatch Logs Insights (`filter message = "AUTHZ_DENY"`). The `<StackPrefix>-Api-Authorization-Denial-Spike` alarm fires on more than 50 denials in 5 minutes. All of these use the same retention as the other log groups. The project doesn't create a CloudTrail trail by default, because accounts managed by AWS Organizations or Control Tower already have one, and a second copy of management events is billed. If your account has no trail (check with `aws cloudtrail describe-trails --include-shadow-trails`), add `-c EnableCloudTrail=true` to deploy the `<StackPrefix>-AuditTrail` stack.
+
 #### Option B: Deploy Individual Stacks (Incremental Updates)
 
 Stacks deploy in dependency order. If you only need to update a specific stack:

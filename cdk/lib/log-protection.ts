@@ -3,6 +3,7 @@ import * as iam from "aws-cdk-lib/aws-iam";
 import * as kms from "aws-cdk-lib/aws-kms";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as logs from "aws-cdk-lib/aws-logs";
+import * as wafv2 from "aws-cdk-lib/aws-wafv2";
 import { Construct } from "constructs";
 
 /**
@@ -113,4 +114,49 @@ export class LogProtection extends Construct {
     );
     return key;
   }
+}
+
+/**
+ * Sends every request a WAF web ACL evaluates to an encrypted CloudWatch log
+ * group with finite retention.
+ *
+ * The authorization and cookie headers and the query string are redacted:
+ * they carry bearer tokens, signed-URL signatures and access codes. WAF
+ * creates the log group resource policy for log delivery itself.
+ * https://docs.aws.amazon.com/waf/latest/developerguide/logging-cw-logs.html
+ *
+ * @param logGroupName - Must start with "aws-waf-logs-" (a WAF requirement)
+ */
+export function logWebAclToCloudWatch(
+  scope: Construct,
+  id: string,
+  webAcl: wafv2.CfnWebACL,
+  logGroupName: string,
+  logProtection: LogProtection
+): wafv2.CfnLoggingConfiguration {
+  if (!logGroupName.startsWith("aws-waf-logs-")) {
+    throw new Error(`WAF log group name must start with "aws-waf-logs-": ${logGroupName}`);
+  }
+  const logGroup = new logs.LogGroup(scope, `${id}-LogGroup`, {
+    logGroupName,
+    retention: logProtection.retention,
+    encryptionKey: logProtection.encryptionKey,
+    removalPolicy: cdk.RemovalPolicy.RETAIN,
+  });
+  // WAF rejects the ":*"-suffixed ARN that logGroup.logGroupArn returns.
+  const logGroupArn = cdk.Stack.of(scope).formatArn({
+    service: "logs",
+    resource: "log-group",
+    resourceName: logGroup.logGroupName,
+    arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME,
+  });
+  return new wafv2.CfnLoggingConfiguration(scope, id, {
+    resourceArn: webAcl.attrArn,
+    logDestinationConfigs: [logGroupArn],
+    redactedFields: [
+      { singleHeader: { Name: "authorization" } },
+      { singleHeader: { Name: "cookie" } },
+      { queryString: {} },
+    ],
+  });
 }

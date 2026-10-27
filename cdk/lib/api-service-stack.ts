@@ -35,7 +35,7 @@ import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ses from "aws-cdk-lib/aws-ses";
 import * as route53 from "aws-cdk-lib/aws-route53";
-import { LogProtection } from "./log-protection";
+import { LogProtection, logWebAclToCloudWatch } from "./log-protection";
 import { getImageTagSsmParam } from "./cicd-stack";
 import { approvedImageTag } from "./approved-image";
 
@@ -124,6 +124,33 @@ export class ApiServiceStack extends cdk.Stack {
     const allowedOriginsEnv = allowedOrigins.join(",");
     this.allowedOriginsEnv = allowedOriginsEnv;
 
+    // Finite retention + CMK encryption for every log group in this stack.
+    // Each Lambda writes to a new encrypted group; its original unencrypted
+    // group gets the same retention (expireLegacyLambdaLogGroups below).
+    const logProtection = new LogProtection(this, `${id}-LogProtection`);
+
+    // Receives S3 server access logs and CloudFront standard logs for this
+    // stack. SSE-S3, not KMS: S3 server access logging cannot deliver to a
+    // bucket with SSE-KMS default encryption. ACLs stay enabled
+    // (BUCKET_OWNER_PREFERRED) because CloudFront standard logging delivers
+    // with an ACL grant. Logs expire with the same retention as CloudWatch.
+    // https://docs.aws.amazon.com/AmazonS3/latest/userguide/enable-server-access-logging.html
+    // https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/standard-logging-legacy-s3.html
+    const accessLogsBucket = new s3.Bucket(this, `${id}-AccessLogsBucket`, {
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      versioned: true,
+      objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_PREFERRED,
+      lifecycleRules: [
+        {
+          expiration: cdk.Duration.days(logProtection.retention),
+          noncurrentVersionExpiration: cdk.Duration.days(30),
+        },
+      ],
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
     const embeddingStorageBucket = new s3.Bucket(
       this,
       `${id}-embeddingStorageBucket`,
@@ -145,6 +172,8 @@ export class ApiServiceStack extends cdk.Stack {
         // When deleting the stack, need to empty the Bucket and delete it manually
         removalPolicy: cdk.RemovalPolicy.RETAIN,
         enforceSSL: true,
+        serverAccessLogsBucket: accessLogsBucket,
+        serverAccessLogsPrefix: "s3/embedding-storage/",
       }
     );
 
@@ -430,6 +459,18 @@ export class ApiServiceStack extends cdk.Stack {
 
     const data = Fn.transform("AWS::Include", { Location: asset.s3ObjectUrl });
 
+    // Per-request access log for the REST API: who called what, from where,
+    // and with what result. Uses the resource template path ($context.resourcePath)
+    // and no query string, so IDs, emails and access codes in the URL are not
+    // recorded. dataTraceEnabled stays off below because it logs full bodies.
+    // https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-logging.html
+    const apiAccessLogGroup = new logs.LogGroup(this, `${id}-ApiAccessLogs`, {
+      logGroupName: `/aws/apigateway/${id}-API/access`,
+      retention: logProtection.retention,
+      encryptionKey: logProtection.encryptionKey,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
     // Create the API Gateway REST API
     this.api = new apigateway.SpecRestApi(this, `${id}-APIGateway`, {
       apiDefinition: apigateway.AssetApiDefinition.fromInline(data),
@@ -442,6 +483,28 @@ export class ApiServiceStack extends cdk.Stack {
         loggingLevel: apigateway.MethodLoggingLevel.ERROR,
         dataTraceEnabled: false,
         stageName: "prod",
+        accessLogDestination: new apigateway.LogGroupLogDestination(apiAccessLogGroup),
+        accessLogFormat: apigateway.AccessLogFormat.custom(
+          JSON.stringify({
+            requestId: "$context.requestId",
+            extendedRequestId: "$context.extendedRequestId",
+            requestTime: "$context.requestTime",
+            sourceIp: "$context.identity.sourceIp",
+            userAgent: "$context.identity.userAgent",
+            principalId: "$context.authorizer.principalId",
+            httpMethod: "$context.httpMethod",
+            resourcePath: "$context.resourcePath",
+            protocol: "$context.protocol",
+            status: "$context.status",
+            responseLength: "$context.responseLength",
+            responseLatency: "$context.responseLatency",
+            integrationStatus: "$context.integration.status",
+            authorizerStatus: "$context.authorizer.status",
+            authorizerError: "$context.authorizer.error",
+            wafStatus: "$context.waf.status",
+            errorMessage: "$context.error.message",
+          })
+        ),
         methodOptions: {
           "/*/*": {
             throttlingRateLimit: 100,
@@ -655,11 +718,6 @@ export class ApiServiceStack extends cdk.Stack {
       ec2.Port.tcp(5432),
       "Allow API Lambda functions to access RDS Proxy"
     );
-
-    // Finite retention + CMK encryption for every Lambda log group in this stack.
-    // Each function writes to a new encrypted group; its original unencrypted
-    // group gets the same retention (expireLegacyLambdaLogGroups below).
-    const logProtection = new LogProtection(this, `${id}-LogProtection`);
 
     const lambdaStudentFunction = new lambda.Function(
       this,
@@ -1902,6 +1960,8 @@ export class ApiServiceStack extends cdk.Stack {
         // When deleting the stack, need to empty the Bucket and delete it manually
         removalPolicy: cdk.RemovalPolicy.RETAIN,
         enforceSSL: true,
+        serverAccessLogsBucket: accessLogsBucket,
+        serverAccessLogsPrefix: "s3/data-ingestion/",
       }
     );
 
@@ -2000,6 +2060,12 @@ export class ApiServiceStack extends cdk.Stack {
           responseHeadersPolicy: docsCorsHeadersPolicy,
         },
         ...(cloudFrontWafArn && { webAclId: cloudFrontWafArn }),
+        // Standard logs record each viewer request. They include the query
+        // string, i.e. signed-URL signatures, which expire after 5-15 minutes.
+        enableLogging: true,
+        logBucket: accessLogsBucket,
+        logFilePrefix: "cloudfront/docs/",
+        logIncludesCookies: false,
       }
     );
 
@@ -2726,6 +2792,45 @@ export class ApiServiceStack extends cdk.Stack {
       deleteLastMessage,
     ]);
 
+    // Authorization denials: every AUTHZ_DENY line (authz.js helpers and the
+    // handler-level role/email checks) is counted into one metric, and a burst
+    // raises an alarm. A run of ownership failures is the signature of
+    // ID-guessing (IDOR) probes. Look up the actor and targets with Logs
+    // Insights: filter message = "AUTHZ_DENY".
+    const authzDenialMetricNamespace = `${id}/Security`;
+    const authzDenialMetricName = "AuthorizationDenials";
+    const authzLoggingFunctions: [string, lambda.Function][] = [
+      ["Student", lambdaStudentFunction],
+      ["Instructor", lambdaInstructorFunction],
+      ["Admin", lambdaAdminFunction],
+      ["TextStreamAuthz", textStreamAuthzFunction],
+    ];
+    for (const [name, fn] of authzLoggingFunctions) {
+      new logs.MetricFilter(this, `${id}-${name}AuthzDenyMetricFilter`, {
+        logGroup: fn.logGroup,
+        metricNamespace: authzDenialMetricNamespace,
+        metricName: authzDenialMetricName,
+        filterPattern: logs.FilterPattern.stringValue("$.message", "=", "AUTHZ_DENY"),
+        metricValue: "1",
+        defaultValue: 0,
+      });
+    }
+    new cloudwatch.Alarm(this, `${id}-AuthzDenialSpikeAlarm`, {
+      alarmName: `${id}-Authorization-Denial-Spike`,
+      alarmDescription:
+        "More than 50 authorization denials in 5 minutes across the student, instructor, admin and text-stream handlers. Possible IDOR / enumeration attempt; query AUTHZ_DENY in Logs Insights.",
+      metric: new cloudwatch.Metric({
+        namespace: authzDenialMetricNamespace,
+        metricName: authzDenialMetricName,
+        period: cdk.Duration.minutes(5),
+        statistic: "Sum",
+      }),
+      threshold: 50,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
     // Grant access to Secret Manager: app_rw credential only
     deleteLastMessage.addToRolePolicy(
       new iam.PolicyStatement({
@@ -2884,6 +2989,10 @@ export class ApiServiceStack extends cdk.Stack {
       resourceArn: this.appSyncApi.arn,
       webAclArn: waf.attrArn,
     });
+
+    // Full WAF request log (every request, with the rule that matched), instead
+    // of only the sampled requests kept for three hours.
+    logWebAclToCloudWatch(this, `${id}-WafLogging`, waf, `aws-waf-logs-${id}-api`, logProtection);
 
     // Export outputs for frontend configuration
     new cdk.CfnOutput(this, 'ApiEndpoint', {

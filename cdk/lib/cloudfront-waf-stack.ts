@@ -1,6 +1,7 @@
 import * as cdk from "aws-cdk-lib";
 import * as wafv2 from "aws-cdk-lib/aws-wafv2";
 import { Construct } from "constructs";
+import { LogProtection, logWebAclToCloudWatch } from "./log-protection";
 
 /**
  * CloudFront WAF stack — must be deployed in us-east-1.
@@ -106,6 +107,17 @@ export class CloudFrontWafStack extends cdk.Stack {
     });
 
     this.webAclArn = webAcl.attrArn;
+
+    // Full request log for the CloudFront web ACL. CLOUDFRONT-scope WAF logs
+    // must go to us-east-1, which is where this stack is deployed.
+    const logProtection = new LogProtection(this, `${id}-LogProtection`);
+    logWebAclToCloudWatch(
+      this,
+      `${id}-WafLogging`,
+      webAcl,
+      `aws-waf-logs-${id}`,
+      logProtection
+    );
 
     new cdk.CfnOutput(this, "CloudFrontWafArn", {
       value: webAcl.attrArn,

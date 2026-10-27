@@ -16,6 +16,8 @@
  *   logger.init(event, context);
  *   logger.info("Processing request", { route: "GET /admin/instructors" });
  *   logger.error("Query failed", { error: err.message, stack: err.stack });
+ *   // Before returning from a handler (no-op for GET):
+ *   logger.audit(event, { actorEmail, statusCode: response.statusCode });
  */
 
 const REDACTED = "[REDACTED]";
@@ -121,4 +123,39 @@ function logResponse(response) {
   });
 }
 
-module.exports = { init, info, warn, error, logResponse, redact };
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+// Only identifier parameters are copied into audit records; values of other
+// parameters can carry access codes, emails or free text.
+const ID_PARAM = /_id$/;
+
+/**
+ * Emits one structured AUDIT line for a state-changing API request (POST, PUT,
+ * PATCH or DELETE); other methods are ignored. Query it in CloudWatch Logs
+ * Insights with `filter message = "AUDIT"`.
+ *
+ * @param {object} event - API Gateway proxy event
+ * @param {{actorEmail?: string, statusCode: number, scope?: object}} details
+ *   `scope` is the parent object the caller was authorized against, if any.
+ */
+function audit(event, { actorEmail, statusCode, scope } = {}) {
+  const method = event?.httpMethod;
+  if (!MUTATING_METHODS.has(method)) return;
+
+  const targetIds = {};
+  for (const [key, value] of Object.entries(event.queryStringParameters || {})) {
+    if (ID_PARAM.test(key) && typeof value === "string") targetIds[key] = value;
+  }
+
+  _log("INFO", "AUDIT", {
+    action: `${method} ${event.resource}`,
+    actorEmail,
+    sourceIp: event.requestContext?.identity?.sourceIp,
+    apiRequestId: event.requestContext?.requestId,
+    targetIds,
+    scope,
+    statusCode,
+    outcome: statusCode >= 200 && statusCode < 400 ? "success" : "failure",
+  });
+}
+
+module.exports = { init, info, warn, error, logResponse, audit, redact };

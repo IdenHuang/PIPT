@@ -107,7 +107,12 @@ exports.handler = async (event, context) => {
   const userRoles = roleCheckResult[0]?.roles || [];
   const actor = { userId: roleCheckResult[0]?.user_id || null, email: adminEmail };
   if (!userRoles.includes("admin")) {
-    logger.warn("Forbidden: user lacks admin role", { adminEmail, userRoles });
+    logger.warn("AUTHZ_DENY", {
+      check: "adminRole",
+      reason: "not_authorized",
+      adminEmail,
+      userRoles,
+    });
     return {
       statusCode: 403,
       headers: getCorsHeaders(event),
@@ -2126,5 +2131,8 @@ exports.handler = async (event, context) => {
     response.body = JSON.stringify(error.message);
   }
   logger.logResponse(response);
+  // Role changes also get a ROLE_CHANGE line and a role_audit_log row
+  // (applyRoleChange); this records every admin mutation, including failures.
+  logger.audit(event, { actorEmail: adminEmail, statusCode: response.statusCode });
   return response;
 };

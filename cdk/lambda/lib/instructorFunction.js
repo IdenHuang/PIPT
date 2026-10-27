@@ -41,7 +41,13 @@ exports.handler = async (event, context) => {
     (instructorEmail && instructorEmail !== userEmailAttribute);
 
   if (isUnauthorized) {
-    logger.warn("Unauthorized access attempt", { queryEmail, instructorEmail, userEmailAttribute });
+    logger.warn("AUTHZ_DENY", {
+      check: "emailParamMatchesToken",
+      reason: "not_authorized",
+      queryEmail,
+      instructorEmail,
+      userEmailAttribute,
+    });
     return {
       statusCode: 401,
       headers: getCorsHeaders(event),
@@ -70,7 +76,12 @@ exports.handler = async (event, context) => {
   `;
   const userRoles = roleCheckResult[0]?.roles || [];
   if (!userRoles.includes("instructor") && !userRoles.includes("admin")) {
-    logger.warn("Forbidden: user lacks instructor/admin role", { userEmailAttribute, userRoles });
+    logger.warn("AUTHZ_DENY", {
+      check: "instructorRole",
+      reason: "not_authorized",
+      userEmailAttribute,
+      userRoles,
+    });
     return {
       statusCode: 403,
       headers: getCorsHeaders(event),
@@ -92,9 +103,12 @@ exports.handler = async (event, context) => {
     isAdmin: userRoles.includes("admin"),
   });
   if (!authzResult.allowed) {
-    logger.warn("Object-level authorization denied", {
-      route: pathData,
+    // For ownership failures the authz.js helper has already logged the target IDs.
+    logger.warn("AUTHZ_DENY", {
+      check: "instructorRoutePolicy",
+      reason: authzResult.statusCode === 400 ? "invalid_input" : "not_authorized",
       statusCode: authzResult.statusCode,
+      error: authzResult.error,
       userEmailAttribute,
     });
     return {
@@ -4203,6 +4217,11 @@ exports.handler = async (event, context) => {
     response.body = JSON.stringify(error.message);
   }
   logger.logResponse(response);
+  logger.audit(event, {
+    actorEmail: userEmailAttribute,
+    statusCode: response.statusCode,
+    scope: authorizedScope,
+  });
 
   return response;
 };
