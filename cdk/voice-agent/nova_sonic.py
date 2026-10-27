@@ -269,7 +269,8 @@ def get_pg_connection():
                 database=secret["dbname"],
                 user=secret["username"],
                 password=secret["password"],
-                sslmode="require",
+                sslmode="verify-full",
+                sslrootcert=chat_history.DB_SSL_ROOT_CERT,
             )
 
         return pg_conn_pool.getconn()

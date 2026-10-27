@@ -103,7 +103,7 @@ class FakeConn:
 
 
 def _password_from_url(url):
-    # postgresql+psycopg://user:password@host:port/db?sslmode=require
+    # postgresql+psycopg://user:password@host:port/db?sslmode=verify-full&sslrootcert=...
     return url.split("://", 1)[1].split("@", 1)[0].split(":", 1)[1]
 
 
@@ -141,7 +141,8 @@ def stubs(monkeypatch):
 
     def connect(**kw):
         state.connect_attempts.append(kw["password"])
-        assert kw["sslmode"] == "require"
+        assert kw["sslmode"] == "verify-full"
+        assert kw["sslrootcert"]
         if state.connect_error is not None:
             raise state.connect_error
         if kw["password"] != state.db_password:

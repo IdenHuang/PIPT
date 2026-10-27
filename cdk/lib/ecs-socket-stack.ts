@@ -189,7 +189,23 @@ export class EcsSocketStack extends Stack {
       vpc,
       allowAllOutbound: true,
     });
-    nlbSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(80), "CloudFront VPC Origin inbound");
+    // Only CloudFront (origin-facing prefix list, as the VPC origins docs
+    // recommend) and in-VPC callers (the text-gen Lambda's /stream-callback
+    // POSTs) may reach the NLB; not 0.0.0.0/0.
+    // https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-vpc-origins.html
+    const cloudFrontOriginFacing = ec2.PrefixList.fromLookup(this, "CloudFrontOriginFacing", {
+      prefixListName: "com.amazonaws.global.cloudfront.origin-facing",
+    });
+    nlbSg.addIngressRule(
+      ec2.Peer.prefixList(cloudFrontOriginFacing.prefixListId),
+      ec2.Port.tcp(80),
+      "CloudFront VPC Origin inbound"
+    );
+    nlbSg.addIngressRule(
+      ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      ec2.Port.tcp(80),
+      "In-VPC stream callbacks (text-gen Lambda)"
+    );
 
     const nlb = new elbv2.NetworkLoadBalancer(this, "SocketNLBInternal", {
       vpc,

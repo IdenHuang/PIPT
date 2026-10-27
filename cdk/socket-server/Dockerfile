@@ -28,6 +28,10 @@ COPY logger.js ./
 
 ENV AWS_DEFAULT_REGION=us-east-1
 
+# Alpine's CA bundle (ca-certificates-bundle, in the base image). The Python DB
+# clients verify the RDS Proxy certificate against it (sslmode=verify-full).
+ENV PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt
+
 # Listen on HTTP port
 EXPOSE 80
 

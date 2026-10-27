@@ -22,6 +22,10 @@ db_secret = None
 secrets_manager_client = boto3.client("secretsmanager")
 
 RDS_PROXY_ENDPOINT = os.environ.get("RDS_PROXY_ENDPOINT")  # Replace with your actual RDS proxy endpoint
+# RDS Proxy presents an ACM certificate; verify it (and the hostname) against
+# the OS trust store. The Dockerfile points PGSSLROOTCERT at Alpine's bundle.
+# https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.howitworks.html#rds-proxy-security.tls
+DB_SSL_ROOT_CERT = os.environ.get("PGSSLROOTCERT", "/etc/ssl/certs/ca-certificates.crt")
 DB_SECRET_NAME = os.environ.get("SM_DB_CREDENTIALS")  # Replace with your actual secret name
 print(f"Using RDS Proxy Endpoint: {RDS_PROXY_ENDPOINT}")
 print(f"Using DB Secret Name: {DB_SECRET_NAME}")
@@ -81,7 +85,8 @@ def connect_to_db():
                 'password': secret["password"],
                 'host': RDS_PROXY_ENDPOINT,
                 'port': secret["port"],
-                'sslmode': 'require'
+                'sslmode': 'verify-full',
+                'sslrootcert': DB_SSL_ROOT_CERT,
             }
             connection_string = " ".join([f"{key}={value}" for key, value in connection_params.items()])
             connection = psycopg2.connect(connection_string)

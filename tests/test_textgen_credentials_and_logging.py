@@ -127,7 +127,8 @@ def _fake_connect(accepted_password, attempts, error=None):
             raise error
         if kw["password"] != accepted_password:
             raise FakeOperationalError('password authentication failed for user "app_rw"', sqlstate="28P01")
-        assert kw["sslmode"] == "require"
+        assert kw["sslmode"] == "verify-full"
+        assert kw["sslrootcert"]
         return types.SimpleNamespace(closed=False)
     return connect
 

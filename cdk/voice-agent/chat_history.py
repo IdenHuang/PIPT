@@ -24,6 +24,10 @@ db_secret = None
 secrets_manager_client = boto3.client("secretsmanager")
 
 RDS_PROXY_ENDPOINT = os.environ.get("RDS_PROXY_ENDPOINT")
+# RDS Proxy presents an ACM certificate; verify it (and the hostname) against
+# the Amazon Trust Services roots in the OS trust store (AL2023 image).
+# https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.howitworks.html#rds-proxy-security.tls
+DB_SSL_ROOT_CERT = os.environ.get("PGSSLROOTCERT", "/etc/pki/tls/certs/ca-bundle.crt")
 DB_SECRET_NAME = os.environ.get("SM_DB_CREDENTIALS")
 _TABLE_NAME = os.environ.get("TABLE_NAME")
 
@@ -91,7 +95,8 @@ def connect_to_db():
             "password": secret["password"],
             "host": RDS_PROXY_ENDPOINT,
             "port": secret["port"],
-            "sslmode": "require",
+            "sslmode": "verify-full",
+            "sslrootcert": DB_SSL_ROOT_CERT,
         }
         connection_string = " ".join(f"{k}={v}" for k, v in connection_params.items())
         connection = psycopg2.connect(connection_string)
