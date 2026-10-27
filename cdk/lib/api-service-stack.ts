@@ -343,6 +343,14 @@ export class ApiServiceStack extends cdk.Stack {
         requireDigits: true,
         requireSymbols: false,
       },
+      // TOTP is available for users who enroll; SMS is not enabled. Nobody is
+      // challenged until they register an authenticator app.
+      mfa: cognito.Mfa.OPTIONAL,
+      mfaSecondFactor: { otp: true, sms: false },
+      // A pending email change stays out of the ID token (and email_verified
+      // stays true) until the new address is verified. Handlers join ownership
+      // on the token's email, so an unverified address must never appear there.
+      keepOriginal: { email: true },
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
       // Retain on stack delete/replacement; user accounts (and password hashes)
       // are unrecoverable once the pool is deleted.
@@ -354,11 +362,16 @@ export class ApiServiceStack extends cdk.Stack {
     // Create app client
     this.appClient = this.userPool.addClient(`${id}-pool`, {
       userPoolClientName: userPoolName,
+      // SRP only: the frontend uses Amplify's default USER_SRP_AUTH, so the
+      // plaintext USER_PASSWORD_AUTH flow and the unused CUSTOM_AUTH flow are off.
       authFlows: {
-        userPassword: true,
-        custom: true,
+        userPassword: false,
+        custom: false,
         userSrp: true,
       },
+      // Sign-in and password reset return the same error for unknown and known
+      // users, so the API cannot be used to enumerate accounts.
+      preventUserExistenceErrors: true,
     });
 
     // Unauthenticated identities disabled — the app requires sign-in for all functionality.
@@ -492,10 +505,10 @@ export class ApiServiceStack extends cdk.Stack {
     );
 
     // Secrets Manager: student, instructor and timeout-handler functions read only
-    // the app_rw credential. The JWT authorizers read no secrets. The admin
+    // the app_rw credential. The instructor and admin JWT authorizers also read
+    // app_rw to look up users.roles; the student authorizer reads no secrets. The admin
     // function needs app_tc, so it runs on its own adminLambdaRole (below) and
     // this shared role never holds the DDL-capable credential.
-    // REVIEW: The authorizers could also move to their own secret-free role.
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -955,8 +968,9 @@ export class ApiServiceStack extends cdk.Stack {
     /**
      *
      * Create Lambda for Student Authorization endpoints
-     * Pure authentication gate — validates JWT signature, issuer, audience, expiry.
-     * Role-based authorization is enforced in the Lambda handlers via the DB.
+     * Authentication gate — validates a Cognito ID token (signature, issuer,
+     * audience, expiry, token_use=id, email_verified) and returns an Allow scoped
+     * to /student/* only. Handlers enforce object-level authorization.
      */
     const authorizationFunction_student = new lambda.Function(
       this,
@@ -970,6 +984,8 @@ export class ApiServiceStack extends cdk.Stack {
           AUTH_JWKS_URI: authJwksUri,
           AUTH_ISSUER: authIssuer,
           AUTH_AUDIENCE: authAudience,
+          ROUTE_PREFIX: "student",
+          // No REQUIRED_ROLES: the student surface needs authentication only.
         },
         functionName: `${id}-studentLambdaAuthorizer`,
         memorySize: 128,
@@ -994,8 +1010,9 @@ export class ApiServiceStack extends cdk.Stack {
     /**
      *
      * Create Lambda for Instructor Authorization endpoints
-     * Pure authentication gate — validates JWT signature, issuer, audience, expiry.
-     * Role-based authorization is enforced in the Lambda handlers via the DB.
+     * Validates the ID token as above, then requires users.roles to contain
+     * 'instructor' or 'admin' and returns a policy scoped to /instructor/* only.
+     * Handlers re-check the role from the DB on every request.
      */
     const authorizationFunction_instructor = new lambda.Function(
       this,
@@ -1009,10 +1026,17 @@ export class ApiServiceStack extends cdk.Stack {
           AUTH_JWKS_URI: authJwksUri,
           AUTH_ISSUER: authIssuer,
           AUTH_AUDIENCE: authAudience,
+          ROUTE_PREFIX: "instructor",
+          REQUIRED_ROLES: "instructor,admin",
+          // Role lookup (users.roles) through RDS Proxy with the app_rw credential.
+          SM_DB_CREDENTIALS: db.secretPathUser.secretName,
+          RDS_PROXY_ENDPOINT: db.rdsProxyEndpoint,
         },
+        vpc: vpcStack.vpc,
+        securityGroups: [apiLambdaSg],
         functionName: `${id}-instructorLambdaAuthorizer`,
         memorySize: 128,
-        layers: [joseLayer],
+        layers: [joseLayer, postgres],
         role: lambdaRole,
         logGroup: logProtection.lambdaLogGroup(`${id}-instructorLambdaAuthorizer`),
       }
@@ -1033,8 +1057,9 @@ export class ApiServiceStack extends cdk.Stack {
     /**
      *
      * Create Lambda for Admin Authorization endpoints
-     * Pure authentication gate — validates JWT signature, issuer, audience, expiry.
-     * Role-based authorization is enforced in the Lambda handlers via the DB.
+     * Validates the ID token as above, then requires users.roles to contain
+     * 'admin' and returns a policy scoped to /admin/* only.
+     * Handlers re-check the role from the DB on every request.
      */
     const authorizationFunction = new lambda.Function(
       this,
@@ -1048,10 +1073,17 @@ export class ApiServiceStack extends cdk.Stack {
           AUTH_JWKS_URI: authJwksUri,
           AUTH_ISSUER: authIssuer,
           AUTH_AUDIENCE: authAudience,
+          ROUTE_PREFIX: "admin",
+          REQUIRED_ROLES: "admin",
+          // Role lookup (users.roles) through RDS Proxy with the app_rw credential.
+          SM_DB_CREDENTIALS: db.secretPathUser.secretName,
+          RDS_PROXY_ENDPOINT: db.rdsProxyEndpoint,
         },
+        vpc: vpcStack.vpc,
+        securityGroups: [apiLambdaSg],
         functionName: `${id}-adminLambdaAuthorizer`,
         memorySize: 128,
-        layers: [joseLayer],
+        layers: [joseLayer, postgres],
         role: lambdaRole,
         logGroup: logProtection.lambdaLogGroup(`${id}-adminLambdaAuthorizer`),
       }

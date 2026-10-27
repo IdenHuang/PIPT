@@ -160,6 +160,29 @@ describe("student route wiring", () => {
     expectCheckBefore(block, "verifyEnrollment(sqlConnection, simulation_group_id, userEmailAttribute)", 'FROM "personas"');
   });
 
+  describe("POST /student/enroll_student enrollment_type", () => {
+    const block = handlerBlock("POST /student/enroll_student");
+
+    test("never assigns the query-string enrollment_type directly", () => {
+      expect(block).not.toMatch(/\?\s*event\.queryStringParameters\.enrollment_type/);
+      expect(block).not.toMatch(/=\s*event\.queryStringParameters\.enrollment_type\s*[;:]/);
+    });
+
+    test("checks the authenticated caller's DB roles before granting preview", () => {
+      expectCheckBefore(
+        block,
+        'SELECT roles FROM "users" WHERE user_email = ${userEmailAttribute}',
+        "enrollment_type = 'preview';"
+      );
+      expect(block).toMatch(/!callerRoles\.includes\('instructor'\) && !callerRoles\.includes\('admin'\)/);
+      expect(block).toMatch(FORBIDDEN);
+    });
+
+    test("decides the type before any enrollment write", () => {
+      expectCheckBefore(block, "enrollment_type = 'preview';", 'INSERT INTO "enrollments"');
+    });
+  });
+
   test("the unreachable, unauthenticated GET /session/messages route is removed", () => {
     expect(source).not.toContain('case "GET /session/messages"');
   });

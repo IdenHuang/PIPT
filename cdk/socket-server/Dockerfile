@@ -22,6 +22,8 @@ COPY media-bridge.js ./
 COPY session-auth.js ./
 COPY session-guard.js ./
 COPY stream-relay.js ./
+COPY voice-preview-limiter.js ./
+COPY relay-token.js ./
 COPY logger.js ./
 
 ENV AWS_DEFAULT_REGION=us-east-1
