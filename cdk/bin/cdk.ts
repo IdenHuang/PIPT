@@ -31,6 +31,7 @@ const cicdStack = new CICDStack(app, `${StackPrefix}-CICD`, {
   env,
   githubRepo,
   githubBranch: app.node.tryGetContext("githubBranch") || "main",
+  stackPrefix: StackPrefix,
   lambdaFunctions: [
     {
       name: "textGeneration",
@@ -44,7 +45,6 @@ const cicdStack = new CICDStack(app, `${StackPrefix}-CICD`, {
     },
     {
       name: "socketServer",
-      functionName: `${StackPrefix}-EcsSocket-SocketServer`,
       sourceDir: "cdk/socket-server",
       ecsServiceSsmParams: {
         cluster: getSocketEcsClusterSsmParam(StackPrefix),
@@ -52,8 +52,9 @@ const cicdStack = new CICDStack(app, `${StackPrefix}-CICD`, {
       },
     },
     {
+      // Hosted on Bedrock AgentCore (configured outside CDK); the build only
+      // pushes and records the approved image tag.
       name: "voiceAgent",
-      functionName: `${StackPrefix}-VoiceAgent-VoiceAgentService`,
       sourceDir: "cdk/voice-agent",
     },
   ],
@@ -119,7 +120,7 @@ const ecsSocketStack = new EcsSocketStack(
   apiStack.getDynamoTableName(),
   cloudFrontWafStack.webAclArn,
   { env, crossRegionReferences: true },
-  cicdStack.buildRole
+  cicdStack.buildRoles["socketServer"]
 );
 const dbFlowStack = new DBFlowStack(
   app,

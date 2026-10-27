@@ -1,6 +1,6 @@
 #!/bin/bash
 # Fail-closed ECR vulnerability gate, run in CodeBuild post_build before an
-# image is promoted to :latest and deployed to Lambda.
+# image is recorded as approved and deployed (cdk/scripts/deploy_image.sh).
 #
 # Exit 0 only when a scan of $REPO_NAME:$IMAGE_TAG has finished AND it reports
 # zero findings at every blocking severity. Anything else exits non-zero and
@@ -34,7 +34,7 @@ trap 'rm -f "$ERR_FILE"' EXIT
 
 block() {
   echo "BLOCKED: $*" >&2
-  echo "Image $IMAGE will NOT be promoted to latest or deployed." >&2
+  echo "Image $IMAGE will NOT be recorded as approved or deployed." >&2
   exit 1
 }
 

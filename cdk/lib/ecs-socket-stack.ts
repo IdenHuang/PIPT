@@ -13,6 +13,7 @@ import { VpcStack } from "./vpc-stack";
 import { DatabaseStack } from "./database-stack";
 import { TurnServerStack } from "./turn-server-stack";
 import { LogProtection } from "./log-protection";
+import { approvedImageTag } from "./approved-image";
 
 /** SSM parameter name where the socket URL is published for other stacks to read. */
 export const getSocketUrlSsmParam = (stackPrefix: string) => `/${stackPrefix}/socket-url`;
@@ -52,7 +53,7 @@ export class EcsSocketStack extends Stack {
     dynamoTableName: string,
     cloudFrontWafArn: string,
     props?: StackProps,
-    // CI/CD build role allowed to force a redeploy of the socket service.
+    // The socketServer CI/CD build role, allowed to redeploy this service.
     deployRole?: iam.IRole
   ) {
     super(scope, id, props);
@@ -207,7 +208,16 @@ export class EcsSocketStack extends Stack {
 
     // 4) Container listening on port 80
     const socketContainer = taskDef.addContainer("SocketContainer", {
-      image: ecs.ContainerImage.fromEcrRepository(socketServerRepo, "latest"),
+      // Pinned to the newest scan-approved image (an immutable tag), not :latest.
+      image: ecs.ContainerImage.fromEcrRepository(
+        socketServerRepo,
+        approvedImageTag(this, "SocketImageWaiter", {
+          serviceToken: apiServiceStack.imageWaiterServiceToken,
+          repository: socketServerRepo,
+          stackPrefix,
+          moduleName: "socketServer",
+        })
+      ),
       portMappings: [{ containerPort: 80 }],
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: "Socket",
@@ -273,8 +283,9 @@ export class EcsSocketStack extends Stack {
       circuitBreaker: { enable: true, rollback: true },
     });
 
-    // 5.0) Let the CI/CD build redeploy exactly this service after it pushes
-    // a new :latest image (ECS only pulls the image when a task starts).
+    // 5.0) Let the CI/CD build roll exactly this service onto a task
+    // definition revision pinned to the new image's digest
+    // (cdk/scripts/deploy_image.sh).
     const ecsClusterParam = new ssm.StringParameter(this, "SocketEcsClusterParam", {
       parameterName: getSocketEcsClusterSsmParam(stackPrefix),
       stringValue: cluster.clusterName,
@@ -292,6 +303,22 @@ export class EcsSocketStack extends Stack {
           new iam.PolicyStatement({
             actions: ["ecs:UpdateService", "ecs:DescribeServices"],
             resources: [service.serviceArn],
+          }),
+          // ECS doesn't support resource-level permissions for these two
+          // actions. A registered revision can't run anywhere except through
+          // the UpdateService grant above, and PassRole below limits it to
+          // this service's own roles.
+          // https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonelasticcontainerservice.html
+          new iam.PolicyStatement({
+            actions: ["ecs:DescribeTaskDefinition", "ecs:RegisterTaskDefinition"],
+            resources: ["*"],
+          }),
+          new iam.PolicyStatement({
+            actions: ["iam:PassRole"],
+            resources: [taskRole.roleArn],
+            conditions: {
+              StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
+            },
           }),
           new iam.PolicyStatement({
             actions: ["ssm:GetParameter"],

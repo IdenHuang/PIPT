@@ -36,8 +36,12 @@ import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ses from "aws-cdk-lib/aws-ses";
 import * as route53 from "aws-cdk-lib/aws-route53";
 import { LogProtection } from "./log-protection";
+import { getImageTagSsmParam } from "./cicd-stack";
+import { approvedImageTag } from "./approved-image";
 
 export class ApiServiceStack extends cdk.Stack {
+  /** ECR image waiter provider; other stacks use it to pin images (see approved-image.ts). */
+  public readonly imageWaiterServiceToken: string;
   private readonly api: apigateway.SpecRestApi;
   public readonly appClient: cognito.UserPoolClient;
   public readonly userPool: cognito.UserPool;
@@ -1674,48 +1678,56 @@ export class ApiServiceStack extends cdk.Stack {
       })
     );
 
-    // Grant CodeBuild start permissions (for triggering builds)
+    // Read the approved image tag the CI/CD build records in SSM (one
+    // parameter per module, all under this environment's prefix).
     imageWaiterFunction.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: ["codebuild:StartBuild"],
-        resources: [`arn:aws:codebuild:${this.region}:${this.account}:project/*`],
+        actions: ["ssm:GetParameter"],
+        resources: [
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${getImageTagSsmParam(stackPrefix, "*")}`,
+        ],
       })
     );
+
+    // Let the waiter start only this environment's text-gen and data-ingest
+    // builds (not every project in the account) when their image is missing.
+    const waiterBuildProjects = [textGenBuildProjectName, dataIngestBuildProjectName].filter(
+      (name): name is string => Boolean(name)
+    );
+    if (waiterBuildProjects.length > 0) {
+      imageWaiterFunction.addToRolePolicy(
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ["codebuild:StartBuild"],
+          resources: waiterBuildProjects.map(
+            (name) => `arn:aws:codebuild:${this.region}:${this.account}:project/${name}`
+          ),
+        })
+      );
+    }
 
     const imageWaiterProvider = new cr.Provider(this, `${id}-EcrImageWaiterProvider`, {
       onEventHandler: imageWaiterFunction,
     });
+    this.imageWaiterServiceToken = imageWaiterProvider.serviceToken;
 
-    // Wait for text generation image
-    if (textGenRepo) {
-      const textGenImageWaiter = new cdk.CustomResource(this, `${id}-TextGenImageWaiter`, {
-        serviceToken: imageWaiterProvider.serviceToken,
-        properties: {
-          RepositoryName: textGenRepo.repositoryName,
-          ImageTag: "latest",
-          MaxRetries: "28",
-          RetryDelaySeconds: "30",
-          TriggerBuildOnMissing: textGenBuildProjectName ? "true" : "false",
-          CodeBuildProjectName: textGenBuildProjectName || "",
-        },
-      });
-    }
-
-    // Wait for data ingestion image
-    if (dataIngestRepo) {
-      const dataIngestImageWaiter = new cdk.CustomResource(this, `${id}-DataIngestImageWaiter`, {
-        serviceToken: imageWaiterProvider.serviceToken,
-        properties: {
-          RepositoryName: dataIngestRepo.repositoryName,
-          ImageTag: "latest",
-          MaxRetries: "28",
-          RetryDelaySeconds: "30",
-          TriggerBuildOnMissing: dataIngestBuildProjectName ? "true" : "false",
-          CodeBuildProjectName: dataIngestBuildProjectName || "",
-        },
-      });
-    }
+    // Pin each Docker Lambda to the newest scan-approved image (an immutable
+    // tag), waiting for the first build on a fresh environment.
+    const textGenImageTag = approvedImageTag(this, `${id}-TextGenImageWaiter`, {
+      serviceToken: imageWaiterProvider.serviceToken,
+      repository: textGenRepo!,
+      stackPrefix,
+      moduleName: "textGeneration",
+      buildProjectName: textGenBuildProjectName,
+    });
+    const dataIngestImageTag = approvedImageTag(this, `${id}-DataIngestImageWaiter`, {
+      serviceToken: imageWaiterProvider.serviceToken,
+      repository: dataIngestRepo!,
+      stackPrefix,
+      moduleName: "dataIngestion",
+      buildProjectName: dataIngestBuildProjectName,
+    });
 
     /**
      *
@@ -1725,7 +1737,7 @@ export class ApiServiceStack extends cdk.Stack {
       this,
       `${id}-TextGenLambdaDockerFunction`,
       {
-        code: lambda.DockerImageCode.fromEcr(textGenRepo!),
+        code: lambda.DockerImageCode.fromEcr(textGenRepo!, { tagOrDigest: textGenImageTag }),
         memorySize: 1024,
         timeout: cdk.Duration.seconds(300),
         reservedConcurrentExecutions: 25,
@@ -2088,7 +2100,7 @@ export class ApiServiceStack extends cdk.Stack {
       this,
       `${id}-DataIngestLambdaDockerFunction`,
       {
-        code: lambda.DockerImageCode.fromEcr(dataIngestRepo!),
+        code: lambda.DockerImageCode.fromEcr(dataIngestRepo!, { tagOrDigest: dataIngestImageTag }),
         memorySize: 3008,
         timeout: cdk.Duration.seconds(900),
         reservedConcurrentExecutions: 10,

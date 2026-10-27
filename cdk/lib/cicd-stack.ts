@@ -5,15 +5,29 @@ import * as codebuild from "aws-cdk-lib/aws-codebuild";
 import * as codepipeline from "aws-cdk-lib/aws-codepipeline";
 import * as codepipeline_actions from "aws-cdk-lib/aws-codepipeline-actions";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as cr from "aws-cdk-lib/custom-resources";
+
+/**
+ * SSM parameter holding the tag of the newest image of `moduleName` that passed
+ * the vulnerability gate. The build writes it; CDK consumers (Lambda, ECS) pin
+ * to the tag it holds, so a CDK deploy never rolls back what the build shipped.
+ */
+export const getImageTagSsmParam = (stackPrefix: string, moduleName: string) =>
+  `/${stackPrefix}/image-tag/${moduleName}`;
+
+/** Value of an image-tag parameter before the first gated build has run. */
+export const IMAGE_TAG_PLACEHOLDER = "pending-first-build";
 
 interface LambdaConfig {
   name: string;           // Module name (e.g., "textGeneration")
-  functionName: string;   // Lambda function name (or ECS service identifier)
+  // Lambda function this build deploys to. Omit for modules that don't run on
+  // Lambda; the build role then gets no Lambda permissions at all.
+  functionName?: string;
   sourceDir: string;      // Source directory for Docker build (relative to repo root)
   // For ECS-hosted modules: SSM parameters (written by the owning ECS stack)
-  // holding the exact cluster and service names that run this repo's :latest
-  // image. After a successful push the build forces a new deployment of that
-  // one service so the running tasks pick up the image.
+  // holding the exact cluster and service names that run this module's image.
+  // After a successful push the build registers a task definition revision
+  // pinned to the new image digest and rolls that one service onto it.
   ecsServiceSsmParams?: { cluster: string; service: string };
 }
 
@@ -21,6 +35,8 @@ interface CICDStackProps extends cdk.StackProps {
   githubRepo: string;
   githubBranch?: string;
   environmentName?: string;
+  /** Prefix of the environment this pipeline deploys; scopes every grant. */
+  stackPrefix: string;
   lambdaFunctions: LambdaConfig[];
   pathFilters?: string[];
 }
@@ -28,47 +44,18 @@ interface CICDStackProps extends cdk.StackProps {
 export class CICDStack extends cdk.Stack {
   public readonly ecrRepositories: { [key: string]: ecr.Repository } = {};
   public readonly buildProjects: { [key: string]: codebuild.IProject } = {};
+  /**
+   * One role per build project, keyed by module name. Each role can only push
+   * to its own repository and deploy its own function or service, so one
+   * module's build can't overwrite another module's image or deployment.
+   */
+  public readonly buildRoles: { [key: string]: iam.IRole } = {};
   public readonly connectionArn: string;
-  /** Role shared by the CodeBuild projects; ECS stacks grant it redeploy rights. */
-  public readonly buildRole: iam.IRole;
 
   constructor(scope: Construct, id: string, props: CICDStackProps) {
     super(scope, id, props);
 
     const envName = props.environmentName ?? "dev";
-
-    // Create a common role for all CodeBuild projects
-    const codeBuildRole = new iam.Role(this, "DockerBuildRole", {
-      assumedBy: new iam.ServicePrincipal("codebuild.amazonaws.com"),
-    });
-
-    // ECR access is granted per repository inside the loop below, not account-wide.
-
-    codeBuildRole.addToPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: [
-          "lambda:GetFunction",
-          "lambda:GetFunctionConfiguration",
-          "lambda:UpdateFunctionCode",
-          "lambda:UpdateFunctionConfiguration",
-          "lambda:PublishVersion",
-          "lambda:GetAlias",
-          "lambda:UpdateAlias",
-        ],
-        resources: [
-          `arn:aws:lambda:${this.region}:${this.account}:function:*-TextGenLambdaDockerFunction`,
-          `arn:aws:lambda:${this.region}:${this.account}:function:*-TextGenLambdaDockerFunction:*`,
-          `arn:aws:lambda:${this.region}:${this.account}:function:*-DataIngestLambdaDockerFunction`,
-          `arn:aws:lambda:${this.region}:${this.account}:function:*-DataIngestLambdaDockerFunction:*`,
-        ],
-      })
-    );
-
-    // ECS redeploy permissions are not granted here. The stack that owns each
-    // ECS service grants this role UpdateService on that exact service ARN
-    // (see EcsSocketStack), so the build can only redeploy that one service.
-    this.buildRole = codeBuildRole;
 
     // Create artifacts for pipeline
     const sourceOutput = new codepipeline.Artifact();
@@ -148,11 +135,13 @@ export class CICDStack extends cdk.Stack {
     const buildActions: codepipeline_actions.CodeBuildAction[] = [];
 
     props.lambdaFunctions.forEach((lambdaConfig) => {
-      // Create ECR repository
+      // Create ECR repository. Tags are immutable: every build pushes a unique
+      // tag, and deployments reference a digest or one of those tags, so what
+      // a deployment points at can never be silently replaced.
       const repoName = `${id.toLowerCase()}-${lambdaConfig.name.toLowerCase()}`;
       const ecrRepo = new ecr.Repository(this, `${lambdaConfig.name}Repo`, {
         repositoryName: repoName,
-        imageTagMutability: ecr.TagMutability.MUTABLE,
+        imageTagMutability: ecr.TagMutability.IMMUTABLE,
         removalPolicy: cdk.RemovalPolicy.RETAIN,
         imageScanOnPush: true,
       });
@@ -179,13 +168,83 @@ export class CICDStack extends cdk.Stack {
       cdk.Tags.of(ecrRepo).add("module", lambdaConfig.name);
       cdk.Tags.of(ecrRepo).add("env", envName);
 
+      // Approved-image pointer. Created once with a placeholder by a custom
+      // resource rather than an ssm.StringParameter: the build owns the value
+      // afterwards, and a CloudFormation-managed parameter would be reset to
+      // the template value whenever that resource changed.
+      const imageTagParamName = getImageTagSsmParam(props.stackPrefix, lambdaConfig.name);
+      const imageTagParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${imageTagParamName}`;
+      new cr.AwsCustomResource(this, `${lambdaConfig.name}ImageTagParamInit`, {
+        onCreate: {
+          service: "SSM",
+          action: "putParameter",
+          parameters: {
+            Name: imageTagParamName,
+            Value: IMAGE_TAG_PLACEHOLDER,
+            Type: "String",
+            Overwrite: false,
+            Description: `Newest ${lambdaConfig.name} image tag that passed the ECR scan gate (written by CI/CD)`,
+          },
+          // Keep an existing value on re-creation of this resource.
+          ignoreErrorCodesMatching: "ParameterAlreadyExists",
+          physicalResourceId: cr.PhysicalResourceId.of(imageTagParamName),
+        },
+        // No onUpdate/onDelete: the parameter outlives this resource on purpose
+        // so a stack update or teardown can't erase the deployed-image record.
+        policy: cr.AwsCustomResourcePolicy.fromStatements([
+          new iam.PolicyStatement({
+            actions: ["ssm:PutParameter"],
+            resources: [imageTagParamArn],
+          }),
+        ]),
+        installLatestAwsSdk: false,
+      });
+
+      // One role per build project (not shared), scoped to this module only.
+      const buildRole = new iam.Role(this, `${lambdaConfig.name}BuildRole`, {
+        assumedBy: new iam.ServicePrincipal("codebuild.amazonaws.com"),
+        description: `CodeBuild role for the ${lambdaConfig.name} image build (${props.stackPrefix})`,
+      });
+      this.buildRoles[lambdaConfig.name] = buildRole;
+
+      buildRole.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ["ssm:GetParameter", "ssm:PutParameter"],
+          resources: [imageTagParamArn],
+        })
+      );
+
+      if (lambdaConfig.functionName) {
+        // Exact function in this environment only. Function names are
+        // `${StackPrefix}-Api-...`, and several prefixes share the account, so
+        // a `*-` wildcard would also match every other environment's function.
+        const functionArn = `arn:aws:lambda:${this.region}:${this.account}:function:${lambdaConfig.functionName}`;
+        buildRole.addToPolicy(
+          new iam.PolicyStatement({
+            actions: [
+              "lambda:GetFunction",
+              "lambda:GetFunctionConfiguration",
+              "lambda:UpdateFunctionCode",
+              "lambda:PublishVersion",
+              "lambda:GetAlias",
+              "lambda:UpdateAlias",
+            ],
+            resources: [functionArn, `${functionArn}:*`],
+          })
+        );
+      }
+
+      // ECS redeploy permissions are not granted here. The stack that owns each
+      // ECS service grants this role UpdateService on that exact service ARN
+      // (see EcsSocketStack), so the build can only redeploy that one service.
+
       // Create CodeBuild project
       const buildProject = new codebuild.PipelineProject(
         this,
         `${lambdaConfig.name}BuildProject`,
         {
           projectName: `${id}-${lambdaConfig.name}Builder`,
-          role: codeBuildRole,
+          role: buildRole,
           cache: codebuild.Cache.local(codebuild.LocalCacheMode.DOCKER_LAYER),
           environment: {
             buildImage: lambdaConfig.name === "voiceAgent" 
@@ -198,9 +257,11 @@ export class CICDStack extends cdk.Stack {
             AWS_REGION: { value: this.region },
             ENVIRONMENT: { value: envName },
             MODULE_NAME: { value: lambdaConfig.name },
-            LAMBDA_FUNCTION_NAME: { value: lambdaConfig.functionName },
+            LAMBDA_FUNCTION_NAME: { value: lambdaConfig.functionName ?? "" },
             ECS_CLUSTER_PARAM: { value: lambdaConfig.ecsServiceSsmParams?.cluster ?? "" },
             ECS_SERVICE_PARAM: { value: lambdaConfig.ecsServiceSsmParams?.service ?? "" },
+            IMAGE_TAG_PARAM: { value: imageTagParamName },
+            IMAGE_TAG_PLACEHOLDER: { value: IMAGE_TAG_PLACEHOLDER },
             REPO_NAME: { value: repoName },
             REPOSITORY_URI: { value: ecrRepo.repositoryUri },
             GITHUB_USERNAME: { value: username },
@@ -217,7 +278,10 @@ export class CICDStack extends cdk.Stack {
                   "echo Logging in to Amazon ECR...",
                   "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com",
                   "COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)",
-                  "IMAGE_TAG=${MODULE_NAME}-${ENVIRONMENT}-${COMMIT_HASH}",
+                  // Tags are immutable, so include the build number: a retry or
+                  // re-run of the same commit must not reuse an existing tag.
+                  // Exported: ecr_scan_gate.sh and deploy_image.sh read it.
+                  "export IMAGE_TAG=${MODULE_NAME}-${ENVIRONMENT}-${COMMIT_HASH}-b${CODEBUILD_BUILD_NUMBER}",
                   "export DOCKER_HOST=unix:///var/run/docker.sock",
                   "chmod +x $CODEBUILD_SRC_DIR/cdk/scripts/check_and_build.sh",
                   '$CODEBUILD_SRC_DIR/cdk/scripts/check_and_build.sh || { echo "Skipping build due to no changes"; exit 1; }',
@@ -233,79 +297,20 @@ export class CICDStack extends cdk.Stack {
               },
               post_build: {
                 commands: [
-                  'echo "Pushing image with commit tag for scanning..."',
+                  // post_build runs even when the build phase failed; don't
+                  // push or deploy an image that was never built.
+                  'if [ "$CODEBUILD_BUILD_SUCCEEDING" != "1" ]; then echo "Build failed; skipping push and deploy."; exit 1; fi',
+                  'echo "Pushing image with build tag for scanning..."',
                   "docker push $REPOSITORY_URI:$IMAGE_TAG",
                   // Fail-closed gate: any scan/API error, unfinished scan, or
                   // CRITICAL/HIGH finding exits non-zero, which fails this phase
-                  // before the :latest push and Lambda deploy below.
+                  // before the image is recorded as approved or deployed.
                   "chmod +x $CODEBUILD_SRC_DIR/cdk/scripts/ecr_scan_gate.sh",
                   "$CODEBUILD_SRC_DIR/cdk/scripts/ecr_scan_gate.sh",
-                  'echo "Scan passed. Tagging and pushing as latest..."',
-                  "docker tag $REPOSITORY_URI:$IMAGE_TAG $REPOSITORY_URI:latest",
-                  "docker push $REPOSITORY_URI:latest",
-                  'echo "Checking if Lambda function exists before updating..."',
-                  `bash -c '
-                    if aws lambda get-function --function-name $LAMBDA_FUNCTION_NAME &>/dev/null; then
-                      echo "Updating Lambda function to use the new image..."
-                      aws lambda update-function-code \
-                        --function-name $LAMBDA_FUNCTION_NAME \
-                        --image-uri $REPOSITORY_URI:latest
-
-                      echo "Waiting for function update to complete..."
-                      aws lambda wait function-updated --function-name $LAMBDA_FUNCTION_NAME
-
-                      echo "Publishing new version..."
-                      NEW_VERSION=$(aws lambda publish-version \
-                        --function-name $LAMBDA_FUNCTION_NAME \
-                        --query "Version" --output text)
-
-                      if [ -z "$NEW_VERSION" ]; then
-                        echo "ERROR: Failed to publish version. Skipping alias update."
-                        exit 0
-                      fi
-                      echo "Published version: $NEW_VERSION"
-
-                      # Check if a live alias exists and update it
-                      if aws lambda get-alias --function-name $LAMBDA_FUNCTION_NAME --name live &>/dev/null; then
-                        PREV_VERSION=$(aws lambda get-alias \
-                          --function-name $LAMBDA_FUNCTION_NAME \
-                          --name live \
-                          --query "FunctionVersion" --output text)
-                        echo "Previous alias version: $PREV_VERSION"
-
-                        echo "Updating live alias to version $NEW_VERSION..."
-                        aws lambda update-alias \
-                          --function-name $LAMBDA_FUNCTION_NAME \
-                          --name live \
-                          --function-version "$NEW_VERSION"
-
-                        echo "Rollback command if needed: aws lambda update-alias --function-name $LAMBDA_FUNCTION_NAME --name live --function-version $PREV_VERSION"
-                      else
-                        echo "No live alias found. Skipping alias update."
-                      fi
-                    else
-                      echo "Lambda function $LAMBDA_FUNCTION_NAME does not exist yet. Skipping update."
-                    fi
-                  '`,
-                  // ECS services pull :latest only when a task starts, so a
-                  // pushed image is not live until the service is redeployed.
-                  `bash -c '
-                    set -euo pipefail
-                    if [ -z "$ECS_CLUSTER_PARAM" ] || [ -z "$ECS_SERVICE_PARAM" ]; then
-                      exit 0
-                    fi
-                    # Exact names come from SSM, written by the ECS stack that
-                    # also grants this role UpdateService on that one service.
-                    if ! CLUSTER=$(aws ssm get-parameter --name "$ECS_CLUSTER_PARAM" --query Parameter.Value --output text 2>/dev/null) \\
-                      || ! SERVICE=$(aws ssm get-parameter --name "$ECS_SERVICE_PARAM" --query Parameter.Value --output text 2>/dev/null); then
-                      echo "ECS service parameters not found (ECS stack not deployed yet?). Skipping redeploy."
-                      exit 0
-                    fi
-                    echo "Forcing new deployment of $SERVICE in $CLUSTER..."
-                    aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment --query "service.serviceName" --output text
-                    echo "Waiting for $SERVICE to stabilize..."
-                    aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
-                  '`,
+                  // Record the approved tag and deploy it by digest to this
+                  // module's Lambda function or ECS service (if any).
+                  "chmod +x $CODEBUILD_SRC_DIR/cdk/scripts/deploy_image.sh",
+                  "$CODEBUILD_SRC_DIR/cdk/scripts/deploy_image.sh",
                 ],
               },
             },
@@ -315,12 +320,12 @@ export class CICDStack extends cdk.Stack {
 
       this.buildProjects[lambdaConfig.name] = buildProject;
 
-      // Grant permissions to push to ECR
-      ecrRepo.grantPullPush(buildProject);
-      // grantPullPush doesn't cover these: check_and_build.sh calls describe-images,
-      // and the vulnerability gate (scripts/ecr_scan_gate.sh) calls
-      // describe-image-scan-findings. Without them the gate fails every build.
-      ecrRepo.grant(buildProject, "ecr:DescribeImages", "ecr:DescribeImageScanFindings");
+      // Per-repository ECR access for this project's own role only.
+      ecrRepo.grantPullPush(buildRole);
+      // grantPullPush doesn't cover these: check_and_build.sh and
+      // deploy_image.sh call describe-images, and the vulnerability gate
+      // (scripts/ecr_scan_gate.sh) calls describe-image-scan-findings.
+      ecrRepo.grant(buildRole, "ecr:DescribeImages", "ecr:DescribeImageScanFindings");
 
       // Add build action to the list
       buildActions.push(

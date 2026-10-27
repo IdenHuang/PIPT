@@ -2,14 +2,17 @@
 set -e
 
 # Determines whether a Docker build is needed based on changed files.
-# Expects environment variables: REPO_NAME, PATH_FILTER, CODEBUILD_SRC_DIR
+# Expects environment variables: REPO_NAME, PATH_FILTER, CODEBUILD_SRC_DIR,
+# IMAGE_TAG_PARAM, IMAGE_TAG_PLACEHOLDER
 # Exit 0 = build needed, Exit 1 = skip build
 
 cd "$CODEBUILD_SRC_DIR"
 
-# Check if image exists in ECR
-if ! aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=latest &>/dev/null; then
-  echo "First deployment or image doesn't exist - building without path check"
+# Build unconditionally until an approved image is recorded and still in ECR.
+APPROVED_TAG=$(aws ssm get-parameter --name "$IMAGE_TAG_PARAM" --query Parameter.Value --output text 2>/dev/null || echo "")
+if [ -z "$APPROVED_TAG" ] || [ "$APPROVED_TAG" = "$IMAGE_TAG_PLACEHOLDER" ] \
+  || ! aws ecr describe-images --repository-name "$REPO_NAME" --image-ids "imageTag=$APPROVED_TAG" &>/dev/null; then
+  echo "No approved image recorded yet - building without path check"
   exit 0
 fi
 
