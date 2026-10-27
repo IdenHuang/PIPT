@@ -39,6 +39,24 @@ import { LogProtection, logWebAclToCloudWatch } from "./log-protection";
 import { getImageTagSsmParam } from "./cicd-stack";
 import { approvedImageTag } from "./approved-image";
 
+/** Largest REST API request body the WAF lets through (matches the KB_64 inspection limit). */
+export const WAF_MAX_BODY_BYTES = 64 * 1024;
+
+/** WAF statement matching the request URI path (case-insensitive). */
+function wafUriPathIs(
+  path: string,
+  positionalConstraint: "EXACTLY" | "ENDS_WITH"
+): wafv2.CfnWebACL.StatementProperty {
+  return {
+    byteMatchStatement: {
+      fieldToMatch: { uriPath: {} },
+      positionalConstraint,
+      searchString: path,
+      textTransformations: [{ priority: 0, type: "LOWERCASE" }],
+    },
+  };
+}
+
 export class ApiServiceStack extends cdk.Stack {
   /** ECR image waiter provider; other stacks use it to pin images (see approved-image.ts). */
   public readonly imageWaiterServiceToken: string;
@@ -50,6 +68,8 @@ export class ApiServiceStack extends cdk.Stack {
   private readonly layerList: { [key: string]: LayerVersion };
   private readonly guardrailId: string;
   private readonly allowedOriginsEnv: string;
+  private readonly docsDomainName: string;
+  private readonly dataIngestionBucketName: string;
   public readonly stageARN_APIGW: string;
   public readonly apiGW_basedURL: string;
   public readonly secret: secretsmanager.ISecret;
@@ -62,6 +82,12 @@ export class ApiServiceStack extends cdk.Stack {
   public getGuardrailId = () => this.guardrailId;
   public getDynamoTableName = () => this.dynamoTableName;
   public getAllowedOriginsEnv = () => this.allowedOriginsEnv;
+  /** Hostname of the REST API (no scheme or stage), for the frontend CSP. */
+  public getApiHost = () => `${this.api.restApiId}.execute-api.${this.region}.${this.urlSuffix}`;
+  /** Hostname of the CloudFront document distribution, for the frontend CSP. */
+  public getDocsDomainName = () => this.docsDomainName;
+  /** Name of the bucket that receives presigned-POST uploads, for the frontend CSP. */
+  public getDataIngestionBucketName = () => this.dataIngestionBucketName;
   public addLayer = (name: string, layer: LayerVersion) =>
     (this.layerList[name] = layer);
   public getLayers = () => this.layerList;
@@ -1544,6 +1570,8 @@ export class ApiServiceStack extends cdk.Stack {
             outputStrength: "HIGH",
           },
           {
+            // Bedrock only evaluates prompt attacks on input; outputStrength must be NONE.
+            // https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-prompt-attack.html
             type: "PROMPT_ATTACK",
             inputStrength: "HIGH",
             outputStrength: "NONE",
@@ -1643,8 +1671,23 @@ export class ApiServiceStack extends cdk.Stack {
         ],
       },
 
-      // No PII filters — patient simulation data (names, ages, medical details)
-      // is educational content from instructor-uploaded documents and must flow freely.
+      // PII policy — block only identifiers that never belong in a simulated
+      // encounter (real contact/financial/credential data typed by a student or
+      // echoed by the model). Persona data — NAME, AGE, ADDRESS, PHONE and
+      // CA_HEALTH_NUMBER (PHN) — is educational content from instructor-uploaded
+      // case documents and is deliberately NOT filtered.
+      // All callers use ApplyGuardrail and treat GUARDRAIL_INTERVENED as a block,
+      // so BLOCK is used rather than ANONYMIZE.
+      sensitiveInformationPolicyConfig: {
+        piiEntitiesConfig: [
+          "EMAIL",
+          "CREDIT_DEBIT_CARD_NUMBER",
+          "CA_SOCIAL_INSURANCE_NUMBER",
+          "PASSWORD",
+          "AWS_ACCESS_KEY",
+          "AWS_SECRET_KEY",
+        ].map((type) => ({ type, action: "BLOCK" })),
+      },
 
       // No contextual grounding — the simulation system prompt and medical
       // documents are the grounding context themselves; this policy would
@@ -2068,6 +2111,9 @@ export class ApiServiceStack extends cdk.Stack {
         logIncludesCookies: false,
       }
     );
+
+    this.docsDomainName = docsDistribution.domainName;
+    this.dataIngestionBucketName = dataIngestionBucket.bucketName;
 
     new cdk.CfnOutput(this, "CloudFrontDomain", {
       value: docsDistribution.domainName,
@@ -2883,17 +2929,16 @@ export class ApiServiceStack extends cdk.Stack {
             managedRuleGroupStatement: {
               vendorName: "AWS",
               name: "AWSManagedRulesCommonRuleSet",
-              // SizeRestrictions_BODY: large document/prompt payloads exceed the default size limit.
-              // GenericLFI_BODY: clinical free-text (e.g. question bank entries asking for PHN, dosages,
-              // path-like tokens) false-positives as local file inclusion. Backend uses parameterized
-              // queries, so body inspection here adds little protection.
-              // CrossSiteScripting_BODY: physical-assessment materials (persona_media) legitimately
-              // contain <iframe> embed codes submitted by instructors, which this rule flags as XSS.
-              // The stored HTML is sanitized on render with DOMPurify (iframe-only allowlist) and React
-              // auto-escapes everywhere else, so XSS is controlled at the app layer. Scoping this rule to
-              // a single path would require a second CommonRuleSet (700 WCU) that exceeds the 1500 WCU
-              // WebACL limit, so it is counted API-wide here.
-              // All are set to Count (via ruleActionOverrides) instead of Block — still logged for visibility.
+              // These three rules are Count here (still logged) because the managed group can't be
+              // scoped per path. Two of them are replaced by the Block rules further down:
+              // SizeRestrictions_BODY (fixed 8 KB): prompts/case text legitimately exceed it.
+              //   -> replaced by "BlockOversizedBody" (64 KB, REST API only).
+              // CrossSiteScripting_BODY: instructors submit <iframe> embed codes to
+              //   instructor/persona_media (sanitized on render with DOMPurify, iframe-only allowlist).
+              //   -> replaced by "BlockXssBody", which blocks on every other path.
+              // GenericLFI_BODY: clinical free-text (PHN, dosages, path-like tokens) false-positives
+              //   as local file inclusion. There is no filesystem access from request bodies and the
+              //   backend uses parameterized queries, so this one stays Count only.
               ruleActionOverrides: [
                 { name: "SizeRestrictions_BODY", actionToUse: { count: {} } },
                 { name: "GenericLFI_BODY", actionToUse: { count: {} } },
@@ -2974,7 +3019,74 @@ export class ApiServiceStack extends cdk.Stack {
             metricName: "AWS-AWSManagedRulesSQLiRuleSet",
           },
         },
+        {
+          // Bounds JSON body size on the REST API (the gateway validator is params-only, so
+          // nothing else does). The REST API body inspection limit is raised to 64 KB in
+          // associationConfig below; anything larger is "oversize" and MATCHes. AppSync is
+          // excluded because its inspection limit is fixed at 8 KB.
+          name: "BlockOversizedBody",
+          priority: 6,
+          action: { block: {} },
+          statement: {
+            andStatement: {
+              statements: [
+                {
+                  sizeConstraintStatement: {
+                    fieldToMatch: { body: { oversizeHandling: "MATCH" } },
+                    comparisonOperator: "GT",
+                    size: WAF_MAX_BODY_BYTES,
+                    textTransformations: [{ priority: 0, type: "NONE" }],
+                  },
+                },
+                { notStatement: { statement: wafUriPathIs("/graphql", "EXACTLY") } },
+              ],
+            },
+          },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: "BlockOversizedBody",
+          },
+        },
+        {
+          // XSS body inspection in Block mode everywhere except the one endpoint that
+          // accepts instructor <iframe> embed codes, and AppSync (server-generated stream
+          // chunks published by the text-generation Lambda).
+          name: "BlockXssBody",
+          priority: 7,
+          action: { block: {} },
+          statement: {
+            andStatement: {
+              statements: [
+                {
+                  xssMatchStatement: {
+                    fieldToMatch: { body: { oversizeHandling: "CONTINUE" } },
+                    textTransformations: [
+                      { priority: 0, type: "URL_DECODE" },
+                      { priority: 1, type: "HTML_ENTITY_DECODE" },
+                    ],
+                  },
+                },
+                { notStatement: { statement: wafUriPathIs("/instructor/persona_media", "ENDS_WITH") } },
+                { notStatement: { statement: wafUriPathIs("/graphql", "EXACTLY") } },
+              ],
+            },
+          },
+          visibilityConfig: {
+            sampledRequestsEnabled: true,
+            cloudWatchMetricsEnabled: true,
+            metricName: "BlockXssBody",
+          },
+        },
       ],
+      // Inspect up to 64 KB of REST API bodies (default 16 KB) so BlockOversizedBody can
+      // allow payloads up to that size. Each extra 16 KB adds a small per-request WAF charge.
+      // https://docs.aws.amazon.com/waf/latest/developerguide/web-acl-setting-body-inspection-limit.html
+      associationConfig: {
+        requestBody: {
+          API_GATEWAY: { defaultSizeInspectionLimit: "KB_64" },
+        },
+      },
     });
     const wafAssociation = new wafv2.CfnWebACLAssociation(
       this,

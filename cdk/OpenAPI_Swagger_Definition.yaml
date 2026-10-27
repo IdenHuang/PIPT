@@ -19,6 +19,14 @@ x-amazon-apigateway-request-validators:
     validateRequestParameters: true
     validateRequestBody: false
 x-amazon-apigateway-request-validator: params-only
+# Gateway error responses return fixed messages rather than
+# $context.error.messageString, so internal error/validator details are not
+# echoed to callers. The frontend only branches on the HTTP status.
+# Access-Control-Allow-Origin stays '*' on these errors and on the OPTIONS
+# mocks: API Gateway gateway responses and mock integrations cannot select one
+# origin from a list, the API authenticates with a bearer token (never cookies,
+# so '*' never permits credentialed reads), and the Lambda responses that carry
+# data use the ALLOWED_ORIGINS allowlist.
 x-amazon-apigateway-gateway-responses:
   UNAUTHORIZED:
     statusCode: "401"
@@ -28,7 +36,7 @@ x-amazon-apigateway-gateway-responses:
       gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
     responseTemplates:
       application/json: |
-        {"message":$context.error.messageString}
+        {"message":"Unauthorized"}
   BAD_REQUEST_PARAMETERS:
     statusCode: "400"
     responseParameters:
@@ -37,7 +45,7 @@ x-amazon-apigateway-gateway-responses:
       gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
     responseTemplates:
       application/json: |
-        {"message":$context.error.messageString}
+        {"message":"Invalid request parameters"}
   BAD_REQUEST_BODY:
     statusCode: "400"
     responseParameters:
@@ -46,7 +54,7 @@ x-amazon-apigateway-gateway-responses:
       gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
     responseTemplates:
       application/json: |
-        {"message":$context.error.messageString}
+        {"message":"Invalid request body"}
   DEFAULT_4XX:
     responseParameters:
       gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
@@ -54,7 +62,7 @@ x-amazon-apigateway-gateway-responses:
       gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
     responseTemplates:
       application/json: |
-        {"message":$context.error.messageString}
+        {"message":"Request rejected"}
   DEFAULT_5XX:
     responseParameters:
       gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
@@ -62,7 +70,7 @@ x-amazon-apigateway-gateway-responses:
       gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
     responseTemplates:
       application/json: |
-        {"message":$context.error.messageString}
+        {"message":"Internal server error"}
   THROTTLED:
     statusCode: "429"
     responseParameters:

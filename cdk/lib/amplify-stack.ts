@@ -4,6 +4,7 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 import { ApiServiceStack } from "./api-service-stack";
 import { getSocketUrlSsmParam } from "./ecs-socket-stack";
+import { buildAmplifyCustomHeaders, buildContentSecurityPolicy } from "./security-headers";
 
 
 export class AmplifyStack extends cdk.Stack {
@@ -21,6 +22,20 @@ export class AmplifyStack extends cdk.Stack {
 
     // Context values
     const githubRepoName = this.node.tryGetContext("githubRepo");
+
+    // Security headers for every page. The CSP ships as Report-Only until it has been
+    // checked in a browser (cdk/scripts/smoke-security-defaults.ps1 lists the checks); then deploy
+    // with -c CspEnforce=true to make it blocking.
+    const enforceCsp = String(this.node.tryGetContext("CspEnforce") ?? "false") === "true";
+    const contentSecurityPolicy = buildContentSecurityPolicy({
+      region: apiStack.region,
+      apiHost: apiStack.getApiHost(),
+      appSyncApiId: apiStack.appSyncApi.apiId,
+      // socketUrl is "wss://<host>" -> "<host>"
+      socketHost: cdk.Fn.select(2, cdk.Fn.split("/", socketUrl)),
+      docsHost: apiStack.getDocsDomainName(),
+      uploadBucketName: apiStack.getDataIngestionBucketName(),
+    });
 
     // GitHub owner name from SSM
     const githubOwner = cdk.aws_ssm.StringParameter.valueForStringParameter(
@@ -89,6 +104,7 @@ applications:
         files:
           - '**/*'
 `,
+      customHeaders: buildAmplifyCustomHeaders(contentSecurityPolicy, enforceCsp),
       customRules: [
         {
           source: "</^[^.]+$|.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|woff2|ttf|map|json|webp)$)([^.]+$)/>",
