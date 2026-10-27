@@ -740,12 +740,25 @@ exports.handler = async (event, context) => {
               }
             }
 
-            // Check message limit for this simulation group
+            // Check message limit using the group that actually owns this chat
+            // (chats -> student_interactions -> enrollments -> simulation_groups),
+            // never the caller-supplied simulation_group_id. Fail closed if the
+            // chat cannot be resolved to a group.
             const groupSettings = await sqlConnection`
-              SELECT max_messages_per_chat FROM "simulation_groups"
-              WHERE simulation_group_id = ${simulationGroupId};
+              SELECT sg.max_messages_per_chat
+              FROM "chats" c
+              JOIN "student_interactions" si ON si.student_interaction_id = c.student_interaction_id
+              JOIN "enrollments" e ON e.enrollment_id = si.enrollment_id
+              JOIN "simulation_groups" sg ON sg.simulation_group_id = e.simulation_group_id
+              WHERE c.chat_id = ${sessionId};
             `;
-            const maxMessages = groupSettings[0]?.max_messages_per_chat;
+            if (groupSettings.length === 0) {
+              response.statusCode = 403;
+              response.body = JSON.stringify({ error: "Forbidden" });
+              break;
+            }
+            // NULL cap on an existing group means "unlimited" (see adminFunction.js)
+            const maxMessages = groupSettings[0].max_messages_per_chat;
 
             if (maxMessages != null) {
               const messageCount = await sqlConnection`
