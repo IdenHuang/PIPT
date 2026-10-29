@@ -23,6 +23,11 @@ const { SecretsManagerClient, GetSecretValueCommand } = require("@aws-sdk/client
 // nova_sonic.py child process.
 const VOICE_AGENT_ARN = process.env.VOICE_AGENT_ENDPOINT || "";
 const AGENTCORE_REGION = process.env.AWS_REGION || "ca-central-1";
+// Upper bounds for starting a voice session: the WebSocket upgrade, then the
+// agent's "Nova Sonic ready" message (guardrail check, persona load, Bedrock
+// stream open). Past either, the client gets an error it can retry from.
+const VOICE_AGENT_HANDSHAKE_TIMEOUT_MS = 20000;
+const VOICE_READY_TIMEOUT_MS = 60000;
 
 // SHA-256 helper for SigV4
 class Sha256 {
@@ -81,6 +86,9 @@ async function connectToVoiceAgent(initConfig) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(wsUrl, {
       headers: signed.headers,
+      // Fail instead of leaving the student on "connecting" if AgentCore
+      // never completes the upgrade.
+      handshakeTimeout: VOICE_AGENT_HANDSHAKE_TIMEOUT_MS,
     });
 
     ws.on("open", () => {
@@ -322,6 +330,36 @@ io.on("connection", (socket) => {
 
   let novaProcess = null;
   let novaReady = false;
+  // Bumped by every start-nova-sonic and stop-nova-sonic. A start that is
+  // still awaiting (authz, patient context, AgentCore connect) checks it and
+  // gives up if a newer start or a stop arrived in the meantime.
+  let voiceGeneration = 0;
+  let voiceReadyTimer = null;
+
+  function clearVoiceReadyTimer() {
+    if (voiceReadyTimer) {
+      clearTimeout(voiceReadyTimer);
+      voiceReadyTimer = null;
+    }
+  }
+
+  // End the current AgentCore session. socket.agentWs is cleared before the
+  // close so that WebSocket's handlers (which check they are still current)
+  // stay silent. Otherwise the old session's "close" would arrive after the
+  // student clicked reconnect and end the new session with an error.
+  function closeAgentWs() {
+    clearVoiceReadyTimer();
+    const ws = socket.agentWs;
+    socket.agentWs = null;
+    novaReady = false;
+    if (!ws) return;
+    try {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "end_session" }));
+      }
+      ws.close();
+    } catch {}
+  }
 
   // Small delay then log active client count
   setTimeout(() => {
@@ -338,9 +376,26 @@ io.on("connection", (socket) => {
   // nova_sonic.py child process.
   socket.on("start-nova-sonic", async (config = {}) => {
     const now = Date.now();
-    if (now - lastNovaSonicStart < 2000) return;
+    if (now - lastNovaSonicStart < 2000) {
+      // Reply instead of dropping silently, which left the client waiting
+      // on "connecting" for a nova-started that never came.
+      socket.emit("nova-error", { error: "Voice is already starting. Please wait a moment and try again." });
+      return;
+    }
     lastNovaSonicStart = now;
+    const generation = ++voiceGeneration;
+    const isStale = () => generation !== voiceGeneration;
     console.log("🚀 Starting Nova Sonic session for client:", socket.id);
+
+    // A new start replaces any previous session. Tear it down before the
+    // awaits below so none of its late events reach the new session.
+    audioStarted = false;
+    closeAgentWs();
+    if (novaProcess) {
+      novaProcess.kill();
+      novaProcess = null;
+    }
+    novaReady = false;
 
     // ── Session authorization (fail closed; see session-guard.js) ─────────
     // The caller must own the chat and it must belong to the patient/group in
@@ -362,22 +417,37 @@ io.on("connection", (socket) => {
         userEmail: socket.userEmail,
         sessionId,
       });
-      socket.emit("nova-error", { error: novaAuthz.error });
+      if (!isStale()) socket.emit("nova-error", { error: novaAuthz.error });
       return;
     }
+    if (isStale()) return;
 
-    audioStarted = false;
-
-    // Clean up any previous session
-    if (socket.agentWs) {
-      try { socket.agentWs.close(); } catch {}
-      socket.agentWs = null;
+    // ── Caller's ID token for upstream calls ───────────────────────────────
+    // The handshake token expires on a long-lived socket (ID tokens last an
+    // hour), which made a reconnect after a long idle period fail to load the
+    // patient context. The client sends a fresh token with each start; it is
+    // verified and bound to the handshake identity, exactly like the
+    // text-generation relay. Clients that don't send one keep the old behaviour.
+    let userToken = socket.handshake.auth.token;
+    if (config.token !== undefined) {
+      const fresh = await resolveRelayToken(
+        config.token,
+        { userId: socket.userId, userEmail: socket.userEmail },
+        verifyToken,
+      );
+      if (isStale()) return;
+      if (!fresh.ok) {
+        logger.warn("Relay token rejected for start-nova-sonic", {
+          component: "server",
+          operation: "start-nova-sonic",
+          userEmail: socket.userEmail,
+          sessionId,
+        });
+        socket.emit("nova-error", { error: fresh.error });
+        return;
+      }
+      userToken = fresh.token;
     }
-    if (novaProcess) {
-      novaProcess.kill();
-      novaProcess = null;
-    }
-    novaReady = false;
 
     // ── Authoritative patient context (fail closed) ────────────────────────
     // The persona, system prompt and completion rule come only from
@@ -389,8 +459,9 @@ io.on("connection", (socket) => {
       endpoint: process.env.TEXT_GENERATION_ENDPOINT,
       simulationGroupId: config.simulation_group_id,
       patientId: config.patient_id,
-      token: socket.handshake.auth.token,
+      token: userToken,
     });
+    if (isStale()) return;
     if (!patientContext.ok) {
       logger.warn("Patient context unavailable for start-nova-sonic", {
         component: "server",
@@ -419,7 +490,7 @@ io.on("connection", (socket) => {
           simulation_group_id: config.simulation_group_id || "",
           llm_completion: voiceContext.llm_completion,
           system_prompt: voiceContext.system_prompt,
-          cognito_token: socket.handshake.auth.token || "",
+          cognito_token: userToken || "",
           text_generation_endpoint: process.env.TEXT_GENERATION_ENDPOINT || "",
           // The voice agent runs outside CDK, so pass the guardrail it must apply.
           // It fails closed (withholds AI text) if neither this nor its own
@@ -428,10 +499,32 @@ io.on("connection", (socket) => {
           guardrail_region: process.env.BEDROCK_GUARDRAIL_REGION || process.env.AWS_REGION || "",
         });
 
+        // A newer start or a stop arrived while connecting: this session is
+        // no longer wanted, so don't attach it to the socket.
+        if (isStale()) {
+          try {
+            agentWs.send(JSON.stringify({ type: "end_session" }));
+            agentWs.close();
+          } catch {}
+          return;
+        }
+
         socket.agentWs = agentWs;
+        const isCurrent = () => socket.agentWs === agentWs;
+
+        voiceReadyTimer = setTimeout(() => {
+          voiceReadyTimer = null;
+          if (!isCurrent() || novaReady) return;
+          console.warn("⏰ Voice agent not ready after %dms; giving up", VOICE_READY_TIMEOUT_MS);
+          closeAgentWs();
+          socket.emit("nova-error", { error: "Voice took too long to connect. Please try again." });
+        }, VOICE_READY_TIMEOUT_MS);
 
         // Relay messages from agent back to the frontend
         agentWs.on("message", (data) => {
+          // Events from a session that was replaced or stopped must not reach
+          // the client, which may already be running a newer session.
+          if (!isCurrent()) return;
           try {
             const msg = JSON.parse(data.toString());
             console.log("📨 AGENT MSG type=%s role=%s", msg.type, msg.role);
@@ -453,6 +546,7 @@ io.on("connection", (socket) => {
               socket.emit("text-message", { text: msg.text, role: msg.role || "assistant" });
               if (msg.text && msg.text.includes("Nova Sonic ready")) {
                 novaReady = true;
+                clearVoiceReadyTimer();
                 socket.emit("nova-started", { status: "Nova Sonic session started" });
               }
             } else if (msg.type === "diagnosis_complete") {
@@ -467,6 +561,10 @@ io.on("connection", (socket) => {
               // guardrail_unavailable: the agent refused (or stopped) the session
               // because content can't be screened; voice must not run unguarded.
               console.log("⏰ Voice session ended:", msg.error, msg.message);
+              // The agent's Bedrock stream is dead but it keeps the WebSocket
+              // open. Close it now: left open, its later "close" fired after
+              // the student clicked reconnect and ended the new session too.
+              closeAgentWs();
               socket.emit("voice-session-ended", {
                 reason: msg.error,
                 message: msg.message || "Voice had an issue. Please reconnect to continue where you left off."
@@ -479,6 +577,9 @@ io.on("connection", (socket) => {
 
         agentWs.on("close", (code, reason) => {
           console.log("🔚 Voice agent WebSocket closed (code=%s reason=%s)", code, reason);
+          // Closed by us (stop, replace, timeout): already handled.
+          if (!isCurrent()) return;
+          clearVoiceReadyTimer();
           socket.agentWs = null;
           novaReady = false;
           // Notify the frontend so it can exit voice mode gracefully
@@ -490,12 +591,15 @@ io.on("connection", (socket) => {
 
         agentWs.on("error", (err) => {
           console.error("❌ Voice agent WebSocket error:", err.message);
+          if (!isCurrent()) return;
           socket.emit("nova-error", { error: err.message });
         });
 
       } catch (error) {
         console.error("❌ Failed to connect to voice agent:", error.message);
-        socket.emit("nova-error", { error: "Failed to connect to voice agent" });
+        if (!isStale()) {
+          socket.emit("nova-error", { error: "Failed to connect to voice agent" });
+        }
       }
       return;
     }
@@ -531,7 +635,7 @@ io.on("connection", (socket) => {
           LLM_COMPLETION: voiceContext.llm_completion ? "true" : "false",
           EXTRA_SYSTEM_PROMPT: voiceContext.system_prompt,
           APPSYNC_GRAPHQL_URL: process.env.APPSYNC_GRAPHQL_URL || "",
-          COGNITO_TOKEN: socket.handshake.auth.token || "",
+          COGNITO_TOKEN: userToken || "",
         },
       });
       console.log("📡 Nova process spawned with PID:", novaProcess.pid);
@@ -662,7 +766,7 @@ io.on("connection", (socket) => {
               LLM_COMPLETION: voiceContext.llm_completion ? "true" : "false",
               EXTRA_SYSTEM_PROMPT: voiceContext.system_prompt,
               APPSYNC_GRAPHQL_URL: process.env.APPSYNC_GRAPHQL_URL || "",
-              COGNITO_TOKEN: socket.handshake.auth.token || "",
+              COGNITO_TOKEN: userToken || "",
             },
           });
           console.log(
@@ -681,8 +785,12 @@ io.on("connection", (socket) => {
       }
     });
 
+    const spawnedProcess = novaProcess;
     novaProcess.on("close", (code) => {
       console.log("🔚 Nova process closed with code:", code);
+      // A killed predecessor exits after its replacement started; only the
+      // current process may reset the session state.
+      if (novaProcess !== spawnedProcess) return;
       novaProcess = null;
       novaReady = false;
     });
@@ -1031,14 +1139,11 @@ io.on("connection", (socket) => {
   // ─── Optional Stop event ────────────────────────────────────────────────
   socket.on("stop-nova-sonic", () => {
     console.log("🛑 Stop requested by client");
+    // Abandon any start that is still connecting.
+    voiceGeneration++;
     // ── AgentCore WebSocket path ──────────────────────────────────────────
     if (socket.agentWs) {
-      try {
-        socket.agentWs.send(JSON.stringify({ type: "end_session" }));
-        socket.agentWs.close();
-      } catch {}
-      socket.agentWs = null;
-      novaReady = false;
+      closeAgentWs();
       return;
     }
 
@@ -1058,14 +1163,10 @@ io.on("connection", (socket) => {
     // on the user and deliberately kept, so a reconnect does not reset it.
     stopTtsProcess();
 
-    // Clean up AgentCore WebSocket session if present
-    if (socket.agentWs) {
-      try {
-        socket.agentWs.send(JSON.stringify({ type: "end_session" }));
-        socket.agentWs.close();
-      } catch {}
-      socket.agentWs = null;
-    }
+    // Clean up AgentCore WebSocket session if present, and abandon any start
+    // that is still connecting so it doesn't open an orphaned session.
+    voiceGeneration++;
+    closeAgentWs();
   });
 });
 

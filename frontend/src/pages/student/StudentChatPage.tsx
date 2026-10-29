@@ -222,7 +222,7 @@ function StudentChatPage() {
         setIsVoiceModeActive(false);
         setVoiceSessionState('idle');
         setVoiceError(message || 'Voice had an issue. Please reconnect to continue where you left off.');
-        audioClientRef.current = null;
+        if (audioClientRef.current === client) audioClientRef.current = null;
         // Reset voice bubble tracking so next session starts fresh
         currentVoiceBubbleRef.current = null;
         lastVoiceRoleRef.current = null;
@@ -277,8 +277,14 @@ function StudentChatPage() {
       },
     });
 
+    // Fresh ID token for the server's upstream calls: the socket's handshake
+    // token may have expired if the page has been open for a while.
+    const freshToken = await authService.getIdToken().catch(() => null);
+
     audioClientRef.current = client;
     client.connect({
+      // Omitted when unavailable so the server falls back to the handshake token.
+      ...(freshToken ? { token: freshToken } : {}),
       session_id: sessionId || routeChatId || '',
       patient_name: patient?.name || '',
       patient_id: patientId || '',

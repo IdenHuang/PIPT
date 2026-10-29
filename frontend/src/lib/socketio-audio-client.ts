@@ -34,6 +34,9 @@ export interface SocketIOAudioClientConfig {
 // Implementation
 // ---------------------------------------------------------------------------
 
+/** Wait this long for `nova-started` (longer than the server's 60s limit). */
+const CONNECT_TIMEOUT_MS = 75000;
+
 export class SocketIOAudioClient {
   private config: SocketIOAudioClientConfig;
   private state: VoiceSessionState = 'idle';
@@ -51,6 +54,7 @@ export class SocketIOAudioClient {
   private boundOnTurnStart: ((...args: unknown[]) => void) | null = null;
   private boundOnSessionEnded: ((...args: unknown[]) => void) | null = null;
   private boundOnAudioFlush: ((...args: unknown[]) => void) | null = null;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(config: SocketIOAudioClientConfig) {
     this.config = config;
@@ -86,12 +90,12 @@ export class SocketIOAudioClient {
 
       // 3. Wire up Socket.IO listeners
       this.boundOnNovaStarted = () => {
+        this.clearConnectTimer();
         this.setState('active');
         // Start audio capture only after Nova Sonic is ready
         // to avoid dropping early frames
         this.startCapture().catch((err) => {
-          this.config.onError(err instanceof Error ? err : new Error(String(err)));
-          this.setState('error');
+          this.fail(err instanceof Error ? err.message : String(err));
         });
       };
       this.boundOnAudioChunk = (data: unknown) => {
@@ -100,8 +104,7 @@ export class SocketIOAudioClient {
       };
       this.boundOnNovaError = (data: unknown) => {
         const msg = data as { error: string };
-        this.config.onError(new Error(msg.error));
-        this.setState('error');
+        this.fail(msg.error);
       };
 
       this.config.socket.on('nova-started', this.boundOnNovaStarted);
@@ -158,6 +161,15 @@ export class SocketIOAudioClient {
 
       // 4. Tell the server to start the session
       this.config.socket.emit('start-nova-sonic', sessionConfig);
+
+      // Don't sit on "connecting" forever if nova-started never arrives
+      // (e.g. the socket dropped mid-start). The server gives up at 60s.
+      this.connectTimer = setTimeout(() => {
+        this.connectTimer = null;
+        if (this.state === 'connecting') {
+          this.fail('Voice took too long to connect. Please try again.');
+        }
+      }, CONNECT_TIMEOUT_MS);
 
     } catch (err) {
       this.cleanup();
@@ -320,7 +332,30 @@ export class SocketIOAudioClient {
   // Cleanup
   // -----------------------------------------------------------------------
 
+  /**
+   * End this session with an error. Tells the server to stop (abandoning a
+   * start that is still connecting) and removes this client's socket
+   * listeners. Without the cleanup, a failed client stayed subscribed and
+   * reacted to the next session's events, e.g. ending it on its
+   * `voice-session-ended` or starting a second mic capture on `nova-started`.
+   */
+  private fail(message: string): void {
+    this.config.socket.emit('stop-nova-sonic', {});
+    this.cleanup();
+    this.config.onError(new Error(message));
+    this.setState('error');
+  }
+
+  private clearConnectTimer(): void {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+  }
+
   private cleanup(): void {
+    this.clearConnectTimer();
+
     // Stop audio capture
     if (this.workletNode) {
       this.workletNode.disconnect();
