@@ -2964,8 +2964,8 @@ def screen_transcript_for_grading(
     max_workers: int = 8,
 ) -> list[dict]:
     """
-    Run every student turn through ``apply_text_guardrail`` (source=INPUT)
-    before the transcript is placed in a grading prompt.
+    Run every non-empty transcript turn through ``apply_text_guardrail``
+    (source=INPUT) before the transcript is placed in a grading prompt.
 
     Messages are stored by ``POST /student/create_message`` without guardrail
     screening, so this is the first point where prompt-attack filtering
@@ -2973,37 +2973,39 @@ def screen_transcript_for_grading(
     ``WITHHELD_MESSAGE_PLACEHOLDER``. The guardrail fails closed, so if it is
     unavailable the turn is also withheld and the debrief is marked degraded.
 
-    AI/system turns are not screened here: they are model output that was
-    already screened (source=OUTPUT) when generated.
+    AI/system turns are screened too. ``sender`` comes from the stored
+    ``messages.sender_type`` column, which a student can set to ``'ai'``
+    (e.g. via ``POST /student/create_ai_message``), so no turn is trusted on
+    the basis of its label.
 
     Returns a new list; the input is not modified.
     """
     screened = [dict(m) for m in transcript]
-    student_idx = [
+    turn_idx = [
         i for i, m in enumerate(screened)
-        if str(m.get("sender", "")).lower() == "student" and (m.get("content") or "").strip()
+        if (m.get("content") or "").strip()
     ]
-    if not student_idx:
+    if not turn_idx:
         return screened
 
-    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(student_idx)))) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(turn_idx)))) as executor:
         results = list(executor.map(
             lambda i: apply_text_guardrail(screened[i]["content"], "INPUT"),
-            student_idx,
+            turn_idx,
         ))
 
     withheld = 0
-    for i, (passed, _replacement) in zip(student_idx, results):
+    for i, (passed, _replacement) in zip(turn_idx, results):
         if not passed:
             screened[i]["content"] = WITHHELD_MESSAGE_PLACEHOLDER
             withheld += 1
 
     if withheld:
-        logger.warning(f"📋 Withheld {withheld}/{len(student_idx)} student turns from the grading transcript")
+        logger.warning(f"📋 Withheld {withheld}/{len(turn_idx)} turns from the grading transcript")
         if tracker:
             tracker.record(
                 "screen_transcript_for_grading",
-                f"{withheld}_of_{len(student_idx)}_student_turns_withheld",
+                f"{withheld}_of_{len(turn_idx)}_turns_withheld",
                 "score_may_be_affected",
             )
     return screened
