@@ -12,6 +12,26 @@ const { fetchPatientContext } = require("./patient-context");
 const { StreamRelayRegistry, safeEqual } = require("./stream-relay");
 const { VoicePreviewLimiter, ConnectionLimiter, limiterKey, positiveIntEnv } = require("./voice-preview-limiter");
 const logger = require("./logger");
+const { asPayload, guardHandler } = require("./event-guard");
+
+// Last-resort traps. Node 22 exits on an unhandled rejection by default, and
+// this service runs as a single ECS task, so one listener bug would drop every
+// connected user. Event handlers are also wrapped individually (guardHandler);
+// these catch anything that escapes outside a handler.
+process.on("unhandledRejection", (err) => {
+  logger.error("unhandledRejection", {
+    component: "server",
+    error: String(err && err.message),
+    stack: err && err.stack,
+  });
+});
+process.on("uncaughtException", (err) => {
+  logger.error("uncaughtException", {
+    component: "server",
+    error: String(err && err.message),
+    stack: err && err.stack,
+  });
+});
 
 /**
  * Logs that a voice transcript or diagnosis message passed through, without
@@ -331,6 +351,9 @@ io.on("connection", (socket) => {
   }
   socket.on("disconnect", releaseConnection);
 
+  // Register a client event listener whose errors are logged, not thrown.
+  const on = (event, handler) => socket.on(event, guardHandler(event, socket, handler));
+
   console.log("🔌 CLIENT CONNECTED:", socket.id, "User:", socket.userEmail);
   console.log(
     process.env.SM_DB_CREDENTIALS
@@ -387,7 +410,9 @@ io.on("connection", (socket) => {
   // When VOICE_AGENT_ARN is set, audio is streamed to the AgentCore
   // voice agent via WebSocket. Otherwise, falls back to the local
   // nova_sonic.py child process.
-  socket.on("start-nova-sonic", async (config = {}) => {
+  on("start-nova-sonic", async (rawConfig) => {
+    // Defaults do not apply to an explicit null, so normalise here.
+    const config = asPayload(rawConfig) || {};
     const now = Date.now();
     if (now - lastNovaSonicStart < 2000) {
       // Reply instead of dropping silently, which left the client waiting
@@ -821,7 +846,9 @@ io.on("connection", (socket) => {
   let audioStarted = false;
   let lastNovaSonicStart = 0;
   let textGenInFlight = false;
-  socket.on("audio-input", (msg) => {
+  on("audio-input", (rawMsg) => {
+    const msg = asPayload(rawMsg);
+    if (!msg) return;
     // ── AgentCore WebSocket path ──────────────────────────────────────────
     if (socket.agentWs && socket.agentWs.readyState === WebSocket.OPEN) {
       if (!audioStarted) {
@@ -848,7 +875,9 @@ io.on("connection", (socket) => {
   });
 
   // ─── Text‑input from client ───────────────────────────────────────────────
-  socket.on("text-input", (msg) => {
+  on("text-input", (rawMsg) => {
+    const msg = asPayload(rawMsg);
+    if (!msg) return;
     // ── AgentCore WebSocket path ──────────────────────────────────────────
     if (socket.agentWs && socket.agentWs.readyState === WebSocket.OPEN) {
       socket.agentWs.send(JSON.stringify({ type: "text", text: msg.text }));
@@ -866,8 +895,13 @@ io.on("connection", (socket) => {
   });
 
   // ─── Text generation streaming ─────────────────────────────────────────────
-  socket.on("text-generation", async (data) => {
+  on("text-generation", async (rawData) => {
     if (textGenInFlight) return;
+    const data = asPayload(rawData);
+    if (!data) {
+      socket.emit("text-stream", { type: "error", content: "Invalid request" });
+      return;
+    }
     textGenInFlight = true;
     // Log identifiers only: data.token is the caller's bearer token and
     // data.message is student content, so neither may reach CloudWatch.
@@ -1002,7 +1036,7 @@ io.on("connection", (socket) => {
   });
 
   // ─── End‑audio event ─────────────────────────────────────────────────────
-  socket.on("end-audio", () => {
+  on("end-audio", () => {
     // ── AgentCore WebSocket path ──────────────────────────────────────────
     if (socket.agentWs && socket.agentWs.readyState === WebSocket.OPEN) {
       socket.agentWs.send(JSON.stringify({ type: "end_audio" }));
@@ -1037,7 +1071,9 @@ io.on("connection", (socket) => {
     return true;
   }
 
-  socket.on("voice-preview", (config = {}) => {
+  on("voice-preview", (rawConfig) => {
+    // Defaults do not apply to an explicit null, so normalise here.
+    const config = asPayload(rawConfig) || {};
     console.log("🎙️ Voice preview requested:", config.voice_id);
 
     // Replace any previous TTS process for this socket before checking limits
@@ -1131,34 +1167,36 @@ io.on("connection", (socket) => {
   });
 
   // Relay mic audio to the voice preview process
-  socket.on("voice-preview-audio", (msg) => {
+  on("voice-preview-audio", (rawMsg) => {
+    const msg = asPayload(rawMsg);
+    if (!msg) return;
     if (ttsProcess && ttsProcess.stdin.writable && ttsReady) {
       ttsProcess.stdin.write(JSON.stringify({ type: "audio", data: msg.data }) + "\n");
     }
   });
 
-  socket.on("voice-preview-start-audio", () => {
+  on("voice-preview-start-audio", () => {
     if (ttsProcess && ttsProcess.stdin.writable && ttsReady) {
       ttsProcess.stdin.write(JSON.stringify({ type: "start_audio" }) + "\n");
       console.log("🎬 Voice preview: start_audio");
     }
   });
 
-  socket.on("voice-preview-end-audio", () => {
+  on("voice-preview-end-audio", () => {
     if (ttsProcess && ttsProcess.stdin.writable && ttsReady) {
       ttsProcess.stdin.write(JSON.stringify({ type: "end_audio" }) + "\n");
       console.log("🛑 Voice preview: end_audio");
     }
   });
 
-  socket.on("stop-voice-preview", () => {
+  on("stop-voice-preview", () => {
     if (stopTtsProcess()) {
       console.log("🛑 Voice preview stopped by client");
     }
   });
 
   // ─── Optional Stop event ────────────────────────────────────────────────
-  socket.on("stop-nova-sonic", () => {
+  on("stop-nova-sonic", () => {
     console.log("🛑 Stop requested by client");
     // Abandon any start that is still connecting.
     voiceGeneration++;
@@ -1177,7 +1215,7 @@ io.on("connection", (socket) => {
   });
 
   // ─── Disconnect cleanup ──────────────────────────────────────────────────
-  socket.on("disconnect", () => {
+  on("disconnect", () => {
     console.log("🔌 CLIENT DISCONNECTED:", socket.id);
 
     // Clean up TTS preview process if present. Rate-limit history is keyed
