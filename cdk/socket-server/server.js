@@ -12,6 +12,19 @@ const { fetchPatientContext } = require("./patient-context");
 const { StreamRelayRegistry, safeEqual } = require("./stream-relay");
 const { VoicePreviewLimiter, ConnectionLimiter, limiterKey, positiveIntEnv } = require("./voice-preview-limiter");
 const logger = require("./logger");
+
+/**
+ * Logs that a voice transcript or diagnosis message passed through, without
+ * its text. Transcripts are student work product (and the assistant's replies
+ * echo it), so only the source, role and length reach CloudWatch.
+ */
+function logTranscript(source, role, text) {
+  logger.info("Voice text message", {
+    component: source,
+    role,
+    chars: typeof text === "string" ? text.length : 0,
+  });
+}
 const { SignatureV4 } = require("@smithy/signature-v4");
 const { HttpRequest } = require("@smithy/protocol-http");
 const { defaultProvider } = require("@aws-sdk/credential-provider-node");
@@ -539,10 +552,11 @@ io.on("connection", (socket) => {
             } else if (msg.type === "turn-start") {
               socket.emit("turn-start", { role: msg.role });
             } else if (msg.type === "user-text") {
-              console.log("💬 AGENT USER TEXT:", msg.text);
+              // Transcripts are student content: log size only, never the text.
+              logTranscript("agentcore", "user", msg.text);
               socket.emit("text-message", { text: msg.text, role: "user" });
             } else if (msg.type === "text") {
-              console.log("💬 AGENT TEXT:", msg.text);
+              logTranscript("agentcore", msg.role || "assistant", msg.text);
               socket.emit("text-message", { text: msg.text, role: msg.role || "assistant" });
               if (msg.text && msg.text.includes("Nova Sonic ready")) {
                 novaReady = true;
@@ -550,7 +564,7 @@ io.on("connection", (socket) => {
                 socket.emit("nova-started", { status: "Nova Sonic session started" });
               }
             } else if (msg.type === "diagnosis_complete") {
-              console.log("🎯 DIAGNOSIS COMPLETE:", msg.text);
+              logTranscript("agentcore", "diagnosis_complete", msg.text);
               socket.emit("diagnosis-complete", { message: msg.text });
             } else if (msg.type === "diagnosis_verdict") {
               console.log("🩺 DIAGNOSIS VERDICT:", msg.verdict);
@@ -654,7 +668,10 @@ io.on("connection", (socket) => {
         .forEach((line) => {
           try {
             const parsed = JSON.parse(line);
-            console.log("📤 NOVA JSON:", parsed);
+            // Message type only: the payload carries transcripts and audio.
+            if (parsed.type !== "audio") {
+              logger.info("Nova message", { component: "nova", type: parsed.type });
+            }
 
             // ─ Audio chunks ───────────────────────────────────────────────
             if (parsed.type === "audio") {
@@ -674,15 +691,19 @@ io.on("connection", (socket) => {
             }
             // ─ Debug messages ───────────────────────────────────────────
             else if (parsed.type === "debug") {
-              console.log("🐞 NOVA DEBUG:", parsed.text);
+              // Debug text can echo session content; local development only.
+              if (process.env.NODE_ENV !== "production") {
+                console.log("🐞 NOVA DEBUG:", parsed.text);
+              }
             }
             // ─ Text messages ─────────────────────────────────────────────
             else if (parsed.type === "user-text") {
-              console.log("💬 NOVA USER TEXT:", parsed.text);
+              // Transcripts are student content: log size only, never the text.
+              logTranscript("nova", "user", parsed.text);
               socket.emit("text-message", { text: parsed.text, role: "user" });
             }
             else if (parsed.type === "text") {
-              console.log("💬 NOVA TEXT:", parsed.text);
+              logTranscript("nova", parsed.role || "assistant", parsed.text);
               socket.emit("text-message", { text: parsed.text, role: parsed.role || "assistant" });
               if (parsed.text.includes("Nova Sonic ready")) {
                 novaReady = true;
@@ -693,7 +714,7 @@ io.on("connection", (socket) => {
             }
             // ─ Diagnosis completion ──────────────────────────────────────
             else if (parsed.type === "diagnosis_complete") {
-              console.log("🎯 DIAGNOSIS COMPLETE:", parsed.text);
+              logTranscript("nova", "diagnosis_complete", parsed.text);
               socket.emit("diagnosis-complete", { message: parsed.text });
             } else if (parsed.type === "diagnosis_verdict") {
               console.log("🩺 DIAGNOSIS VERDICT:", parsed.verdict);

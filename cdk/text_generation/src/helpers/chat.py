@@ -334,7 +334,8 @@ def get_response(
     Manager read, a DB connection and an error log. Conversation history
     still lives in DynamoDB under the caller-bound playground key.
     """
-    logger.info(f"🔍 GET_RESPONSE CALLED - Stream: {stream}, Query: '{query[:50]}...'")
+    # Never log query text (student message content); its length is enough to debug.
+    logger.info(f"🔍 GET_RESPONSE CALLED - Stream: {stream}, query_chars={len(query or '')}")
     
     # Screen student input through guardrails (skip the initial system-generated prompt
     # which is trusted instructor content, not student input)
@@ -541,7 +542,7 @@ def generate_streaming_response(
     # TODO(refactor): Extract student message saving + matching into a helper function (duplicated with get_response)
     import time
     
-    logger.info(f"🚀 STREAMING FUNCTION STARTED with query: '{query}' - DEPLOYMENT TEST v2")
+    logger.info(f"🚀 STREAMING FUNCTION STARTED: query_chars={len(query or '')}")
 
     # Empathy evaluation disabled
     # def empathy_async():
@@ -570,7 +571,7 @@ def generate_streaming_response(
     #         save_message_to_db(session_id, student_user_id, 'student', query)
 
     try:
-        logger.info(f"🔍 STREAMING QUERY CHECK: '{query}' (length: {len(query.strip())})")
+        logger.info(f"🔍 STREAMING QUERY CHECK: length={len(query.strip())}")
         # Empathy evaluation disabled
         # Skip saving and matching for the initial system-generated prompt —
         # it is not a real student message.

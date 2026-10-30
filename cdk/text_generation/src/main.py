@@ -374,13 +374,13 @@ def get_system_prompt(simulation_group_id):
         """, (simulation_group_id,))
 
         result = cur.fetchone()
-        logger.info(f"Query result: {result}")
         system_prompt = result[0] if result else None
 
         cur.close()
 
         if system_prompt and system_prompt.strip():
-            logger.info(f"System prompt for simulation_group_id {simulation_group_id} found: {system_prompt}")
+            # Log metadata only, never the instructor-authored prompt text.
+            logger.info(f"System prompt for simulation_group_id {simulation_group_id} found: prompt_chars={len(system_prompt)}")
             return system_prompt
         else:
             logger.warning(f"No system prompt configured for simulation_group_id={simulation_group_id}, using default")
@@ -411,7 +411,6 @@ def get_persona_details(persona_id):
         """, (persona_id,))
 
         result = cur.fetchone()
-        logger.info(f"Query result: {result}")
 
         cur.close()
 
@@ -419,8 +418,10 @@ def get_persona_details(persona_id):
             persona_name, persona_age, persona_prompt = result
             persona_prompt = seed_prompt(persona_prompt, DEFAULT_PERSONA_PROMPT)
             llm_completion = True
+            # Log metadata only: the persona prompt is instructor-authored
+            # configuration and must not be copied into CloudWatch.
             logger.info(f"persona details found for persona_id {persona_id}: "
-                        f"Name: {persona_name}, Age: {persona_age}, Prompt: {persona_prompt}, LLM Completion: {llm_completion}")
+                        f"prompt_chars={len(persona_prompt or '')}, LLM Completion: {llm_completion}")
             return persona_name, persona_age, persona_prompt, llm_completion
         else:
             logger.warning(f"No details found for persona_id {persona_id}")
@@ -833,11 +834,12 @@ def handler(event, context):
         except Exception as e:
             logger.error(f"Failed to cache key questions: {e}")
     else:
-        logger.info(f"Processing student question: {question}")
+        # Student messages are educational records: log their size, never their text.
+        logger.info(f"Processing student question: question_chars={len(question or '')}")
         student_query = get_student_query(question)
         is_initial_prompt = False
         
-    logger.info(f"🔍 FINAL STUDENT QUERY: '{student_query}'")
+    logger.info(f"🔍 FINAL STUDENT QUERY built: query_chars={len(student_query or '')}")
 
     # ── Message Limit Check ──────────────────────────────────────────────
     if not is_initial_prompt:
@@ -950,7 +952,7 @@ def handler(event, context):
     try:
         logger.info("Generating response from the LLM.")
         
-        logger.info(f"🚀 CALLING get_response with query: '{student_query}'")
+        logger.info(f"🚀 CALLING get_response: query_chars={len(student_query or '')}")
         response = get_response(
             query=student_query,
             patient_name=patient_name,
