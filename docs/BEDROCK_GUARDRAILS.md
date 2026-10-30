@@ -300,8 +300,8 @@ These metrics are available in the `AWS/Bedrock` namespace and can be filtered b
 The text generation service logs guardrail events at the application level:
 
 ```python
-# Logged when guardrail blocks a message
-logger.warning("Guardrail INTERVENED (%s): %s → %s", source, text[:60], blocked_msg)
+# Logged when guardrail blocks a message (length only, never the text itself)
+logger.warning("Guardrail INTERVENED (%s): chars=%d", source, len(text or ""))
 
 # Logged when guardrail API call fails
 logger.error("Guardrail check failed, attempt %d/2 (%s): %s", attempt + 1, source, e)

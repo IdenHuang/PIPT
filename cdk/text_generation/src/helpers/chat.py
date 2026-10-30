@@ -208,7 +208,8 @@ def apply_text_guardrail(text: str, source: str) -> tuple:
             action = response.get('action', '')
             if action == 'GUARDRAIL_INTERVENED':
                 blocked_msg = response.get('outputs', [{}])[0].get('text', "I'm sorry, I can't respond to that.")
-                logger.warning("Guardrail INTERVENED (%s): %s → %s", source, text[:60], blocked_msg)
+                # Never log checked text (student input or model output); length is enough to debug.
+                logger.warning("Guardrail INTERVENED (%s): chars=%d", source, len(text or ""))
                 return False, blocked_msg
             return True, None
         except Exception as e:
@@ -342,7 +343,7 @@ def get_response(
     if not is_initial_prompt:
         passed, blocked_msg = apply_text_guardrail(query, "INPUT")
         if not passed:
-            logger.warning("Guardrail blocked student input: %s", query[:60])
+            logger.warning("Guardrail blocked student input (chars=%d)", len(query or ""))
             if stream:
                 # Publish the blocked message through AppSync so the frontend
                 # receives the full start → chunk → end sequence and stops loading.
