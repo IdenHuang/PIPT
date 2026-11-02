@@ -1,16 +1,20 @@
+const { tokenExpiryMs } = require("./socket-auth-lifetime");
+
 /**
- * Upstream credential for the text-generation relay.
+ * Verifies a client-supplied ID token and binds it to the socket's identity.
  *
- * The client sends a fresh ID token with each request (data.token) because the
- * handshake token can expire on a long-lived socket. That token must not be
- * forwarded as-is: it is verified the same way as the handshake token, and it
- * must belong to the same user the socket authenticated as. Otherwise the
- * session guard would authorize as one user while the API call ran as another.
+ * Used for every token a client sends after the handshake: the per-request
+ * token on text-generation and start-nova-sonic (forwarded upstream), and the
+ * "reauth" event that extends the socket's lifetime. The token is verified the
+ * same way as the handshake token, and it must belong to the same user the
+ * socket authenticated as. Otherwise the session guard would authorize as one
+ * user while the API call ran as another.
  *
- * @param {unknown} token - client-supplied token (data.token)
+ * @param {unknown} token - client-supplied token
  * @param {{ userId: string, userEmail: string }} socketIdentity - from the verified handshake
  * @param {(token: string) => Promise<object>} verify - auth.verifyToken
- * @returns {Promise<{ ok: true, token: string } | { ok: false, error: string }>}
+ * @returns {Promise<{ ok: true, token: string, expiresAt: number } | { ok: false, error: string }>}
+ *   expiresAt is the token's exp in epoch milliseconds.
  */
 async function resolveRelayToken(token, socketIdentity, verify) {
   if (typeof token !== "string" || token.length === 0) {
@@ -32,7 +36,7 @@ async function resolveRelayToken(token, socketIdentity, verify) {
   ) {
     return { ok: false, error: "Authentication failed" };
   }
-  return { ok: true, token };
+  return { ok: true, token, expiresAt: tokenExpiryMs(decoded) };
 }
 
 module.exports = { resolveRelayToken };

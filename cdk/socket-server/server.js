@@ -13,6 +13,7 @@ const { StreamRelayRegistry, safeEqual } = require("./stream-relay");
 const { VoicePreviewLimiter, ConnectionLimiter, limiterKey, positiveIntEnv } = require("./voice-preview-limiter");
 const logger = require("./logger");
 const { asPayload, guardHandler } = require("./event-guard");
+const { SocketAuthLifetime, tokenExpiryMs } = require("./socket-auth-lifetime");
 
 // Last-resort traps. Node 22 exits on an unhandled rejection by default, and
 // this service runs as a single ECS task, so one listener bug would drop every
@@ -328,6 +329,9 @@ io.use(async (socket, next) => {
     const decoded = await verifyToken(token);
     socket.userId = decoded.sub;
     socket.userEmail = decoded.email;
+    // The connection is valid only until this token (or a newer one sent on
+    // "reauth") expires; see socket-auth-lifetime.js.
+    socket.authExpiresAt = tokenExpiryMs(decoded);
     // Early refusal with a clear connect_error; the authoritative count is
     // taken in the connection handler so abandoned handshakes cannot leak.
     if (connectionLimiter.isAtLimit(limiterKey(socket))) {
@@ -351,8 +355,78 @@ io.on("connection", (socket) => {
   }
   socket.on("disconnect", releaseConnection);
 
-  // Register a client event listener whose errors are logged, not thrown.
-  const on = (event, handler) => socket.on(event, guardHandler(event, socket, handler));
+  // ── Credential lifetime ───────────────────────────────────────────────────
+  // The handshake token is verified once, so the socket must not outlive it.
+  // When it (or the newest token sent on "reauth") expires, the server
+  // disconnects; the disconnect handler below tears down voice and preview
+  // sessions. Every client event is refused once expired, even if the timer
+  // has not fired yet.
+  function expireSocket() {
+    if (socket.disconnected) return;
+    logger.info("Socket credential expired; disconnecting", {
+      component: "server",
+      operation: "auth-expiry",
+      socketId: socket.id,
+      userEmail: socket.userEmail,
+    });
+    socket.emit("auth-expired", { message: "Your sign-in has expired. Please sign in again." });
+    socket.disconnect(true);
+  }
+  const authLifetime = new SocketAuthLifetime({
+    expiresAtMs: socket.authExpiresAt,
+    onExpire: expireSocket,
+  });
+  socket.on("disconnect", () => authLifetime.stop());
+
+  // Extend the lifetime from any token verified and bound to this socket's
+  // identity (reauth, text-generation, start-nova-sonic).
+  function acceptFreshToken(verified) {
+    if (verified && verified.ok) authLifetime.renew(verified.expiresAt);
+  }
+
+  // Register a client event listener whose errors are logged, not thrown, and
+  // which only runs while the socket's credential is still valid.
+  const on = (event, handler) => socket.on(event, guardHandler(event, socket, (...args) => {
+    if (authLifetime.isExpired()) {
+      expireSocket();
+      return undefined;
+    }
+    return handler(...args);
+  }));
+
+  // ─── Re-authentication ────────────────────────────────────────────────────
+  // The client sends a fresh ID token before the current one expires. It must
+  // verify and belong to the same user as the handshake (resolveRelayToken).
+  // A rejected token does not disconnect immediately (a JWKS hiccup should not
+  // drop a live voice session); the socket still expires on schedule.
+  on("reauth", async (rawData, ack) => {
+    const reply = typeof ack === "function" ? ack : () => {};
+    const data = asPayload(rawData);
+    const result = await resolveRelayToken(
+      data && data.token,
+      { userId: socket.userId, userEmail: socket.userEmail },
+      verifyToken,
+    );
+    if (!result.ok) {
+      logger.warn("Reauth token rejected", {
+        component: "server",
+        operation: "reauth",
+        socketId: socket.id,
+        userEmail: socket.userEmail,
+      });
+      reply({ ok: false, error: result.error });
+      return;
+    }
+    if (!authLifetime.renew(result.expiresAt)) {
+      reply({ ok: false, error: "Session expired" });
+      return;
+    }
+    reply({ ok: true, expiresInMs: authLifetime.expiresInMs() });
+  });
+
+  // Tell the client when to reauth. Relative time, so client clock skew
+  // doesn't matter.
+  socket.emit("auth-state", { expiresInMs: authLifetime.expiresInMs() });
 
   console.log("🔌 CLIENT CONNECTED:", socket.id, "User:", socket.userEmail);
   console.log(
@@ -460,32 +534,29 @@ io.on("connection", (socket) => {
     }
     if (isStale()) return;
 
-    // ── Caller's ID token for upstream calls ───────────────────────────────
-    // The handshake token expires on a long-lived socket (ID tokens last an
-    // hour), which made a reconnect after a long idle period fail to load the
-    // patient context. The client sends a fresh token with each start; it is
-    // verified and bound to the handshake identity, exactly like the
-    // text-generation relay. Clients that don't send one keep the old behaviour.
-    let userToken = socket.handshake.auth.token;
-    if (config.token !== undefined) {
-      const fresh = await resolveRelayToken(
-        config.token,
-        { userId: socket.userId, userEmail: socket.userEmail },
-        verifyToken,
-      );
-      if (isStale()) return;
-      if (!fresh.ok) {
-        logger.warn("Relay token rejected for start-nova-sonic", {
-          component: "server",
-          operation: "start-nova-sonic",
-          userEmail: socket.userEmail,
-          sessionId,
-        });
-        socket.emit("nova-error", { error: fresh.error });
-        return;
-      }
-      userToken = fresh.token;
+    // ── Caller's ID token for upstream calls (required) ────────────────────
+    // The client sends a fresh token with each start. It is verified and bound
+    // to the handshake identity, exactly like the text-generation relay. The
+    // handshake token is never reused: it may be close to expiry, and the
+    // voice agent forwards this token to the API for the whole session.
+    const fresh = await resolveRelayToken(
+      config.token,
+      { userId: socket.userId, userEmail: socket.userEmail },
+      verifyToken,
+    );
+    if (isStale()) return;
+    if (!fresh.ok) {
+      logger.warn("Relay token rejected for start-nova-sonic", {
+        component: "server",
+        operation: "start-nova-sonic",
+        userEmail: socket.userEmail,
+        sessionId,
+      });
+      socket.emit("nova-error", { error: fresh.error });
+      return;
     }
+    acceptFreshToken(fresh);
+    const userToken = fresh.token;
 
     // ── Authoritative patient context (fail closed) ────────────────────────
     // The persona, system prompt and completion rule come only from
@@ -959,6 +1030,7 @@ io.on("connection", (socket) => {
       textGenInFlight = false;
       return;
     }
+    acceptFreshToken(relayToken);
 
     // Register this socket so /stream-callback can find it. With stream=true the
     // Lambda POSTs chunks back to this server's internal NLB URL, which it reads
@@ -1215,7 +1287,8 @@ io.on("connection", (socket) => {
   });
 
   // ─── Disconnect cleanup ──────────────────────────────────────────────────
-  on("disconnect", () => {
+  // Registered without the credential gate: cleanup must run after expiry.
+  socket.on("disconnect", guardHandler("disconnect", socket, () => {
     console.log("🔌 CLIENT DISCONNECTED:", socket.id);
 
     // Clean up TTS preview process if present. Rate-limit history is keyed
@@ -1226,7 +1299,15 @@ io.on("connection", (socket) => {
     // that is still connecting so it doesn't open an orphaned session.
     voiceGeneration++;
     closeAgentWs();
-  });
+
+    // Local child process path: stop it too, so an expired or closed socket
+    // cannot leave a Bedrock stream running.
+    if (novaProcess) {
+      novaProcess.kill();
+      novaProcess = null;
+      novaReady = false;
+    }
+  }));
 });
 
 // ─── Start HTTP server on port 80 ─────────────────────────────────────────

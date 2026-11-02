@@ -8,6 +8,7 @@ import { SIMULATION_GROUP_COLOR_PALETTE, UI_COLORS } from '@/lib/colors';
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import { SocketIOAudioClient, type VoiceSessionState } from '@/lib/socketio-audio-client';
+import { attachSocketReauth } from '@/lib/socket-reauth';
 // CaseMaterialsDialog and PhysicalAssessmentDialog are rendered inline in the sidebar
 import ConfirmConcludeDialog from '@/components/ConfirmConcludeDialog';
 import PhysicalAssessmentContent, { ImageViewer, isImageFile } from '@/components/PhysicalAssessmentContent';
@@ -178,6 +179,13 @@ function StudentChatPage() {
         reconnectionDelayMax: 10000,
         timeout: 60000,
       });
+      attachSocketReauth(socketRef.current, {
+        onExpired: (message) => {
+          setIsVoiceModeActive(false);
+          setVoiceSessionState('idle');
+          setVoiceError(message);
+        },
+      });
       startAudioClient();
       return;
     }
@@ -277,14 +285,13 @@ function StudentChatPage() {
       },
     });
 
-    // Fresh ID token for the server's upstream calls: the socket's handshake
-    // token may have expired if the page has been open for a while.
+    // Fresh ID token for the server's upstream calls. Required: the server
+    // refuses to start voice without one.
     const freshToken = await authService.getIdToken().catch(() => null);
 
     audioClientRef.current = client;
     client.connect({
-      // Omitted when unavailable so the server falls back to the handshake token.
-      ...(freshToken ? { token: freshToken } : {}),
+      token: freshToken || '',
       session_id: sessionId || routeChatId || '',
       patient_name: patient?.name || '',
       patient_id: patientId || '',
@@ -567,6 +574,14 @@ function StudentChatPage() {
       timeout: 60000,
     });
     socketRef.current = socket;
+    // Renew the connection's credential before the ID token expires.
+    attachSocketReauth(socket, {
+      onExpired: (message) => {
+        setIsVoiceModeActive(false);
+        setVoiceSessionState('idle');
+        setVoiceError(message);
+      },
+    });
 
     socket.on('connect', () => {
       if (!cancelled) setSocketConnected(true);

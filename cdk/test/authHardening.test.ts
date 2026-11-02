@@ -151,8 +151,12 @@ describe('socket relay token', () => {
   const identity = { userId: SUB, userEmail: EMAIL };
 
   test('forwards a verified token belonging to the socket user', async () => {
-    const verify = jest.fn().mockResolvedValue(idPayload());
-    await expect(resolveRelayToken('tok', identity, verify)).resolves.toEqual({ ok: true, token: 'tok' });
+    const verify = jest.fn().mockResolvedValue(idPayload({ exp: 1_700_000_000 }));
+    await expect(resolveRelayToken('tok', identity, verify)).resolves.toEqual({
+      ok: true,
+      token: 'tok',
+      expiresAt: 1_700_000_000_000,
+    });
     expect(verify).toHaveBeenCalledWith('tok');
   });
 

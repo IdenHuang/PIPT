@@ -161,13 +161,17 @@ class AuthService {
   // Get current ID token for API requests.
   // Returns the cached token while it's still valid (with a 60s safety buffer)
   // to avoid a fetchAuthSession() call on every request.
-  async getIdToken(): Promise<string | null> {
+  // forceRefresh exchanges the refresh token for a new ID token even if the
+  // current one is still valid (used to renew the socket before it expires).
+  // It fails, returning null, once the refresh token is revoked (e.g. global
+  // sign-out on another device).
+  async getIdToken(options: { forceRefresh?: boolean } = {}): Promise<string | null> {
     const nowSec = Math.floor(Date.now() / 1000);
-    if (this.cachedToken && nowSec < this.cachedTokenExp - 60) {
+    if (!options.forceRefresh && this.cachedToken && nowSec < this.cachedTokenExp - 60) {
       return this.cachedToken;
     }
     try {
-      const session = await fetchAuthSession();
+      const session = await fetchAuthSession({ forceRefresh: options.forceRefresh === true });
       const idToken = session.tokens?.idToken;
       const token = idToken?.toString() || null;
       this.cachedToken = token;
