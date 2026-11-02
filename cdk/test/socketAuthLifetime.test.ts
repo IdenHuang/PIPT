@@ -8,7 +8,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 /* eslint-disable @typescript-eslint/no-require-imports */
-const { SocketAuthLifetime, tokenExpiryMs, DEFAULT_GRACE_MS } = require('../socket-server/socket-auth-lifetime.js');
+const {
+  SocketAuthLifetime,
+  ReauthGate,
+  tokenExpiryMs,
+  DEFAULT_GRACE_MS,
+} = require('../socket-server/socket-auth-lifetime.js');
+const { resolveRelayToken } = require('../socket-server/relay-token.js');
+const { isTransientKeyError } = require('../socket-server/auth.js');
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 describe('tokenExpiryMs', () => {
@@ -113,6 +120,102 @@ describe('SocketAuthLifetime', () => {
   });
 });
 
+describe('ReauthGate (finding f-ac8c49e2)', () => {
+  let now: number;
+  const make = () => new ReauthGate({ minIntervalMs: 5_000, maxFailures: 3, lockoutMs: 300_000, now: () => now });
+
+  beforeEach(() => {
+    now = 1_000_000;
+  });
+
+  test('allows one attempt at a time', () => {
+    const gate = make();
+    expect(gate.tryBegin()).toEqual({ allowed: true });
+    now += 60_000;
+    expect(gate.tryBegin()).toEqual({ allowed: false, reason: 'in_flight' });
+    gate.finish('ok');
+    expect(gate.tryBegin()).toEqual({ allowed: true });
+  });
+
+  test('enforces the minimum interval between attempts', () => {
+    const gate = make();
+    gate.tryBegin();
+    gate.finish('ok');
+    now += 4_999;
+    expect(gate.tryBegin()).toEqual({ allowed: false, reason: 'too_soon' });
+    now += 1;
+    expect(gate.tryBegin()).toEqual({ allowed: true });
+  });
+
+  test("never refuses the real client's schedule (hourly renewals, 30s retries)", () => {
+    const gate = make();
+    for (let i = 0; i < 20; i++) {
+      expect(gate.tryBegin().allowed).toBe(true);
+      gate.finish(i % 2 ? 'ok' : 'transient');
+      now += 30_000;
+    }
+  });
+
+  test('locks out after maxFailures clear rejections in a row, then recovers', () => {
+    const gate = make();
+    for (let i = 0; i < 3; i++) {
+      expect(gate.tryBegin().allowed).toBe(true);
+      gate.finish('rejected');
+      now += 5_000;
+    }
+    expect(gate.tryBegin()).toEqual({ allowed: false, reason: 'locked' });
+    now += 300_000;
+    expect(gate.tryBegin()).toEqual({ allowed: true });
+  });
+
+  test('a success resets the failure count', () => {
+    const gate = make();
+    for (const outcome of ['rejected', 'rejected', 'ok', 'rejected', 'rejected']) {
+      expect(gate.tryBegin().allowed).toBe(true);
+      gate.finish(outcome);
+      now += 5_000;
+    }
+    expect(gate.tryBegin().allowed).toBe(true);
+  });
+
+  test('transient failures (JWKS unreachable or rate limited) never lock out', () => {
+    const gate = make();
+    for (let i = 0; i < 10; i++) {
+      expect(gate.tryBegin().allowed).toBe(true);
+      gate.finish('transient');
+      now += 5_000;
+    }
+  });
+});
+
+describe('transient token-check failures', () => {
+  const identity = { userId: 'u1', userEmail: 'u1@example.edu' };
+
+  test.each([
+    ['rate limited', 'JwksRateLimitError', true],
+    ['JWKS endpoint error', 'JwksError', true],
+    ['network error', 'Error', true],
+    ['unknown kid', 'SigningKeyNotFoundError', false],
+  ])('%s -> transient=%p', (_label, name, transient) => {
+    const err = new Error('x');
+    err.name = name;
+    expect(isTransientKeyError(err)).toBe(transient);
+  });
+
+  test('resolveRelayToken passes transient through, and only then', async () => {
+    const transientErr = Object.assign(new Error('jwks down'), { transient: true });
+    await expect(resolveRelayToken('tok', identity, jest.fn().mockRejectedValue(transientErr))).resolves.toEqual({
+      ok: false,
+      error: 'Authentication failed',
+      transient: true,
+    });
+    await expect(resolveRelayToken('tok', identity, jest.fn().mockRejectedValue(new Error('bad sig')))).resolves.toEqual({
+      ok: false,
+      error: 'Authentication failed',
+    });
+  });
+});
+
 describe('socket server wiring', () => {
   const root = path.join(__dirname, '..', 'socket-server');
   const server = fs.readFileSync(path.join(root, 'server.js'), 'utf8');
@@ -132,5 +235,20 @@ describe('socket server wiring', () => {
 
   test('the lifetime module ships in the image', () => {
     expect(dockerfile).toContain('COPY socket-auth-lifetime.js ./');
+  });
+
+  test('reauth is gated before any token verification', () => {
+    const start = server.indexOf('on("reauth"');
+    const block = server.slice(start, server.indexOf('socket.emit("auth-state"', start));
+    expect(block.indexOf('reauthGate.tryBegin()')).toBeGreaterThan(-1);
+    expect(block.indexOf('reauthGate.tryBegin()')).toBeLessThan(block.indexOf('resolveRelayToken('));
+    expect(block).toContain('reauthGate.finish(outcome)');
+  });
+
+  test('JWKS fetches for uncached keys are rate limited', () => {
+    const auth = fs.readFileSync(path.join(root, 'auth.js'), 'utf8');
+    expect(auth).toContain('cache: true');
+    expect(auth).toContain('rateLimit: true');
+    expect(auth).toContain('jwksRequestsPerMinute: JWKS_REQUESTS_PER_MINUTE');
   });
 });

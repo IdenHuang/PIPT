@@ -13,7 +13,7 @@ const { StreamRelayRegistry, safeEqual } = require("./stream-relay");
 const { VoicePreviewLimiter, ConnectionLimiter, limiterKey, positiveIntEnv } = require("./voice-preview-limiter");
 const logger = require("./logger");
 const { asPayload, guardHandler } = require("./event-guard");
-const { SocketAuthLifetime, tokenExpiryMs } = require("./socket-auth-lifetime");
+const { SocketAuthLifetime, ReauthGate, tokenExpiryMs } = require("./socket-auth-lifetime");
 
 // Last-resort traps. Node 22 exits on an unhandled rejection by default, and
 // this service runs as a single ECS task, so one listener bug would drop every
@@ -399,29 +399,45 @@ io.on("connection", (socket) => {
   // verify and belong to the same user as the handshake (resolveRelayToken).
   // A rejected token does not disconnect immediately (a JWKS hiccup should not
   // drop a live voice session); the socket still expires on schedule.
+  // reauthGate bounds how often this socket can make the server verify a
+  // token; refused attempts are answered without any verification or logging.
+  const reauthGate = new ReauthGate();
   on("reauth", async (rawData, ack) => {
     const reply = typeof ack === "function" ? ack : () => {};
-    const data = asPayload(rawData);
-    const result = await resolveRelayToken(
-      data && data.token,
-      { userId: socket.userId, userEmail: socket.userEmail },
-      verifyToken,
-    );
-    if (!result.ok) {
-      logger.warn("Reauth token rejected", {
-        component: "server",
-        operation: "reauth",
-        socketId: socket.id,
-        userEmail: socket.userEmail,
-      });
-      reply({ ok: false, error: result.error });
+    const gate = reauthGate.tryBegin();
+    if (!gate.allowed) {
+      reply({ ok: false, error: "Too many reauth attempts" });
       return;
     }
-    if (!authLifetime.renew(result.expiresAt)) {
-      reply({ ok: false, error: "Session expired" });
-      return;
+    let outcome = "rejected";
+    try {
+      const data = asPayload(rawData);
+      const result = await resolveRelayToken(
+        data && data.token,
+        { userId: socket.userId, userEmail: socket.userEmail },
+        verifyToken,
+      );
+      if (!result.ok) {
+        if (result.transient) outcome = "transient";
+        logger.warn("Reauth token rejected", {
+          component: "server",
+          operation: "reauth",
+          socketId: socket.id,
+          userEmail: socket.userEmail,
+          transient: outcome === "transient",
+        });
+        reply({ ok: false, error: result.error });
+        return;
+      }
+      if (!authLifetime.renew(result.expiresAt)) {
+        reply({ ok: false, error: "Session expired" });
+        return;
+      }
+      outcome = "ok";
+      reply({ ok: true, expiresInMs: authLifetime.expiresInMs() });
+    } finally {
+      reauthGate.finish(outcome);
     }
-    reply({ ok: true, expiresInMs: authLifetime.expiresInMs() });
   });
 
   // Tell the client when to reauth. Relative time, so client clock skew

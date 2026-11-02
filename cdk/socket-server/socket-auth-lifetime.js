@@ -114,4 +114,65 @@ class SocketAuthLifetime {
   }
 }
 
-module.exports = { SocketAuthLifetime, tokenExpiryMs, DEFAULT_GRACE_MS };
+/**
+ * Bounds the work one socket can cause through "reauth" (finding f-ac8c49e2).
+ * Each attempt costs a JWT verification and possibly a JWKS fetch, and this
+ * server runs as a single task. Refusals are cheap and never disconnect: the
+ * socket still ends on its normal expiry schedule, so a legitimate client
+ * (which renews about hourly and retries every 30s) sees no change.
+ *
+ * - one attempt in flight at a time
+ * - at least minIntervalMs between attempts
+ * - after maxFailures clear rejections in a row, attempts are refused without
+ *   verification for lockoutMs. Transient failures (JWKS unreachable or rate
+ *   limited) don't count: the token was never judged.
+ */
+class ReauthGate {
+  constructor({
+    minIntervalMs = 5 * 1000,
+    maxFailures = 3,
+    lockoutMs = 5 * 60 * 1000,
+    now = Date.now,
+  } = {}) {
+    this._minIntervalMs = minIntervalMs;
+    this._maxFailures = maxFailures;
+    this._lockoutMs = lockoutMs;
+    this._now = now;
+    this._inFlight = false;
+    this._lastStart = -Infinity;
+    this._failures = 0;
+    this._lockedUntil = 0;
+  }
+
+  /**
+   * @returns {{ allowed: true } | { allowed: false, reason: "in_flight" | "locked" | "too_soon" }}
+   */
+  tryBegin() {
+    const now = this._now();
+    if (this._inFlight) return { allowed: false, reason: "in_flight" };
+    if (now < this._lockedUntil) return { allowed: false, reason: "locked" };
+    if (now - this._lastStart < this._minIntervalMs) return { allowed: false, reason: "too_soon" };
+    this._inFlight = true;
+    this._lastStart = now;
+    return { allowed: true };
+  }
+
+  /**
+   * Record the outcome of an attempt that tryBegin allowed.
+   * @param {"ok" | "rejected" | "transient"} outcome
+   */
+  finish(outcome) {
+    this._inFlight = false;
+    if (outcome === "ok") {
+      this._failures = 0;
+    } else if (outcome === "rejected") {
+      this._failures += 1;
+      if (this._failures >= this._maxFailures) {
+        this._failures = 0;
+        this._lockedUntil = this._now() + this._lockoutMs;
+      }
+    }
+  }
+}
+
+module.exports = { SocketAuthLifetime, ReauthGate, tokenExpiryMs, DEFAULT_GRACE_MS };

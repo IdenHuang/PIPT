@@ -13,8 +13,9 @@ const { tokenExpiryMs } = require("./socket-auth-lifetime");
  * @param {unknown} token - client-supplied token
  * @param {{ userId: string, userEmail: string }} socketIdentity - from the verified handshake
  * @param {(token: string) => Promise<object>} verify - auth.verifyToken
- * @returns {Promise<{ ok: true, token: string, expiresAt: number } | { ok: false, error: string }>}
- *   expiresAt is the token's exp in epoch milliseconds.
+ * @returns {Promise<{ ok: true, token: string, expiresAt: number } | { ok: false, error: string, transient?: true }>}
+ *   expiresAt is the token's exp in epoch milliseconds. transient is set when
+ *   the token could not be checked (JWKS unreachable or rate limited).
  */
 async function resolveRelayToken(token, socketIdentity, verify) {
   if (typeof token !== "string" || token.length === 0) {
@@ -26,8 +27,12 @@ async function resolveRelayToken(token, socketIdentity, verify) {
   let decoded;
   try {
     decoded = await verify(token);
-  } catch {
-    return { ok: false, error: "Authentication failed" };
+  } catch (err) {
+    // transient: the signing key couldn't be fetched, so the token itself
+    // was not judged (see auth.verifyToken).
+    return err && err.transient
+      ? { ok: false, error: "Authentication failed", transient: true }
+      : { ok: false, error: "Authentication failed" };
   }
   if (
     !decoded ||
