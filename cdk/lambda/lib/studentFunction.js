@@ -190,9 +190,15 @@ exports.handler = async (event, context) => {
 
               const user_id = userResult[0].user_id;
 
-              // Query to get simulation groups for the user
+              // Query to get simulation groups for the user.
+              // Explicit column list: never return group_access_code,
+              // system_prompt, debrief_prompt or max_messages_per_chat to students.
               const data = await sqlConnection`
-                SELECT "simulation_groups".*
+                SELECT
+                  "simulation_groups".simulation_group_id,
+                  "simulation_groups".group_name,
+                  "simulation_groups".group_description,
+                  "simulation_groups".organization_id
                 FROM "enrollments"
                 JOIN "simulation_groups" ON "simulation_groups".simulation_group_id = "enrollments".simulation_group_id
                 WHERE "enrollments".user_id = ${user_id}
