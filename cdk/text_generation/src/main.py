@@ -7,6 +7,7 @@ import boto3
 import logging
 import psycopg
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from langchain_aws import BedrockEmbeddings
 from helpers.cohere_embeddings import CohereBedrockEmbeddings
 
@@ -353,6 +354,90 @@ def _authorize(mode, caller_email, session_id, persona_id, simulation_group_id):
         logger.error(f"Authorization check failed: {e}")
         _safe_cleanup_after_error(cur)
         return AuthzDecision(False, 500, "Authorization check failed")
+
+
+# One-time marker for a chat's opening AI turn (the empty-message request).
+# It lives in the conversation table, which is keyed only on SessionId and
+# already holds prefixed items such as QCACHE#, so no schema change is needed.
+# The conditional put makes the claim atomic across concurrent requests.
+INITIAL_PROMPT_KEY_PREFIX = "INIT#"
+_INITIAL_PROMPT_FAILED = "failed"
+# A claim older than this is treated as abandoned and can be taken again, so a
+# chat whose opening turn died without releasing the claim recovers on its own.
+# Must exceed the text-gen Lambda timeout (300s in api-service-stack.ts) so an
+# in-flight generation is never overtaken.
+INITIAL_PROMPT_CLAIM_STALE_SECONDS = 360
+_dynamodb_resource = None
+
+
+def _conversation_table():
+    global _dynamodb_resource
+    if _dynamodb_resource is None:
+        _dynamodb_resource = boto3.resource("dynamodb", region_name=REGION)
+    return _dynamodb_resource.Table(TABLE_NAME)
+
+
+def claim_initial_prompt(session_id):
+    """Atomically claim the chat's single opening turn.
+
+    Returns True if this request won the claim, False if it is already held.
+    A claim that was released (failed generation) or is older than
+    INITIAL_PROMPT_CLAIM_STALE_SECONDS can be taken again so the student can
+    retry the greeting. Other DynamoDB errors propagate (callers fail closed).
+    """
+    now = int(time.time())
+    try:
+        _conversation_table().put_item(
+            Item={
+                "SessionId": f"{INITIAL_PROMPT_KEY_PREFIX}{session_id}",
+                "claim_status": "claimed",
+                "claimed_at": now,
+            },
+            ConditionExpression=(
+                "attribute_not_exists(SessionId) OR claim_status = :failed OR claimed_at < :stale"
+            ),
+            ExpressionAttributeValues={
+                ":failed": _INITIAL_PROMPT_FAILED,
+                ":stale": now - INITIAL_PROMPT_CLAIM_STALE_SECONDS,
+            },
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        raise
+
+
+def release_initial_prompt(session_id):
+    """Mark the opening-turn claim as failed so it can be retried."""
+    try:
+        _conversation_table().update_item(
+            Key={"SessionId": f"{INITIAL_PROMPT_KEY_PREFIX}{session_id}"},
+            UpdateExpression="SET claim_status = :failed",
+            ExpressionAttributeValues={":failed": _INITIAL_PROMPT_FAILED},
+        )
+    except Exception as e:
+        logger.error(f"Failed to release initial-prompt claim for session {session_id}: {e}")
+
+
+def _chat_has_ai_turn(session_id):
+    """True if the chat has a persisted AI message; False if not or unknown.
+
+    get_response() swallows generation errors and save_message_to_db() swallows
+    insert errors, so a 200 does not prove the opening turn was saved.
+    """
+    try:
+        cur = connect_to_db().cursor()
+        cur.execute(
+            """SELECT EXISTS (SELECT 1 FROM "messages" WHERE chat_id = %s AND sender_type = 'ai')""",
+            (session_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return bool(row and row[0])
+    except Exception as e:
+        logger.error(f"Could not verify opening turn for session {session_id}: {e}")
+        return False
 
 
 def get_system_prompt(simulation_group_id):
@@ -818,100 +903,107 @@ def handler(event, context):
     
     logger.info(f"Received message ({len(question)} chars)")
 
-    if not question:
-        logger.info(f"Start of conversation. Creating conversation history table in DynamoDB.")
+    # An empty message asks for the AI patient's opening turn. That is allowed
+    # once per chat: the limit check below rejects it once an AI turn exists,
+    # and claim_initial_prompt() closes the race between concurrent requests.
+    is_initial_prompt = not question
+    if is_initial_prompt:
+        logger.info(f"Start of conversation requested for session {session_id}.")
         student_query = get_initial_student_query(patient_name)
-        is_initial_prompt = True
-        # Cache key questions on first message for real-time matching
-        try:
-            cache_key_questions(
-                session_id=session_id,
-                simulation_group_id=simulation_group_id,
-                persona_id=persona_id,
-                embeddings_model=embeddings,
-                table_name=TABLE_NAME,
-            )
-        except Exception as e:
-            logger.error(f"Failed to cache key questions: {e}")
     else:
         # Student messages are educational records: log their size, never their text.
         logger.info(f"Processing student question: question_chars={len(question or '')}")
         student_query = get_student_query(question)
-        is_initial_prompt = False
         
     logger.info(f"🔍 FINAL STUDENT QUERY built: query_chars={len(student_query or '')}")
 
     # ── Message Limit Check ──────────────────────────────────────────────
-    if not is_initial_prompt:
-        try:
-            conn = connect_to_db()
-            cur = conn.cursor()
-            # Resolve the cap from the group that owns this chat, never from the
-            # caller-supplied simulation_group_id. Fail closed if unresolvable.
-            cur.execute("""
-                SELECT sg.max_messages_per_chat
-                FROM "chats" c
-                JOIN "student_interactions" si ON si.student_interaction_id = c.student_interaction_id
-                JOIN "enrollments" e ON e.enrollment_id = si.enrollment_id
-                JOIN "simulation_groups" sg ON sg.simulation_group_id = e.simulation_group_id
-                WHERE c.chat_id = %s
-            """, (session_id,))
-            group_result = cur.fetchone()
-            if group_result is None:
-                logger.warning(f"Message limit check: chat {session_id} has no owning group; rejecting")
-                cur.close()
-                return {
-                    'statusCode': 403,
-                    "headers": {
-                        "Content-Type": "application/json",
-                        "Access-Control-Allow-Headers": "*",
-                        "Access-Control-Allow-Origin": _get_cors_origin(event),
-                        "Access-Control-Allow-Methods": "*",
-                    },
-                    'body': json.dumps({"error": "Forbidden"})
-                }
-            # NULL cap on an existing group means "unlimited"
-            max_messages = group_result[0]
-
-            if max_messages is not None:
-                cur.execute("""
-                    SELECT COUNT(*)::int AS count FROM "messages"
-                    WHERE chat_id = %s AND sender_type = 'student'
-                """, (session_id,))
-                count_result = cur.fetchone()
-                message_count = count_result[0] if count_result else 0
-
-                if message_count >= max_messages:
-                    logger.info(f"Message limit reached: {message_count}/{max_messages} for session {session_id}")
-                    cur.close()
-                    return {
-                        'statusCode': 403,
-                        "headers": {
-                            "Content-Type": "application/json",
-                            "Access-Control-Allow-Headers": "*",
-                            "Access-Control-Allow-Origin": _get_cors_origin(event),
-                            "Access-Control-Allow-Methods": "*",
-                        },
-                        'body': json.dumps({
-                            "error": "Message limit reached",
-                            "message": f"You have reached the maximum of {max_messages} messages for this conversation.",
-                            "max_messages": max_messages,
-                        })
-                    }
+    # Runs on every request, including the opening turn, so an empty message
+    # can never skip the cap.
+    try:
+        conn = connect_to_db()
+        cur = conn.cursor()
+        # Resolve the cap from the group that owns this chat, never from the
+        # caller-supplied simulation_group_id. Fail closed if unresolvable.
+        cur.execute("""
+            SELECT sg.max_messages_per_chat
+            FROM "chats" c
+            JOIN "student_interactions" si ON si.student_interaction_id = c.student_interaction_id
+            JOIN "enrollments" e ON e.enrollment_id = si.enrollment_id
+            JOIN "simulation_groups" sg ON sg.simulation_group_id = e.simulation_group_id
+            WHERE c.chat_id = %s
+        """, (session_id,))
+        group_result = cur.fetchone()
+        if group_result is None:
+            logger.warning(f"Message limit check: chat {session_id} has no owning group; rejecting")
             cur.close()
-        except Exception as e:
-            # Fail closed — do not invoke the LLM if the limit cannot be verified
-            logger.error(f"Error checking message limit (failing closed): {e}")
             return {
-                'statusCode': 500,
+                'statusCode': 403,
                 "headers": {
                     "Content-Type": "application/json",
                     "Access-Control-Allow-Headers": "*",
                     "Access-Control-Allow-Origin": _get_cors_origin(event),
                     "Access-Control-Allow-Methods": "*",
                 },
-                'body': json.dumps({"error": "Unable to verify message limit"})
+                'body': json.dumps({"error": "Forbidden"})
             }
+        # NULL cap on an existing group means "unlimited"
+        max_messages = group_result[0]
+
+        cur.execute("""
+            SELECT COUNT(*) FILTER (WHERE sender_type = 'student')::int,
+                   COUNT(*) FILTER (WHERE sender_type = 'ai')::int
+            FROM "messages"
+            WHERE chat_id = %s
+        """, (session_id,))
+        count_result = cur.fetchone()
+        student_count, ai_count = count_result if count_result else (0, 0)
+        cur.close()
+
+        # The opening turn happens once: if the chat already has an AI turn,
+        # an empty message is a replay, not a start of conversation.
+        if is_initial_prompt and ai_count > 0:
+            logger.info(f"Rejecting repeated initial prompt for session {session_id} (ai_count={ai_count})")
+            return {
+                'statusCode': 409,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Origin": _get_cors_origin(event),
+                    "Access-Control-Allow-Methods": "*",
+                },
+                'body': json.dumps({"error": "Conversation already started"})
+            }
+
+        if max_messages is not None and student_count >= max_messages:
+            logger.info(f"Message limit reached: {student_count}/{max_messages} for session {session_id}")
+            return {
+                'statusCode': 403,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Origin": _get_cors_origin(event),
+                    "Access-Control-Allow-Methods": "*",
+                },
+                'body': json.dumps({
+                    "error": "Message limit reached",
+                    "message": f"You have reached the maximum of {max_messages} messages for this conversation.",
+                    "max_messages": max_messages,
+                })
+            }
+    except Exception as e:
+        # Fail closed — do not invoke the LLM if the limit cannot be verified
+        logger.error(f"Error checking message limit (failing closed): {e}")
+        return {
+            'statusCode': 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Origin": _get_cors_origin(event),
+                "Access-Control-Allow-Methods": "*",
+            },
+            'body': json.dumps({"error": "Unable to verify message limit"})
+        }
 
     # Check if streaming is requested
     query_params = event.get("queryStringParameters", {})
@@ -949,6 +1041,46 @@ def handler(event, context):
             'body': json.dumps('Error creating history-aware retriever')
         }
 
+    if is_initial_prompt:
+        try:
+            claimed = claim_initial_prompt(session_id)
+        except Exception as e:
+            # Fail closed — without the claim, concurrent replays could each generate
+            logger.error(f"Error claiming initial prompt (failing closed): {e}")
+            return {
+                'statusCode': 500,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Origin": _get_cors_origin(event),
+                    "Access-Control-Allow-Methods": "*",
+                },
+                'body': json.dumps({"error": "Unable to start conversation"})
+            }
+        if not claimed:
+            logger.info(f"Initial prompt already claimed for session {session_id}")
+            return {
+                'statusCode': 409,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Allow-Origin": _get_cors_origin(event),
+                    "Access-Control-Allow-Methods": "*",
+                },
+                'body': json.dumps({"error": "Conversation already started"})
+            }
+        # Cache key questions once, on the opening turn, for real-time matching
+        try:
+            cache_key_questions(
+                session_id=session_id,
+                simulation_group_id=simulation_group_id,
+                persona_id=persona_id,
+                embeddings_model=embeddings,
+                table_name=TABLE_NAME,
+            )
+        except Exception as e:
+            logger.error(f"Failed to cache key questions: {e}")
+
     try:
         logger.info("Generating response from the LLM.")
         
@@ -975,6 +1107,8 @@ def handler(event, context):
     except Exception as e:
         logger.error(f"Error getting response: {e}")
         logger.exception("Full error details:")
+        if is_initial_prompt:
+            release_initial_prompt(session_id)
         return {
             'statusCode': 500,
             "headers": {
@@ -986,7 +1120,12 @@ def handler(event, context):
             'body': json.dumps("Internal server error")
         }
 
-
+    # Generation and persistence errors are swallowed inside get_response, so
+    # release the claim whenever no AI turn was saved; otherwise the student
+    # could never retry the greeting.
+    if is_initial_prompt and not _chat_has_ai_turn(session_id):
+        logger.warning(f"Opening turn for session {session_id} was not persisted; releasing claim")
+        release_initial_prompt(session_id)
 
     # TODO(refactor): Extract response formatting into a helper function
     if stream:

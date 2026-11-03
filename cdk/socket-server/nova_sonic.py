@@ -420,8 +420,13 @@ class NovaSonic:
         try:
             conn = get_pg_connection()
             cursor = conn.cursor()
+            # Platform-wide prompt only: rows with organization_id IS NULL. Admins
+            # are global and never set organization_id; filtering on it keeps any
+            # tenant-tagged row from being applied to every tenant's sessions.
             cursor.execute(
-                'SELECT prompt_content FROM system_prompt_history ORDER BY created_at DESC LIMIT 1'
+                'SELECT prompt_content FROM system_prompt_history '
+                'WHERE organization_id IS NULL '
+                'ORDER BY created_at DESC LIMIT 1'
             )
             result = cursor.fetchone()
             cursor.close()

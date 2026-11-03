@@ -907,10 +907,15 @@ exports.handler = async (event, context) => {
         break;
       case "GET /admin/system_prompts":
         try {
-          // Get the latest system prompt from history table
+          // system_prompt_history holds the platform-wide prompt: admins are
+          // global (no organization scoping), so their rows carry
+          // organization_id IS NULL. The voice engines read the same scope.
+          // If organization-scoped admins are introduced, this table must be
+          // filtered by the caller's organization instead (f-c5040033).
           const latestPrompt = await sqlConnectionTableCreator`
             SELECT prompt_content, created_at
             FROM "system_prompt_history"
+            WHERE organization_id IS NULL
             ORDER BY created_at DESC
             LIMIT 1;
           `;
@@ -919,6 +924,7 @@ exports.handler = async (event, context) => {
           const promptHistory = await sqlConnectionTableCreator`
             SELECT history_id, prompt_content, created_at
             FROM "system_prompt_history"
+            WHERE organization_id IS NULL
             ORDER BY created_at DESC
             OFFSET 1;
           `;
@@ -943,10 +949,10 @@ exports.handler = async (event, context) => {
               break;
             }
 
-            // Insert new prompt into history (created_by removed)
+            // Platform-wide prompt (organization_id NULL), attributed to the admin
             await sqlConnectionTableCreator`
-              INSERT INTO "system_prompt_history" (prompt_content)
-              VALUES (${prompt_content});
+              INSERT INTO "system_prompt_history" (prompt_content, modified_by)
+              VALUES (${prompt_content}, ${actor.userId});
             `;
 
             response.body = JSON.stringify({
@@ -977,6 +983,7 @@ exports.handler = async (event, context) => {
               SELECT prompt_content
               FROM "system_prompt_history"
               WHERE history_id = ${historyId}
+                AND organization_id IS NULL
               LIMIT 1;
             `;
 
@@ -990,8 +997,8 @@ exports.handler = async (event, context) => {
             }
 
             await sqlConnectionTableCreator`
-              INSERT INTO "system_prompt_history" (prompt_content)
-              VALUES (${fromHistory});
+              INSERT INTO "system_prompt_history" (prompt_content, modified_by)
+              VALUES (${fromHistory}, ${actor.userId});
             `;
 
             response.body = JSON.stringify({
@@ -1000,7 +1007,7 @@ exports.handler = async (event, context) => {
             break;
           }
 
-          // Fallback: body-based restore (no created_by)
+          // Fallback: body-based restore
           if (event.body) {
             const { prompt_content } = JSON.parse(event.body);
             if (!prompt_content || !prompt_content.trim()) {
@@ -1010,8 +1017,8 @@ exports.handler = async (event, context) => {
             }
 
             await sqlConnectionTableCreator`
-              INSERT INTO "system_prompt_history" (prompt_content)
-              VALUES (${prompt_content});
+              INSERT INTO "system_prompt_history" (prompt_content, modified_by)
+              VALUES (${prompt_content}, ${actor.userId});
             `;
 
             response.body = JSON.stringify({
