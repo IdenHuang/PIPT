@@ -525,13 +525,13 @@ Audit trail of user engagement events.
 
 ### system_prompt_history
 
-Audit trail of organization-level system prompt changes.
+History of the platform-wide system prompt used by the voice engines (`socket-server` and `voice-agent`). Only global admins write it, through `/admin/update_system_prompt` and `/admin/restore_system_prompt`. The newest row with `organization_id IS NULL` is the active prompt. Text chat uses each simulation group's own `simulation_groups.system_prompt` instead.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | history_id | uuid (PK) | Unique identifier |
-| modified_by | uuid (FK → users) | User who made the change |
-| organization_id | uuid (FK → organizations) | Organization reference |
+| modified_by | uuid (FK → users) | Admin who made the change |
+| organization_id | uuid (FK → organizations) | Reserved. Always NULL (platform-wide); every reader filters on `organization_id IS NULL`. Must be written and filtered per organization before organization-scoped admins can edit prompts |
 | prompt_content | text | Prompt content at time of change |
 | created_at | timestamp | Change timestamp |
 
