@@ -1,42 +1,60 @@
-const jwt = require('jsonwebtoken');
-const jwksClient = require('jwks-rsa');
+const { CognitoJwtVerifier } = require('aws-jwt-verify');
 const logger = require('./logger');
 
-// Known signing keys are cached (cache hits never reach the rate limiter), so
-// the limit only applies to fetches for a kid that isn't cached, e.g. a forged
-// token or a Cognito key rotation. Without it, every forged-kid token, from the
-// unauthenticated handshake or from "reauth", made an outbound JWKS request.
-const JWKS_REQUESTS_PER_MINUTE = 10;
-const client = jwksClient({
-  jwksUri: `https://cognito-idp.${process.env.AWS_REGION}.amazonaws.com/${process.env.COGNITO_USER_POOL_ID}/.well-known/jwks.json`,
-  cache: true,
-  cacheMaxAge: 10 * 60 * 1000,
-  rateLimit: true,
-  jwksRequestsPerMinute: JWKS_REQUESTS_PER_MINUTE,
-});
+// Cognito ID-token verification with aws-jwt-verify
+// (https://github.com/awslabs/aws-jwt-verify).
+//
+// Chosen over jsonwebtoken + jwks-rsa for how it fetches signing keys
+// (findings f-ac8c49e2, f-e757a3fc):
+// - Known keys are cached with no expiry, so a valid token never needs a JWKS
+//   download and a flood of forged tokens cannot make valid ones fail.
+// - A kid missing from the JWKS triggers at most one download, then a
+//   10-second penalty period in which further unknown kids are refused
+//   locally. A rotated Cognito key is picked up by the next allowed download.
+//   Concurrent downloads are merged into one.
+// It checks signature (RS256), exp, iss, aud (clientId) and token_use itself;
+// idTokenClaimError below adds the email checks the session guard relies on.
 
-/**
- * Whether a signing-key lookup failure says nothing about the token itself
- * (JWKS unreachable or rate limited) as opposed to the token's kid not being
- * a Cognito key. jsonwebtoken wraps the callback error, so it is classified
- * here, where the original error is still available.
- */
-function isTransientKeyError(err) {
-  return !err || err.name !== "SigningKeyNotFoundError";
+let verifier = null;
+function getVerifier() {
+  if (!verifier) {
+    verifier = CognitoJwtVerifier.create({
+      userPoolId: process.env.COGNITO_USER_POOL_ID,
+      clientId: process.env.COGNITO_CLIENT_ID,
+      tokenUse: 'id',
+    });
+  }
+  return verifier;
 }
 
-function makeGetKey(onKeyError) {
-  return (header, callback) => {
-    client.getSigningKey(header.kid, (err, key) => {
-      if (err) {
-        onKeyError(err);
-        logger.error("Failed to get signing key", { component: "auth", operation: "getKey", kid: header.kid, error: err.message });
-        return callback(err);
-      }
-      const signingKey = key.publicKey || key.rsaPublicKey;
-      callback(null, signingKey);
-    });
-  };
+/**
+ * Download the user pool's signing keys ahead of the first connection.
+ * Failure is not fatal: the first verification fetches them instead.
+ */
+async function hydrateVerifier() {
+  try {
+    await getVerifier().hydrate();
+    logger.info("Cognito signing keys loaded", { component: "auth", operation: "hydrate" });
+  } catch (err) {
+    logger.warn("Could not preload Cognito signing keys", { component: "auth", operation: "hydrate", error: err.message });
+  }
+}
+
+// Failures where the signing key could not be obtained, so the token itself
+// was never judged: JWKS unreachable or invalid, or the penalty period after
+// an unknown kid. Everything else (bad signature, expired, wrong audience,
+// unknown kid, malformed) is a clear rejection of the token.
+const TRANSIENT_KEY_ERRORS = new Set([
+  'WaitPeriodNotYetEndedJwkError',
+  'FetchError',
+  'NonRetryableFetchError',
+  'JwksNotAvailableInCacheError',
+  'JwksValidationError',
+]);
+
+/** Whether a verification failure says nothing about the token itself. */
+function isTransientKeyError(err) {
+  return !!err && TRANSIENT_KEY_ERRORS.has(err.name);
 }
 
 /**
@@ -56,31 +74,39 @@ function idTokenClaimError(decoded) {
 
 /**
  * Verify a Cognito ID token. A rejection carries `transient: true` when the
- * signing key could not be fetched (JWKS unreachable or rate limited): the
- * token may be valid, so callers must not hold it against the client.
+ * signing key could not be obtained: the token may be valid, so callers must
+ * not hold it against the client.
+ * @param {string} token
+ * @returns {Promise<object>} the verified payload
  */
-function verifyToken(token) {
-  return new Promise((resolve, reject) => {
-    let keyError = null;
-    const getKey = makeGetKey((err) => { keyError = err; });
-    jwt.verify(token, getKey, {
-      audience: process.env.COGNITO_CLIENT_ID,
-      issuer: `https://cognito-idp.${process.env.AWS_REGION}.amazonaws.com/${process.env.COGNITO_USER_POOL_ID}`,
-      algorithms: ['RS256']
-    }, (err, decoded) => {
-      const claimError = err ? null : idTokenClaimError(decoded);
-      if (err || claimError) {
-        const message = err ? err.message : claimError;
-        logger.error("Token verification failed", { component: "auth", operation: "verifyToken", error: message });
-        const failure = err || new Error(claimError);
-        if (keyError && isTransientKeyError(keyError)) failure.transient = true;
-        reject(failure);
-      } else {
-        logger.info("Token verified successfully", { component: "auth", operation: "verifyToken", userId: decoded.sub });
-        resolve(decoded);
-      }
-    });
-  });
+async function verifyToken(token) {
+  let decoded;
+  try {
+    decoded = await getVerifier().verify(token);
+  } catch (err) {
+    const failure = err instanceof Error ? err : new Error(String(err));
+    if (isTransientKeyError(failure)) {
+      failure.transient = true;
+      // Penalty-period refusals are expected under a forged-kid flood and
+      // cost nothing; logging each one would be the expensive part.
+      if (failure.name === 'WaitPeriodNotYetEndedJwkError') throw failure;
+    }
+    logger.error("Token verification failed", { component: "auth", operation: "verifyToken", error: failure.message });
+    throw failure;
+  }
+  const claimError = idTokenClaimError(decoded);
+  if (claimError) {
+    logger.error("Token verification failed", { component: "auth", operation: "verifyToken", error: claimError });
+    throw new Error(claimError);
+  }
+  logger.info("Token verified successfully", { component: "auth", operation: "verifyToken", userId: decoded.sub });
+  return decoded;
 }
 
-module.exports = { verifyToken, idTokenClaimError, isTransientKeyError };
+module.exports = {
+  verifyToken,
+  hydrateVerifier,
+  idTokenClaimError,
+  isTransientKeyError,
+  _getVerifier: getVerifier, // tests: preload a JWKS with cacheJwks()
+};

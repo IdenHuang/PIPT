@@ -4,6 +4,7 @@
  * extended only by a fresh token bound to the same user.
  */
 
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -11,12 +12,15 @@ import * as path from 'path';
 const {
   SocketAuthLifetime,
   ReauthGate,
+  TokenFailureCap,
+  tokenOutcome,
   tokenExpiryMs,
   DEFAULT_GRACE_MS,
 } = require('../socket-server/socket-auth-lifetime.js');
 const { resolveRelayToken } = require('../socket-server/relay-token.js');
-const { isTransientKeyError } = require('../socket-server/auth.js');
+const auth = require('../socket-server/auth.js');
 /* eslint-enable @typescript-eslint/no-require-imports */
+const { isTransientKeyError } = auth;
 
 describe('tokenExpiryMs', () => {
   test('converts exp seconds to epoch ms', () => {
@@ -192,10 +196,17 @@ describe('transient token-check failures', () => {
   const identity = { userId: 'u1', userEmail: 'u1@example.edu' };
 
   test.each([
-    ['rate limited', 'JwksRateLimitError', true],
-    ['JWKS endpoint error', 'JwksError', true],
-    ['network error', 'Error', true],
-    ['unknown kid', 'SigningKeyNotFoundError', false],
+    ['penalty period after an unknown kid', 'WaitPeriodNotYetEndedJwkError', true],
+    ['JWKS fetch failed', 'FetchError', true],
+    ['JWKS fetch failed (non-retryable)', 'NonRetryableFetchError', true],
+    ['JWKS not cached', 'JwksNotAvailableInCacheError', true],
+    ['JWKS response invalid', 'JwksValidationError', true],
+    ['unknown kid', 'KidNotFoundInJwksError', false],
+    ['bad signature', 'JwtInvalidSignatureError', false],
+    ['expired', 'JwtExpiredError', false],
+    ['wrong audience', 'CognitoJwtInvalidClientIdError', false],
+    ['malformed', 'JwtParseError', false],
+    ['plain error', 'Error', false],
   ])('%s -> transient=%p', (_label, name, transient) => {
     const err = new Error('x');
     err.name = name;
@@ -245,10 +256,127 @@ describe('socket server wiring', () => {
     expect(block).toContain('reauthGate.finish(outcome)');
   });
 
-  test('JWKS fetches for uncached keys are rate limited', () => {
-    const auth = fs.readFileSync(path.join(root, 'auth.js'), 'utf8');
-    expect(auth).toContain('cache: true');
-    expect(auth).toContain('rateLimit: true');
-    expect(auth).toContain('jwksRequestsPerMinute: JWKS_REQUESTS_PER_MINUTE');
+  test('tokens are verified with aws-jwt-verify, not jwks-rsa (finding f-e757a3fc)', () => {
+    const authSrc = fs.readFileSync(path.join(root, 'auth.js'), 'utf8');
+    const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    expect(authSrc).toContain("require('aws-jwt-verify')");
+    expect(authSrc).not.toMatch(/require\(['"](jwks-rsa|jsonwebtoken)['"]\)/);
+    expect(pkg.dependencies).not.toHaveProperty('jwks-rsa');
+    expect(pkg.dependencies).not.toHaveProperty('jsonwebtoken');
+    expect(server).toContain('hydrateVerifier();');
+  });
+
+  test.each([
+    ['text-generation', 'relayToken'],
+    ['start-nova-sonic', 'fresh'],
+  ])('%s is refused while locked and records every verification (finding f-5dab915a)', (event, result) => {
+    const start = server.indexOf(`on("${event}"`);
+    const block = server.slice(start, server.indexOf('\n  on("', start + 1));
+    const lockCheck = block.indexOf('if (tokenFailureCap.isLocked())');
+    expect(lockCheck).toBeGreaterThan(-1);
+    expect(lockCheck).toBeLessThan(block.indexOf('authorizeSessionRequest('));
+    expect(lockCheck).toBeLessThan(block.indexOf('resolveRelayToken('));
+    expect(block).toContain(`tokenFailureCap.record(tokenOutcome(${result}));`);
+  });
+
+  test('reauth shares the same failure cap', () => {
+    expect(server).toContain('new ReauthGate({ failureCap: tokenFailureCap })');
+  });
+});
+
+describe('TokenFailureCap and tokenOutcome', () => {
+  test.each([
+    [{ ok: true }, 'ok'],
+    [{ ok: false, error: 'x' }, 'rejected'],
+    [{ ok: false, error: 'x', transient: true }, 'transient'],
+    [undefined, 'rejected'],
+  ])('tokenOutcome(%p) = %p', (result, outcome) => {
+    expect(tokenOutcome(result)).toBe(outcome);
+  });
+
+  test('locks after 3 clear rejections, ignores transient, recovers after lockout', () => {
+    let now = 0;
+    const cap = new TokenFailureCap({ maxFailures: 3, lockoutMs: 300_000, now: () => now });
+    cap.record('rejected');
+    cap.record('transient');
+    cap.record('rejected');
+    expect(cap.isLocked()).toBe(false);
+    cap.record('rejected');
+    expect(cap.isLocked()).toBe(true);
+    now += 300_000;
+    expect(cap.isLocked()).toBe(false);
+  });
+
+  test('a valid token resets the count', () => {
+    const cap = new TokenFailureCap({ maxFailures: 3 });
+    cap.record('rejected');
+    cap.record('rejected');
+    cap.record('ok');
+    cap.record('rejected');
+    cap.record('rejected');
+    expect(cap.isLocked()).toBe(false);
+  });
+
+  test('rapid valid chat messages are never refused', () => {
+    const cap = new TokenFailureCap({ maxFailures: 3 });
+    for (let i = 0; i < 100; i++) cap.record('ok');
+    expect(cap.isLocked()).toBe(false);
+  });
+
+  test('rejections on one event lock the others via a shared cap', () => {
+    const cap = new TokenFailureCap({ maxFailures: 3 });
+    const gate = new ReauthGate({ minIntervalMs: 0, failureCap: cap });
+    cap.record('rejected'); // text-generation
+    cap.record('rejected'); // start-nova-sonic
+    expect(gate.tryBegin().allowed).toBe(true);
+    gate.finish('rejected'); // reauth
+    expect(cap.isLocked()).toBe(true);
+    expect(gate.tryBegin()).toEqual({ allowed: false, reason: 'locked' });
+  });
+});
+
+describe('verifyToken with aws-jwt-verify (offline, preloaded JWKS)', () => {
+  const POOL = 'ca-central-1_TestPool';
+  const CLIENT = 'test-client';
+  const ISS = `https://cognito-idp.ca-central-1.amazonaws.com/${POOL}`;
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const otherKey = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
+  const b64 = (v: object) => Buffer.from(JSON.stringify(v)).toString('base64url');
+
+  const sign = (claims: Record<string, unknown> = {}, key = privateKey) => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const head = b64({ alg: 'RS256', kid: 'k1', typ: 'JWT' });
+    const body = b64({
+      sub: 'u1', email: 'u1@example.edu', email_verified: true, token_use: 'id',
+      aud: CLIENT, iss: ISS, iat: nowSec, exp: nowSec + 3600, ...claims,
+    });
+    const sig = crypto.sign('sha256', Buffer.from(`${head}.${body}`), key).toString('base64url');
+    return `${head}.${body}.${sig}`;
+  };
+
+  beforeAll(() => {
+    process.env.COGNITO_USER_POOL_ID = POOL;
+    process.env.COGNITO_CLIENT_ID = CLIENT;
+    const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'k1', alg: 'RS256', use: 'sig' };
+    auth._getVerifier().cacheJwks({ keys: [jwk] });
+  });
+
+  test('accepts a valid ID token', async () => {
+    await expect(auth.verifyToken(sign())).resolves.toMatchObject({ sub: 'u1', email: 'u1@example.edu' });
+  });
+
+  test.each([
+    ['bad signature', () => sign({}, otherKey)],
+    ['expired', () => sign({ exp: Math.floor(Date.now() / 1000) - 10 })],
+    ['wrong audience', () => sign({ aud: 'other-client' })],
+    ['wrong issuer', () => sign({ iss: 'https://evil.example' })],
+    ['access token', () => sign({ token_use: 'access' })],
+    ['unverified email', () => sign({ email_verified: false })],
+    ['missing email', () => sign({ email: undefined })],
+    ['garbage', () => 'not-a-jwt'],
+  ])('rejects %s as a clear (non-transient) rejection', async (_label, make) => {
+    const err = await auth.verifyToken(make()).catch((e: Error & { transient?: boolean }) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.transient).toBeUndefined();
   });
 });

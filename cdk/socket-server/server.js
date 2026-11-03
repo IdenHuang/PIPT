@@ -4,7 +4,7 @@ const { createServer } = require("http");
 const { Server } = require("socket.io");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
-const { verifyToken } = require("./auth");
+const { verifyToken, hydrateVerifier } = require("./auth");
 const { verifySessionScope } = require("./session-auth");
 const { authorizeSessionRequest } = require("./session-guard");
 const { resolveRelayToken } = require("./relay-token");
@@ -13,7 +13,13 @@ const { StreamRelayRegistry, safeEqual } = require("./stream-relay");
 const { VoicePreviewLimiter, ConnectionLimiter, limiterKey, positiveIntEnv } = require("./voice-preview-limiter");
 const logger = require("./logger");
 const { asPayload, guardHandler } = require("./event-guard");
-const { SocketAuthLifetime, ReauthGate, tokenExpiryMs } = require("./socket-auth-lifetime");
+const {
+  SocketAuthLifetime,
+  ReauthGate,
+  TokenFailureCap,
+  tokenOutcome,
+  tokenExpiryMs,
+} = require("./socket-auth-lifetime");
 
 // Last-resort traps. Node 22 exits on an unhandled rejection by default, and
 // this service runs as a single ECS task, so one listener bug would drop every
@@ -399,9 +405,13 @@ io.on("connection", (socket) => {
   // verify and belong to the same user as the handshake (resolveRelayToken).
   // A rejected token does not disconnect immediately (a JWKS hiccup should not
   // drop a live voice session); the socket still expires on schedule.
-  // reauthGate bounds how often this socket can make the server verify a
-  // token; refused attempts are answered without any verification or logging.
-  const reauthGate = new ReauthGate();
+  // tokenFailureCap is shared by every event that verifies a client token
+  // (reauth, text-generation, start-nova-sonic): after 3 clear rejections in a
+  // row they are refused without verification for 5 minutes. reauthGate adds
+  // one-at-a-time and a 5s minimum gap, which only "reauth" can afford (chat
+  // messages each carry a token and may be sent in quick succession).
+  const tokenFailureCap = new TokenFailureCap();
+  const reauthGate = new ReauthGate({ failureCap: tokenFailureCap });
   on("reauth", async (rawData, ack) => {
     const reply = typeof ack === "function" ? ack : () => {};
     const gate = reauthGate.tryBegin();
@@ -510,6 +520,12 @@ io.on("connection", (socket) => {
       socket.emit("nova-error", { error: "Voice is already starting. Please wait a moment and try again." });
       return;
     }
+    // Too many bad tokens on this socket: refuse before tearing anything down
+    // or querying the database.
+    if (tokenFailureCap.isLocked()) {
+      socket.emit("nova-error", { error: "Authentication failed" });
+      return;
+    }
     lastNovaSonicStart = now;
     const generation = ++voiceGeneration;
     const isStale = () => generation !== voiceGeneration;
@@ -560,6 +576,7 @@ io.on("connection", (socket) => {
       { userId: socket.userId, userEmail: socket.userEmail },
       verifyToken,
     );
+    tokenFailureCap.record(tokenOutcome(fresh));
     if (isStale()) return;
     if (!fresh.ok) {
       logger.warn("Relay token rejected for start-nova-sonic", {
@@ -989,6 +1006,12 @@ io.on("connection", (socket) => {
       socket.emit("text-stream", { type: "error", content: "Invalid request" });
       return;
     }
+    // Too many bad tokens on this socket: refuse before the database lookup
+    // and token verification below.
+    if (tokenFailureCap.isLocked()) {
+      socket.emit("text-stream", { type: "error", content: "Authentication failed" });
+      return;
+    }
     textGenInFlight = true;
     // Log identifiers only: data.token is the caller's bearer token and
     // data.message is student content, so neither may reach CloudWatch.
@@ -1032,6 +1055,7 @@ io.on("connection", (socket) => {
       { userId: socket.userId, userEmail: socket.userEmail },
       verifyToken,
     );
+    tokenFailureCap.record(tokenOutcome(relayToken));
     if (!relayToken.ok) {
       logger.warn("Relay token rejected for text-generation", {
         component: "server",
@@ -1328,6 +1352,8 @@ io.on("connection", (socket) => {
 
 // ─── Start HTTP server on port 80 ─────────────────────────────────────────
 const PORT = process.env.PORT || 80;
+// Preload Cognito's signing keys so the first handshake doesn't fetch them.
+hydrateVerifier();
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Socket server running on port ${PORT}`);
 });
