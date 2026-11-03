@@ -7,6 +7,7 @@ import psycopg2
 import logging
 from datetime import datetime, timezone
 from typing import NamedTuple
+from urllib.parse import unquote_plus
 
 from helpers.vectorstore import update_vectorstore
 from helpers.helper import is_db_auth_error, open_vectorstore, grant_readwrite_on_vectorstore_tables
@@ -483,7 +484,10 @@ def handler(event, context):
             logger.info(f"Ignoring event from non-target bucket: {bucket_name}")
             continue
 
-        file_key = record['s3']['object']['key']
+        # S3 event notifications URL-encode object keys (space -> '+'). Decode once here so
+        # the stored filepath matches the key the worker rebuilds from list_objects_v2.
+        # https://docs.aws.amazon.com/AmazonS3/latest/userguide/notification-content-structure.html
+        file_key = unquote_plus(record['s3']['object']['key'])
         parsed = parse_s3_file_path(file_key)
         simulation_group_id = parsed.simulation_group_id
         persona_id = parsed.persona_id
