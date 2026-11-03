@@ -362,6 +362,11 @@ def _authorize(mode, caller_email, session_id, persona_id, simulation_group_id):
 # The conditional put makes the claim atomic across concurrent requests.
 INITIAL_PROMPT_KEY_PREFIX = "INIT#"
 _INITIAL_PROMPT_FAILED = "failed"
+# A claim older than this is treated as abandoned and can be taken again, so a
+# chat whose opening turn died without releasing the claim recovers on its own.
+# Must exceed the text-gen Lambda timeout (300s in api-service-stack.ts) so an
+# in-flight generation is never overtaken.
+INITIAL_PROMPT_CLAIM_STALE_SECONDS = 360
 _dynamodb_resource = None
 
 
@@ -376,18 +381,25 @@ def claim_initial_prompt(session_id):
     """Atomically claim the chat's single opening turn.
 
     Returns True if this request won the claim, False if it is already held.
-    A claim released by a failed generation can be taken again so the student
-    can retry the greeting. Other DynamoDB errors propagate (callers fail closed).
+    A claim that was released (failed generation) or is older than
+    INITIAL_PROMPT_CLAIM_STALE_SECONDS can be taken again so the student can
+    retry the greeting. Other DynamoDB errors propagate (callers fail closed).
     """
+    now = int(time.time())
     try:
         _conversation_table().put_item(
             Item={
                 "SessionId": f"{INITIAL_PROMPT_KEY_PREFIX}{session_id}",
                 "claim_status": "claimed",
-                "claimed_at": int(time.time()),
+                "claimed_at": now,
             },
-            ConditionExpression="attribute_not_exists(SessionId) OR claim_status = :failed",
-            ExpressionAttributeValues={":failed": _INITIAL_PROMPT_FAILED},
+            ConditionExpression=(
+                "attribute_not_exists(SessionId) OR claim_status = :failed OR claimed_at < :stale"
+            ),
+            ExpressionAttributeValues={
+                ":failed": _INITIAL_PROMPT_FAILED,
+                ":stale": now - INITIAL_PROMPT_CLAIM_STALE_SECONDS,
+            },
         )
         return True
     except ClientError as e:
@@ -406,6 +418,26 @@ def release_initial_prompt(session_id):
         )
     except Exception as e:
         logger.error(f"Failed to release initial-prompt claim for session {session_id}: {e}")
+
+
+def _chat_has_ai_turn(session_id):
+    """True if the chat has a persisted AI message; False if not or unknown.
+
+    get_response() swallows generation errors and save_message_to_db() swallows
+    insert errors, so a 200 does not prove the opening turn was saved.
+    """
+    try:
+        cur = connect_to_db().cursor()
+        cur.execute(
+            """SELECT EXISTS (SELECT 1 FROM "messages" WHERE chat_id = %s AND sender_type = 'ai')""",
+            (session_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return bool(row and row[0])
+    except Exception as e:
+        logger.error(f"Could not verify opening turn for session {session_id}: {e}")
+        return False
 
 
 def get_system_prompt(simulation_group_id):
@@ -1088,7 +1120,12 @@ def handler(event, context):
             'body': json.dumps("Internal server error")
         }
 
-
+    # Generation and persistence errors are swallowed inside get_response, so
+    # release the claim whenever no AI turn was saved; otherwise the student
+    # could never retry the greeting.
+    if is_initial_prompt and not _chat_has_ai_turn(session_id):
+        logger.warning(f"Opening turn for session {session_id} was not persisted; releasing claim")
+        release_initial_prompt(session_id)
 
     # TODO(refactor): Extract response formatting into a helper function
     if stream:

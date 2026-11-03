@@ -24,7 +24,11 @@ class FakeTable:
 
     def put_item(self, Item, ConditionExpression, ExpressionAttributeValues):
         existing = self.items.get(Item["SessionId"])
-        if existing is not None and existing.get("claim_status") != ExpressionAttributeValues[":failed"]:
+        retakeable = existing is None or (
+            existing.get("claim_status") == ExpressionAttributeValues[":failed"]
+            or existing["claimed_at"] < ExpressionAttributeValues[":stale"]
+        )
+        if not retakeable:
             raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem")
         self.items[Item["SessionId"]] = dict(Item)
 
@@ -47,6 +51,8 @@ class FakeDb:
         def fetchone():
             if "max_messages_per_chat" in state["sql"]:
                 return (db.max_messages,)
+            if "EXISTS" in state["sql"]:
+                return (db.ai > 0,)
             return (db.student, db.ai)
 
         return types.SimpleNamespace(execute=execute, fetchone=fetchone, close=lambda: None)
@@ -55,12 +61,16 @@ class FakeDb:
 @pytest.fixture
 def chat(main, monkeypatch):  # noqa: F811
     """Handler wired for chat mode; records generations and key-question caching."""
-    calls = {"generate": 0, "cache": 0, "fail": False}
+    # fail: get_response raises. swallow: it returns 200 but saves no AI turn,
+    # like chat.py does when Bedrock or the message insert fails.
+    calls = {"generate": 0, "cache": 0, "fail": False, "swallow": False}
     db, table = FakeDb(), FakeTable()
 
     def get_response(**kw):
         if calls["fail"]:
             raise RuntimeError("bedrock down")
+        if calls["swallow"]:
+            return {"llm_output": "I'm sorry, I cannot provide a response to that query."}
         calls["generate"] += 1
         db.ai += 1  # chat.py persists the AI turn
         if not kw["is_initial_prompt"]:
@@ -114,9 +124,11 @@ def test_initial_prompt_runs_once_then_replays_are_rejected(chat, stream):
     assert chat.calls["cache"] == 1
 
 
-def test_concurrent_initial_prompt_loses_the_claim(chat):
-    # Another request holds the claim but has not written its AI turn yet.
-    chat.table.items[f"INIT#{SESSION}"] = {"SessionId": f"INIT#{SESSION}", "claim_status": "claimed"}
+def test_concurrent_initial_prompt_loses_the_claim(chat, main):  # noqa: F811
+    # Another request holds a fresh claim but has not written its AI turn yet.
+    chat.table.items[f"INIT#{SESSION}"] = {
+        "SessionId": f"INIT#{SESSION}", "claim_status": "claimed", "claimed_at": int(main.time.time()),
+    }
     assert chat.send()["statusCode"] == 409
     assert chat.calls["generate"] == 0
     assert chat.calls["cache"] == 0
@@ -135,5 +147,24 @@ def test_failed_generation_releases_the_claim_for_retry(chat):
     chat.calls["fail"] = True
     assert chat.send()["statusCode"] == 500
     chat.calls["fail"] = False
+    assert chat.send()["statusCode"] == 200
+    assert chat.calls["generate"] == 1
+
+
+def test_swallowed_failure_with_no_ai_turn_releases_the_claim(chat):
+    chat.calls["swallow"] = True
+    assert chat.send()["statusCode"] == 200  # get_response hides the error
+    chat.calls["swallow"] = False
+    assert chat.send()["statusCode"] == 200
+    assert chat.calls["generate"] == 1
+
+
+def test_stale_claim_can_be_retaken(chat, main):  # noqa: F811
+    # A claim left behind by a request that died mid-generation.
+    key = f"INIT#{SESSION}"
+    chat.table.items[key] = {
+        "SessionId": key, "claim_status": "claimed",
+        "claimed_at": int(main.time.time()) - main.INITIAL_PROMPT_CLAIM_STALE_SECONDS - 1,
+    }
     assert chat.send()["statusCode"] == 200
     assert chat.calls["generate"] == 1
