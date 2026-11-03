@@ -14,6 +14,7 @@ const cognitoClient = new CognitoIdentityProviderClient();
 
 const DEFAULT_DEBRIEF_PROMPT = fs.readFileSync(path.join(__dirname, "defaultDebriefPrompt.txt"), "utf8").trim();
 const { seedPrompt } = require("./seedPrompt.js");
+const { generateAccessCode } = require("./accessCode.js");
 const DEFAULT_SYSTEM_PROMPT = fs.readFileSync(path.join(__dirname, "defaultSystemPrompt.txt"), "utf8").trim();
 
 // SQL conneciton from global variable at libadmin.js
@@ -312,11 +313,7 @@ exports.handler = async (event, context) => {
             logger.info("Simulation group creation start", { group_name, group_description });
 
             // Auto-generate access code server-side (XXXX-XXXX format)
-            const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-            let group_access_code = "";
-            for (let i = 0; i < 4; i++) group_access_code += chars.charAt(Math.floor(Math.random() * chars.length));
-            group_access_code += "-";
-            for (let i = 0; i < 4; i++) group_access_code += chars.charAt(Math.floor(Math.random() * chars.length));
+            const group_access_code = generateAccessCode(8);
 
             // Insert new simulation group into simulation_groups table
             // TODO: add admin_voice_enabled and instructor_voice_enabled after migration 005 runs
@@ -459,11 +456,7 @@ exports.handler = async (event, context) => {
             const { simulation_group_id } = event.queryStringParameters;
 
             // Generate a new random access code (8 chars, uppercase alphanumeric)
-            const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-            let newCode = "";
-            for (let i = 0; i < 4; i++) newCode += chars.charAt(Math.floor(Math.random() * chars.length));
-            newCode += "-";
-            for (let i = 0; i < 4; i++) newCode += chars.charAt(Math.floor(Math.random() * chars.length));
+            const newCode = generateAccessCode(8);
 
             const updated = await sqlConnectionTableCreator`
               UPDATE "simulation_groups"

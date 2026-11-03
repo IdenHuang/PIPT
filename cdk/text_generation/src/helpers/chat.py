@@ -208,7 +208,8 @@ def apply_text_guardrail(text: str, source: str) -> tuple:
             action = response.get('action', '')
             if action == 'GUARDRAIL_INTERVENED':
                 blocked_msg = response.get('outputs', [{}])[0].get('text', "I'm sorry, I can't respond to that.")
-                logger.warning("Guardrail INTERVENED (%s): %s → %s", source, text[:60], blocked_msg)
+                # Never log checked text (student input or model output); length is enough to debug.
+                logger.warning("Guardrail INTERVENED (%s): chars=%d", source, len(text or ""))
                 return False, blocked_msg
             return True, None
         except Exception as e:
@@ -334,14 +335,15 @@ def get_response(
     Manager read, a DB connection and an error log. Conversation history
     still lives in DynamoDB under the caller-bound playground key.
     """
-    logger.info(f"🔍 GET_RESPONSE CALLED - Stream: {stream}, Query: '{query[:50]}...'")
+    # Never log query text (student message content); its length is enough to debug.
+    logger.info(f"🔍 GET_RESPONSE CALLED - Stream: {stream}, query_chars={len(query or '')}")
     
     # Screen student input through guardrails (skip the initial system-generated prompt
     # which is trusted instructor content, not student input)
     if not is_initial_prompt:
         passed, blocked_msg = apply_text_guardrail(query, "INPUT")
         if not passed:
-            logger.warning("Guardrail blocked student input: %s", query[:60])
+            logger.warning("Guardrail blocked student input (chars=%d)", len(query or ""))
             if stream:
                 # Publish the blocked message through AppSync so the frontend
                 # receives the full start → chunk → end sequence and stops loading.
@@ -541,7 +543,7 @@ def generate_streaming_response(
     # TODO(refactor): Extract student message saving + matching into a helper function (duplicated with get_response)
     import time
     
-    logger.info(f"🚀 STREAMING FUNCTION STARTED with query: '{query}' - DEPLOYMENT TEST v2")
+    logger.info(f"🚀 STREAMING FUNCTION STARTED: query_chars={len(query or '')}")
 
     # Empathy evaluation disabled
     # def empathy_async():
@@ -570,7 +572,7 @@ def generate_streaming_response(
     #         save_message_to_db(session_id, student_user_id, 'student', query)
 
     try:
-        logger.info(f"🔍 STREAMING QUERY CHECK: '{query}' (length: {len(query.strip())})")
+        logger.info(f"🔍 STREAMING QUERY CHECK: length={len(query.strip())}")
         # Empathy evaluation disabled
         # Skip saving and matching for the initial system-generated prompt —
         # it is not a real student message.
@@ -2964,8 +2966,8 @@ def screen_transcript_for_grading(
     max_workers: int = 8,
 ) -> list[dict]:
     """
-    Run every student turn through ``apply_text_guardrail`` (source=INPUT)
-    before the transcript is placed in a grading prompt.
+    Run every non-empty transcript turn through ``apply_text_guardrail``
+    (source=INPUT) before the transcript is placed in a grading prompt.
 
     Messages are stored by ``POST /student/create_message`` without guardrail
     screening, so this is the first point where prompt-attack filtering
@@ -2973,37 +2975,39 @@ def screen_transcript_for_grading(
     ``WITHHELD_MESSAGE_PLACEHOLDER``. The guardrail fails closed, so if it is
     unavailable the turn is also withheld and the debrief is marked degraded.
 
-    AI/system turns are not screened here: they are model output that was
-    already screened (source=OUTPUT) when generated.
+    AI/system turns are screened too. ``sender`` comes from the stored
+    ``messages.sender_type`` column, which a student can set to ``'ai'``
+    (e.g. via ``POST /student/create_ai_message``), so no turn is trusted on
+    the basis of its label.
 
     Returns a new list; the input is not modified.
     """
     screened = [dict(m) for m in transcript]
-    student_idx = [
+    turn_idx = [
         i for i, m in enumerate(screened)
-        if str(m.get("sender", "")).lower() == "student" and (m.get("content") or "").strip()
+        if (m.get("content") or "").strip()
     ]
-    if not student_idx:
+    if not turn_idx:
         return screened
 
-    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(student_idx)))) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(turn_idx)))) as executor:
         results = list(executor.map(
             lambda i: apply_text_guardrail(screened[i]["content"], "INPUT"),
-            student_idx,
+            turn_idx,
         ))
 
     withheld = 0
-    for i, (passed, _replacement) in zip(student_idx, results):
+    for i, (passed, _replacement) in zip(turn_idx, results):
         if not passed:
             screened[i]["content"] = WITHHELD_MESSAGE_PLACEHOLDER
             withheld += 1
 
     if withheld:
-        logger.warning(f"📋 Withheld {withheld}/{len(student_idx)} student turns from the grading transcript")
+        logger.warning(f"📋 Withheld {withheld}/{len(turn_idx)} turns from the grading transcript")
         if tracker:
             tracker.record(
                 "screen_transcript_for_grading",
-                f"{withheld}_of_{len(student_idx)}_student_turns_withheld",
+                f"{withheld}_of_{len(turn_idx)}_turns_withheld",
                 "score_may_be_affected",
             )
     return screened

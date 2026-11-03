@@ -7,6 +7,7 @@ import LoadingIndicator from '@/components/LoadingIndicator';
 import { io, type Socket } from 'socket.io-client';
 import { appConfig } from '@/config/aws-config';
 import { getVoicesByAccent } from '@/lib/voice-constants';
+import { attachSocketReauth } from '@/lib/socket-reauth';
 
 // ---------------------------------------------------------------------------
 // Build grouped voice data from shared constants (preserving locale for keys)
@@ -183,9 +184,23 @@ export default function VoicePreview({ value, onChange }: VoicePreviewProps = {}
 
       const socket = io(socketUrl, {
         transports: ['websocket'],
-        auth: { token },
+        // Function form so a reconnect fetches a current token, not this one.
+        auth: (cb) => {
+          authService.getIdToken()
+            .then((t) => cb({ token: t || '' }))
+            .catch(() => cb({ token: '' }));
+        },
       });
       socketRef.current = socket;
+      // The cached token can be within a minute or two of expiry; renew it so
+      // the server doesn't end the preview part-way through.
+      attachSocketReauth(socket, {
+        onExpired: (message) => {
+          setErrorMessage(message);
+          setPreviewState('error');
+          cleanup();
+        },
+      });
 
       socket.on('audio-chunk', (data: { data: string }) => {
         stopMic();

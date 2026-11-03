@@ -122,7 +122,9 @@ def s3_key_exists(bucket, key):
     except Exception:
         return False
 
-@logger.inject_lambda_context(log_event=True)
+# No log_event: the raw event carries the caller's Cognito ID token in
+# headers.Authorization, which must never reach CloudWatch.
+@logger.inject_lambda_context
 def lambda_handler(event, context):
     # Extract user identity from authorizer context
     user_email = event.get("requestContext", {}).get("authorizer", {}).get("email", "")

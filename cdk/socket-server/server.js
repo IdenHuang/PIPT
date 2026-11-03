@@ -4,7 +4,7 @@ const { createServer } = require("http");
 const { Server } = require("socket.io");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
-const { verifyToken } = require("./auth");
+const { verifyToken, hydrateVerifier } = require("./auth");
 const { verifySessionScope } = require("./session-auth");
 const { authorizeSessionRequest } = require("./session-guard");
 const { resolveRelayToken } = require("./relay-token");
@@ -12,6 +12,46 @@ const { fetchPatientContext } = require("./patient-context");
 const { StreamRelayRegistry, safeEqual } = require("./stream-relay");
 const { VoicePreviewLimiter, ConnectionLimiter, limiterKey, positiveIntEnv } = require("./voice-preview-limiter");
 const logger = require("./logger");
+const { asPayload, guardHandler } = require("./event-guard");
+const {
+  SocketAuthLifetime,
+  ReauthGate,
+  TokenFailureCap,
+  tokenOutcome,
+  tokenExpiryMs,
+} = require("./socket-auth-lifetime");
+
+// Last-resort traps. Node 22 exits on an unhandled rejection by default, and
+// this service runs as a single ECS task, so one listener bug would drop every
+// connected user. Event handlers are also wrapped individually (guardHandler);
+// these catch anything that escapes outside a handler.
+process.on("unhandledRejection", (err) => {
+  logger.error("unhandledRejection", {
+    component: "server",
+    error: String(err && err.message),
+    stack: err && err.stack,
+  });
+});
+process.on("uncaughtException", (err) => {
+  logger.error("uncaughtException", {
+    component: "server",
+    error: String(err && err.message),
+    stack: err && err.stack,
+  });
+});
+
+/**
+ * Logs that a voice transcript or diagnosis message passed through, without
+ * its text. Transcripts are student work product (and the assistant's replies
+ * echo it), so only the source, role and length reach CloudWatch.
+ */
+function logTranscript(source, role, text) {
+  logger.info("Voice text message", {
+    component: source,
+    role,
+    chars: typeof text === "string" ? text.length : 0,
+  });
+}
 const { SignatureV4 } = require("@smithy/signature-v4");
 const { HttpRequest } = require("@smithy/protocol-http");
 const { defaultProvider } = require("@aws-sdk/credential-provider-node");
@@ -295,6 +335,9 @@ io.use(async (socket, next) => {
     const decoded = await verifyToken(token);
     socket.userId = decoded.sub;
     socket.userEmail = decoded.email;
+    // The connection is valid only until this token (or a newer one sent on
+    // "reauth") expires; see socket-auth-lifetime.js.
+    socket.authExpiresAt = tokenExpiryMs(decoded);
     // Early refusal with a clear connect_error; the authoritative count is
     // taken in the connection handler so abandoned handshakes cannot leak.
     if (connectionLimiter.isAtLimit(limiterKey(socket))) {
@@ -317,6 +360,99 @@ io.on("connection", (socket) => {
     return;
   }
   socket.on("disconnect", releaseConnection);
+
+  // ── Credential lifetime ───────────────────────────────────────────────────
+  // The handshake token is verified once, so the socket must not outlive it.
+  // When it (or the newest token sent on "reauth") expires, the server
+  // disconnects; the disconnect handler below tears down voice and preview
+  // sessions. Every client event is refused once expired, even if the timer
+  // has not fired yet.
+  function expireSocket() {
+    if (socket.disconnected) return;
+    logger.info("Socket credential expired; disconnecting", {
+      component: "server",
+      operation: "auth-expiry",
+      socketId: socket.id,
+      userEmail: socket.userEmail,
+    });
+    socket.emit("auth-expired", { message: "Your sign-in has expired. Please sign in again." });
+    socket.disconnect(true);
+  }
+  const authLifetime = new SocketAuthLifetime({
+    expiresAtMs: socket.authExpiresAt,
+    onExpire: expireSocket,
+  });
+  socket.on("disconnect", () => authLifetime.stop());
+
+  // Extend the lifetime from any token verified and bound to this socket's
+  // identity (reauth, text-generation, start-nova-sonic).
+  function acceptFreshToken(verified) {
+    if (verified && verified.ok) authLifetime.renew(verified.expiresAt);
+  }
+
+  // Register a client event listener whose errors are logged, not thrown, and
+  // which only runs while the socket's credential is still valid.
+  const on = (event, handler) => socket.on(event, guardHandler(event, socket, (...args) => {
+    if (authLifetime.isExpired()) {
+      expireSocket();
+      return undefined;
+    }
+    return handler(...args);
+  }));
+
+  // ─── Re-authentication ────────────────────────────────────────────────────
+  // The client sends a fresh ID token before the current one expires. It must
+  // verify and belong to the same user as the handshake (resolveRelayToken).
+  // A rejected token does not disconnect immediately (a JWKS hiccup should not
+  // drop a live voice session); the socket still expires on schedule.
+  // tokenFailureCap is shared by every event that verifies a client token
+  // (reauth, text-generation, start-nova-sonic): after 3 clear rejections in a
+  // row they are refused without verification for 5 minutes. reauthGate adds
+  // one-at-a-time and a 5s minimum gap, which only "reauth" can afford (chat
+  // messages each carry a token and may be sent in quick succession).
+  const tokenFailureCap = new TokenFailureCap();
+  const reauthGate = new ReauthGate({ failureCap: tokenFailureCap });
+  on("reauth", async (rawData, ack) => {
+    const reply = typeof ack === "function" ? ack : () => {};
+    const gate = reauthGate.tryBegin();
+    if (!gate.allowed) {
+      reply({ ok: false, error: "Too many reauth attempts" });
+      return;
+    }
+    let outcome = "rejected";
+    try {
+      const data = asPayload(rawData);
+      const result = await resolveRelayToken(
+        data && data.token,
+        { userId: socket.userId, userEmail: socket.userEmail },
+        verifyToken,
+      );
+      if (!result.ok) {
+        if (result.transient) outcome = "transient";
+        logger.warn("Reauth token rejected", {
+          component: "server",
+          operation: "reauth",
+          socketId: socket.id,
+          userEmail: socket.userEmail,
+          transient: outcome === "transient",
+        });
+        reply({ ok: false, error: result.error });
+        return;
+      }
+      if (!authLifetime.renew(result.expiresAt)) {
+        reply({ ok: false, error: "Session expired" });
+        return;
+      }
+      outcome = "ok";
+      reply({ ok: true, expiresInMs: authLifetime.expiresInMs() });
+    } finally {
+      reauthGate.finish(outcome);
+    }
+  });
+
+  // Tell the client when to reauth. Relative time, so client clock skew
+  // doesn't matter.
+  socket.emit("auth-state", { expiresInMs: authLifetime.expiresInMs() });
 
   console.log("🔌 CLIENT CONNECTED:", socket.id, "User:", socket.userEmail);
   console.log(
@@ -374,12 +510,20 @@ io.on("connection", (socket) => {
   // When VOICE_AGENT_ARN is set, audio is streamed to the AgentCore
   // voice agent via WebSocket. Otherwise, falls back to the local
   // nova_sonic.py child process.
-  socket.on("start-nova-sonic", async (config = {}) => {
+  on("start-nova-sonic", async (rawConfig) => {
+    // Defaults do not apply to an explicit null, so normalise here.
+    const config = asPayload(rawConfig) || {};
     const now = Date.now();
     if (now - lastNovaSonicStart < 2000) {
       // Reply instead of dropping silently, which left the client waiting
       // on "connecting" for a nova-started that never came.
       socket.emit("nova-error", { error: "Voice is already starting. Please wait a moment and try again." });
+      return;
+    }
+    // Too many bad tokens on this socket: refuse before tearing anything down
+    // or querying the database.
+    if (tokenFailureCap.isLocked()) {
+      socket.emit("nova-error", { error: "Authentication failed" });
       return;
     }
     lastNovaSonicStart = now;
@@ -422,32 +566,30 @@ io.on("connection", (socket) => {
     }
     if (isStale()) return;
 
-    // ── Caller's ID token for upstream calls ───────────────────────────────
-    // The handshake token expires on a long-lived socket (ID tokens last an
-    // hour), which made a reconnect after a long idle period fail to load the
-    // patient context. The client sends a fresh token with each start; it is
-    // verified and bound to the handshake identity, exactly like the
-    // text-generation relay. Clients that don't send one keep the old behaviour.
-    let userToken = socket.handshake.auth.token;
-    if (config.token !== undefined) {
-      const fresh = await resolveRelayToken(
-        config.token,
-        { userId: socket.userId, userEmail: socket.userEmail },
-        verifyToken,
-      );
-      if (isStale()) return;
-      if (!fresh.ok) {
-        logger.warn("Relay token rejected for start-nova-sonic", {
-          component: "server",
-          operation: "start-nova-sonic",
-          userEmail: socket.userEmail,
-          sessionId,
-        });
-        socket.emit("nova-error", { error: fresh.error });
-        return;
-      }
-      userToken = fresh.token;
+    // ── Caller's ID token for upstream calls (required) ────────────────────
+    // The client sends a fresh token with each start. It is verified and bound
+    // to the handshake identity, exactly like the text-generation relay. The
+    // handshake token is never reused: it may be close to expiry, and the
+    // voice agent forwards this token to the API for the whole session.
+    const fresh = await resolveRelayToken(
+      config.token,
+      { userId: socket.userId, userEmail: socket.userEmail },
+      verifyToken,
+    );
+    tokenFailureCap.record(tokenOutcome(fresh));
+    if (isStale()) return;
+    if (!fresh.ok) {
+      logger.warn("Relay token rejected for start-nova-sonic", {
+        component: "server",
+        operation: "start-nova-sonic",
+        userEmail: socket.userEmail,
+        sessionId,
+      });
+      socket.emit("nova-error", { error: fresh.error });
+      return;
     }
+    acceptFreshToken(fresh);
+    const userToken = fresh.token;
 
     // ── Authoritative patient context (fail closed) ────────────────────────
     // The persona, system prompt and completion rule come only from
@@ -539,10 +681,11 @@ io.on("connection", (socket) => {
             } else if (msg.type === "turn-start") {
               socket.emit("turn-start", { role: msg.role });
             } else if (msg.type === "user-text") {
-              console.log("💬 AGENT USER TEXT:", msg.text);
+              // Transcripts are student content: log size only, never the text.
+              logTranscript("agentcore", "user", msg.text);
               socket.emit("text-message", { text: msg.text, role: "user" });
             } else if (msg.type === "text") {
-              console.log("💬 AGENT TEXT:", msg.text);
+              logTranscript("agentcore", msg.role || "assistant", msg.text);
               socket.emit("text-message", { text: msg.text, role: msg.role || "assistant" });
               if (msg.text && msg.text.includes("Nova Sonic ready")) {
                 novaReady = true;
@@ -550,7 +693,7 @@ io.on("connection", (socket) => {
                 socket.emit("nova-started", { status: "Nova Sonic session started" });
               }
             } else if (msg.type === "diagnosis_complete") {
-              console.log("🎯 DIAGNOSIS COMPLETE:", msg.text);
+              logTranscript("agentcore", "diagnosis_complete", msg.text);
               socket.emit("diagnosis-complete", { message: msg.text });
             } else if (msg.type === "diagnosis_verdict") {
               console.log("🩺 DIAGNOSIS VERDICT:", msg.verdict);
@@ -654,7 +797,10 @@ io.on("connection", (socket) => {
         .forEach((line) => {
           try {
             const parsed = JSON.parse(line);
-            console.log("📤 NOVA JSON:", parsed);
+            // Message type only: the payload carries transcripts and audio.
+            if (parsed.type !== "audio") {
+              logger.info("Nova message", { component: "nova", type: parsed.type });
+            }
 
             // ─ Audio chunks ───────────────────────────────────────────────
             if (parsed.type === "audio") {
@@ -674,15 +820,19 @@ io.on("connection", (socket) => {
             }
             // ─ Debug messages ───────────────────────────────────────────
             else if (parsed.type === "debug") {
-              console.log("🐞 NOVA DEBUG:", parsed.text);
+              // Debug text can echo session content; local development only.
+              if (process.env.NODE_ENV !== "production") {
+                console.log("🐞 NOVA DEBUG:", parsed.text);
+              }
             }
             // ─ Text messages ─────────────────────────────────────────────
             else if (parsed.type === "user-text") {
-              console.log("💬 NOVA USER TEXT:", parsed.text);
+              // Transcripts are student content: log size only, never the text.
+              logTranscript("nova", "user", parsed.text);
               socket.emit("text-message", { text: parsed.text, role: "user" });
             }
             else if (parsed.type === "text") {
-              console.log("💬 NOVA TEXT:", parsed.text);
+              logTranscript("nova", parsed.role || "assistant", parsed.text);
               socket.emit("text-message", { text: parsed.text, role: parsed.role || "assistant" });
               if (parsed.text.includes("Nova Sonic ready")) {
                 novaReady = true;
@@ -693,7 +843,7 @@ io.on("connection", (socket) => {
             }
             // ─ Diagnosis completion ──────────────────────────────────────
             else if (parsed.type === "diagnosis_complete") {
-              console.log("🎯 DIAGNOSIS COMPLETE:", parsed.text);
+              logTranscript("nova", "diagnosis_complete", parsed.text);
               socket.emit("diagnosis-complete", { message: parsed.text });
             } else if (parsed.type === "diagnosis_verdict") {
               console.log("🩺 DIAGNOSIS VERDICT:", parsed.verdict);
@@ -800,7 +950,9 @@ io.on("connection", (socket) => {
   let audioStarted = false;
   let lastNovaSonicStart = 0;
   let textGenInFlight = false;
-  socket.on("audio-input", (msg) => {
+  on("audio-input", (rawMsg) => {
+    const msg = asPayload(rawMsg);
+    if (!msg) return;
     // ── AgentCore WebSocket path ──────────────────────────────────────────
     if (socket.agentWs && socket.agentWs.readyState === WebSocket.OPEN) {
       if (!audioStarted) {
@@ -827,7 +979,9 @@ io.on("connection", (socket) => {
   });
 
   // ─── Text‑input from client ───────────────────────────────────────────────
-  socket.on("text-input", (msg) => {
+  on("text-input", (rawMsg) => {
+    const msg = asPayload(rawMsg);
+    if (!msg) return;
     // ── AgentCore WebSocket path ──────────────────────────────────────────
     if (socket.agentWs && socket.agentWs.readyState === WebSocket.OPEN) {
       socket.agentWs.send(JSON.stringify({ type: "text", text: msg.text }));
@@ -845,8 +999,19 @@ io.on("connection", (socket) => {
   });
 
   // ─── Text generation streaming ─────────────────────────────────────────────
-  socket.on("text-generation", async (data) => {
+  on("text-generation", async (rawData) => {
     if (textGenInFlight) return;
+    const data = asPayload(rawData);
+    if (!data) {
+      socket.emit("text-stream", { type: "error", content: "Invalid request" });
+      return;
+    }
+    // Too many bad tokens on this socket: refuse before the database lookup
+    // and token verification below.
+    if (tokenFailureCap.isLocked()) {
+      socket.emit("text-stream", { type: "error", content: "Authentication failed" });
+      return;
+    }
     textGenInFlight = true;
     // Log identifiers only: data.token is the caller's bearer token and
     // data.message is student content, so neither may reach CloudWatch.
@@ -890,6 +1055,7 @@ io.on("connection", (socket) => {
       { userId: socket.userId, userEmail: socket.userEmail },
       verifyToken,
     );
+    tokenFailureCap.record(tokenOutcome(relayToken));
     if (!relayToken.ok) {
       logger.warn("Relay token rejected for text-generation", {
         component: "server",
@@ -904,6 +1070,7 @@ io.on("connection", (socket) => {
       textGenInFlight = false;
       return;
     }
+    acceptFreshToken(relayToken);
 
     // Register this socket so /stream-callback can find it. With stream=true the
     // Lambda POSTs chunks back to this server's internal NLB URL, which it reads
@@ -981,7 +1148,7 @@ io.on("connection", (socket) => {
   });
 
   // ─── End‑audio event ─────────────────────────────────────────────────────
-  socket.on("end-audio", () => {
+  on("end-audio", () => {
     // ── AgentCore WebSocket path ──────────────────────────────────────────
     if (socket.agentWs && socket.agentWs.readyState === WebSocket.OPEN) {
       socket.agentWs.send(JSON.stringify({ type: "end_audio" }));
@@ -1016,7 +1183,9 @@ io.on("connection", (socket) => {
     return true;
   }
 
-  socket.on("voice-preview", (config = {}) => {
+  on("voice-preview", (rawConfig) => {
+    // Defaults do not apply to an explicit null, so normalise here.
+    const config = asPayload(rawConfig) || {};
     console.log("🎙️ Voice preview requested:", config.voice_id);
 
     // Replace any previous TTS process for this socket before checking limits
@@ -1110,34 +1279,36 @@ io.on("connection", (socket) => {
   });
 
   // Relay mic audio to the voice preview process
-  socket.on("voice-preview-audio", (msg) => {
+  on("voice-preview-audio", (rawMsg) => {
+    const msg = asPayload(rawMsg);
+    if (!msg) return;
     if (ttsProcess && ttsProcess.stdin.writable && ttsReady) {
       ttsProcess.stdin.write(JSON.stringify({ type: "audio", data: msg.data }) + "\n");
     }
   });
 
-  socket.on("voice-preview-start-audio", () => {
+  on("voice-preview-start-audio", () => {
     if (ttsProcess && ttsProcess.stdin.writable && ttsReady) {
       ttsProcess.stdin.write(JSON.stringify({ type: "start_audio" }) + "\n");
       console.log("🎬 Voice preview: start_audio");
     }
   });
 
-  socket.on("voice-preview-end-audio", () => {
+  on("voice-preview-end-audio", () => {
     if (ttsProcess && ttsProcess.stdin.writable && ttsReady) {
       ttsProcess.stdin.write(JSON.stringify({ type: "end_audio" }) + "\n");
       console.log("🛑 Voice preview: end_audio");
     }
   });
 
-  socket.on("stop-voice-preview", () => {
+  on("stop-voice-preview", () => {
     if (stopTtsProcess()) {
       console.log("🛑 Voice preview stopped by client");
     }
   });
 
   // ─── Optional Stop event ────────────────────────────────────────────────
-  socket.on("stop-nova-sonic", () => {
+  on("stop-nova-sonic", () => {
     console.log("🛑 Stop requested by client");
     // Abandon any start that is still connecting.
     voiceGeneration++;
@@ -1156,7 +1327,8 @@ io.on("connection", (socket) => {
   });
 
   // ─── Disconnect cleanup ──────────────────────────────────────────────────
-  socket.on("disconnect", () => {
+  // Registered without the credential gate: cleanup must run after expiry.
+  socket.on("disconnect", guardHandler("disconnect", socket, () => {
     console.log("🔌 CLIENT DISCONNECTED:", socket.id);
 
     // Clean up TTS preview process if present. Rate-limit history is keyed
@@ -1167,11 +1339,21 @@ io.on("connection", (socket) => {
     // that is still connecting so it doesn't open an orphaned session.
     voiceGeneration++;
     closeAgentWs();
-  });
+
+    // Local child process path: stop it too, so an expired or closed socket
+    // cannot leave a Bedrock stream running.
+    if (novaProcess) {
+      novaProcess.kill();
+      novaProcess = null;
+      novaReady = false;
+    }
+  }));
 });
 
 // ─── Start HTTP server on port 80 ─────────────────────────────────────────
 const PORT = process.env.PORT || 80;
+// Preload Cognito's signing keys so the first handshake doesn't fetch them.
+hydrateVerifier();
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Socket server running on port ${PORT}`);
 });

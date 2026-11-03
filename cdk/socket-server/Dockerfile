@@ -24,8 +24,10 @@ COPY session-guard.js ./
 COPY stream-relay.js ./
 COPY voice-preview-limiter.js ./
 COPY relay-token.js ./
+COPY socket-auth-lifetime.js ./
 COPY patient-context.js ./
 COPY logger.js ./
+COPY event-guard.js ./
 
 ENV AWS_DEFAULT_REGION=us-east-1
 

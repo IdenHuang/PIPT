@@ -18,6 +18,7 @@ let sqlConnection = global.sqlConnection;
 
 const DEFAULT_DEBRIEF_PROMPT = fs.readFileSync(path.join(__dirname, "defaultDebriefPrompt.txt"), "utf8").trim();
 const { seedPrompt } = require("./seedPrompt.js");
+const { generateAccessCode } = require("./accessCode.js");
 const DEFAULT_PERSONA_PROMPT = fs.readFileSync(path.join(__dirname, "defaultPersonaPrompt.txt"), "utf8").trim();
 const DEFAULT_SYSTEM_PROMPT = fs.readFileSync(path.join(__dirname, "defaultSystemPrompt.txt"), "utf8").trim();
 
@@ -118,15 +119,6 @@ exports.handler = async (event, context) => {
     };
   }
   const authorizedScope = authzResult.scope;
-
-  function generateAccessCode() {
-    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let code = "";
-    for (let i = 0; i < 16; i++) {
-      code += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return code.match(/.{1,4}/g).join("-");
-  }
 
   try {
     switch (pathData) {
@@ -1336,7 +1328,7 @@ exports.handler = async (event, context) => {
             event.queryStringParameters.simulation_group_id;
 
           try {
-            const newAccessCode = generateAccessCode();
+            const newAccessCode = generateAccessCode(16);
 
             // Update the access code in the simulation_groups table
             await sqlConnection`
@@ -1802,7 +1794,7 @@ exports.handler = async (event, context) => {
             }
 
             const userId = userResult[0].user_id;
-            const accessCode = generateAccessCode();
+            const accessCode = generateAccessCode(16);
 
             // Insert new simulation group
             const newGroup = await sqlConnection`

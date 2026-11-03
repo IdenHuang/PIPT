@@ -1,0 +1,217 @@
+"use strict";
+
+/**
+ * Bounds a Socket.IO connection to the lifetime of the credential it was
+ * opened with.
+ *
+ * The handshake verifies a Cognito ID token once. Without this, the socket
+ * (and any voice session on it) would keep working after that token expired,
+ * after a global sign-out, or after a password reset. The connection is now
+ * valid only until the newest verified token's `exp` plus a short grace
+ * period. The client extends it by sending a fresh token on the "reauth"
+ * event before then; otherwise the server disconnects it.
+ */
+
+// Covers clock skew and a reauth that is still in flight when exp passes.
+const DEFAULT_GRACE_MS = 30 * 1000;
+// setTimeout overflows above 2^31-1 ms (~24.8 days); re-arm in chunks.
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * Epoch milliseconds at which a verified token lapses, or 0 if it has no
+ * numeric `exp` (treated as already expired).
+ * @param {object} decoded - verified JWT payload
+ * @returns {number}
+ */
+function tokenExpiryMs(decoded) {
+  return decoded && typeof decoded.exp === "number" && Number.isFinite(decoded.exp)
+    ? decoded.exp * 1000
+    : 0;
+}
+
+class SocketAuthLifetime {
+  /**
+   * @param {object} options
+   * @param {number} options.expiresAtMs - exp of the handshake token, epoch ms
+   * @param {() => void} options.onExpire - called once when the lifetime ends
+   * @param {number} [options.graceMs]
+   * @param {() => number} [options.now]
+   * @param {typeof setTimeout} [options.setTimer]
+   * @param {typeof clearTimeout} [options.clearTimer]
+   */
+  constructor({
+    expiresAtMs,
+    onExpire,
+    graceMs = DEFAULT_GRACE_MS,
+    now = Date.now,
+    setTimer = setTimeout,
+    clearTimer = clearTimeout,
+  }) {
+    this._expiresAt = Number.isFinite(expiresAtMs) ? expiresAtMs : 0;
+    this._onExpire = onExpire;
+    this._graceMs = graceMs;
+    this._now = now;
+    this._setTimer = setTimer;
+    this._clearTimer = clearTimer;
+    this._timer = null;
+    this._stopped = false;
+    this._schedule();
+  }
+
+  /** Epoch ms of the newest verified token's exp. */
+  get expiresAt() {
+    return this._expiresAt;
+  }
+
+  /** Milliseconds until the client's credential expires (may be negative). */
+  expiresInMs() {
+    return this._expiresAt - this._now();
+  }
+
+  /** True once exp plus the grace period has passed. */
+  isExpired() {
+    return this._stopped || this._now() >= this._expiresAt + this._graceMs;
+  }
+
+  /**
+   * Extend the lifetime to a newer verified token's exp. An older exp never
+   * shortens it. Has no effect after the lifetime ended.
+   * @param {number} expiresAtMs
+   * @returns {boolean} whether the lifetime is still active
+   */
+  renew(expiresAtMs) {
+    if (this.isExpired()) return false;
+    if (Number.isFinite(expiresAtMs) && expiresAtMs > this._expiresAt) {
+      this._expiresAt = expiresAtMs;
+      this._schedule();
+    }
+    return true;
+  }
+
+  /** Cancel the timer (on disconnect). onExpire will not be called. */
+  stop() {
+    this._stopped = true;
+    this._clearTimer(this._timer);
+    this._timer = null;
+  }
+
+  _schedule() {
+    this._clearTimer(this._timer);
+    this._timer = null;
+    if (this._stopped) return;
+    const delay = Math.max(0, this._expiresAt + this._graceMs - this._now());
+    this._timer = this._setTimer(() => {
+      this._timer = null;
+      if (this._stopped) return;
+      if (this._now() >= this._expiresAt + this._graceMs) {
+        this._stopped = true;
+        this._onExpire();
+      } else {
+        this._schedule();
+      }
+    }, Math.min(delay, MAX_TIMER_MS));
+    if (this._timer && typeof this._timer.unref === "function") this._timer.unref();
+  }
+}
+
+/**
+ * Classify a resolveRelayToken result for the failure cap.
+ * @param {{ ok: boolean, transient?: boolean }} result
+ * @returns {"ok" | "rejected" | "transient"}
+ */
+function tokenOutcome(result) {
+  if (result && result.ok) return "ok";
+  return result && result.transient ? "transient" : "rejected";
+}
+
+/**
+ * Per-socket cap on clearly rejected client tokens, shared by every event that
+ * verifies one (reauth, text-generation, start-nova-sonic; finding
+ * f-5dab915a). After maxFailures clear rejections in a row, those events are
+ * refused without verification for lockoutMs. Transient failures (signing key
+ * unavailable) don't count: the token was never judged. A legitimate client
+ * never sends a token that verifies as bad, so it is never locked out.
+ */
+class TokenFailureCap {
+  constructor({ maxFailures = 3, lockoutMs = 5 * 60 * 1000, now = Date.now } = {}) {
+    this._maxFailures = maxFailures;
+    this._lockoutMs = lockoutMs;
+    this._now = now;
+    this._failures = 0;
+    this._lockedUntil = 0;
+  }
+
+  isLocked() {
+    return this._now() < this._lockedUntil;
+  }
+
+  /** @param {"ok" | "rejected" | "transient"} outcome */
+  record(outcome) {
+    if (outcome === "ok") {
+      this._failures = 0;
+    } else if (outcome === "rejected") {
+      this._failures += 1;
+      if (this._failures >= this._maxFailures) {
+        this._failures = 0;
+        this._lockedUntil = this._now() + this._lockoutMs;
+      }
+    }
+  }
+}
+
+/**
+ * Bounds the work one socket can cause through "reauth" (finding f-ac8c49e2).
+ * Refusals are cheap and never disconnect: the socket still ends on its normal
+ * expiry schedule, so a legitimate client (which renews about hourly and
+ * retries every 30s) sees no change.
+ *
+ * - one attempt in flight at a time
+ * - at least minIntervalMs between attempts
+ * - refused while the shared TokenFailureCap is locked
+ */
+class ReauthGate {
+  constructor({
+    minIntervalMs = 5 * 1000,
+    maxFailures = 3,
+    lockoutMs = 5 * 60 * 1000,
+    now = Date.now,
+    failureCap = new TokenFailureCap({ maxFailures, lockoutMs, now }),
+  } = {}) {
+    this._minIntervalMs = minIntervalMs;
+    this._now = now;
+    this._failureCap = failureCap;
+    this._inFlight = false;
+    this._lastStart = -Infinity;
+  }
+
+  /**
+   * @returns {{ allowed: true } | { allowed: false, reason: "in_flight" | "locked" | "too_soon" }}
+   */
+  tryBegin() {
+    const now = this._now();
+    if (this._inFlight) return { allowed: false, reason: "in_flight" };
+    if (this._failureCap.isLocked()) return { allowed: false, reason: "locked" };
+    if (now - this._lastStart < this._minIntervalMs) return { allowed: false, reason: "too_soon" };
+    this._inFlight = true;
+    this._lastStart = now;
+    return { allowed: true };
+  }
+
+  /**
+   * Record the outcome of an attempt that tryBegin allowed.
+   * @param {"ok" | "rejected" | "transient"} outcome
+   */
+  finish(outcome) {
+    this._inFlight = false;
+    this._failureCap.record(outcome);
+  }
+}
+
+module.exports = {
+  SocketAuthLifetime,
+  ReauthGate,
+  TokenFailureCap,
+  tokenOutcome,
+  tokenExpiryMs,
+  DEFAULT_GRACE_MS,
+};

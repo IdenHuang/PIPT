@@ -137,6 +137,12 @@ async function createAppUsers(
   await adminClient.query("BEGIN");
   try {
     await adminClient.query(sql);
+    // Fail the deploy (and roll back, before any secret is rotated) if the
+    // audit trail is still editable by the roles it audits.
+    const { rows: auditRows } = await adminClient.query(
+      appendOnlyViolationsSql(["tablecreator", "readwrite", TC_NAME, RW_NAME]),
+    );
+    assertAppendOnlyTables(auditRows);
     await adminClient.query("COMMIT");
   } catch (e) {
     await adminClient.query("ROLLBACK");
@@ -287,7 +293,8 @@ const READWRITE_TABLE_PRIVILEGES = Object.freeze({
 /**
  * What used to be "GRANT ... ON ALL TABLES / ALL SEQUENCES IN SCHEMA public",
  * limited to objects the admin owns:
- *   tablecreator: SELECT, INSERT, UPDATE, DELETE on every admin-owned table
+ *   tablecreator: SELECT, INSERT, UPDATE, DELETE on every admin-owned table,
+ *     except APPEND_ONLY_TABLES (role_audit_log), which get SELECT, INSERT only
  *   readwrite, tablecreator: USAGE on every admin-owned sequence
  *
  * The ALL TABLES form fails outright ("permission denied for table ...") as
@@ -310,6 +317,12 @@ function adminOwnedGrantsSql() {
       LOOP
         IF r.relkind = 'S' THEN
           EXECUTE format('GRANT USAGE ON SEQUENCE public.%I TO readwrite, tablecreator', r.relname);
+        ELSIF r.relname = ANY (ARRAY[${appendOnlyTablesSqlArray()}]) THEN
+          -- Append-only audit tables: app_tc (adminFunction, bootstrapAdmin)
+          -- writes the rows it audits, so it must not be able to rewrite or
+          -- erase them. REVOKE first: earlier deploys granted full DML.
+          EXECUTE format('REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public.%I FROM tablecreator', r.relname);
+          EXECUTE format('GRANT SELECT, INSERT ON TABLE public.%I TO tablecreator', r.relname);
         ELSE
           EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO tablecreator', r.relname);
         END IF;
@@ -320,6 +333,54 @@ function adminOwnedGrantsSql() {
 
 const PRIVILEGE_LIST_RE = /^(SELECT|INSERT|UPDATE|DELETE)(, (SELECT|INSERT|UPDATE|DELETE))*$/;
 const TABLE_NAME_RE = /^[a-z_][a-z0-9_]*$/;
+
+/**
+ * Audit tables the app roles may only read and append to. role_audit_log is
+ * written by adminFunction / bootstrapAdmin as app_tc, the same credential
+ * whose role changes it records, so app_tc must not be able to UPDATE, DELETE
+ * or TRUNCATE it.
+ */
+const APPEND_ONLY_TABLES = ["role_audit_log"];
+
+function appendOnlyTablesSqlArray() {
+  for (const tbl of APPEND_ONLY_TABLES) {
+    if (!TABLE_NAME_RE.test(tbl)) throw new Error(`Invalid append-only table name: ${tbl}`);
+  }
+  return APPEND_ONLY_TABLES.map((tbl) => `'${tbl}'`).join(", ");
+}
+
+/**
+ * Rows (role, tbl, priv) where an app role can still modify an append-only
+ * table. has_table_privilege includes inherited grants, so checking app_tc
+ * also catches anything granted to tablecreator.
+ */
+function appendOnlyViolationsSql(roles) {
+  for (const role of roles) {
+    if (!TABLE_NAME_RE.test(role)) throw new Error(`Invalid role name: ${role}`);
+  }
+  const roleValues = roles.map((r) => `('${r}')`).join(", ");
+  return `
+    SELECT r.role, t.tbl, p.priv
+    FROM (VALUES ${roleValues}) AS r(role)
+    CROSS JOIN unnest(ARRAY[${appendOnlyTablesSqlArray()}]) AS t(tbl)
+    CROSS JOIN (VALUES ('UPDATE'), ('DELETE'), ('TRUNCATE')) AS p(priv)
+    WHERE to_regclass('public.' || t.tbl) IS NOT NULL
+      AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r.role)
+      AND has_table_privilege(r.role, to_regclass('public.' || t.tbl), p.priv);
+  `;
+}
+
+/** Throw if appendOnlyViolationsSql returned any rows. */
+function assertAppendOnlyTables(rows) {
+  if (!rows || rows.length === 0) return;
+  const triples = rows.map((r) => `${r.role}:${r.tbl}:${r.priv}`).join(", ");
+  console.error(JSON.stringify({
+    level: "ERROR",
+    message: "app roles can still modify append-only audit tables",
+    privileges: rows,
+  }));
+  throw new Error(`app roles can still modify append-only audit tables: ${triples}`);
+}
 
 /**
  * Reset readwrite's privileges on every public table owned by the current
@@ -427,6 +488,10 @@ exports.handler = async function (event, context) {
 // Exported for unit tests.
 exports.assertNoForbiddenPrivileges = assertNoForbiddenPrivileges;
 exports.readwriteNarrowingSql = readwriteNarrowingSql;
+exports.adminOwnedGrantsSql = adminOwnedGrantsSql;
+exports.appendOnlyViolationsSql = appendOnlyViolationsSql;
+exports.assertAppendOnlyTables = assertAppendOnlyTables;
+exports.APPEND_ONLY_TABLES = APPEND_ONLY_TABLES;
 exports.APPLICATION_TABLE_PRIVILEGES = APPLICATION_TABLE_PRIVILEGES;
 exports.VECTORSTORE_TABLE_PRIVILEGES = VECTORSTORE_TABLE_PRIVILEGES;
 exports.READWRITE_TABLE_PRIVILEGES = READWRITE_TABLE_PRIVILEGES;
