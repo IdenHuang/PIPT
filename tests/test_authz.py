@@ -96,7 +96,7 @@ def decide(mode="chat", email=STUDENT, session=CHAT, persona=PERSONA, group=GROU
 
 # ── Student-owned modes ─────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("mode", ["chat", "match", "debrief", "unknown_mode"])
+@pytest.mark.parametrize("mode", ["chat", "match", "unknown_mode"])
 def test_owner_is_allowed(mode):
     assert decide(mode=mode).allowed
 
@@ -148,6 +148,20 @@ def test_chat_on_concluded_session_is_409(mode, email):
 @pytest.mark.parametrize("mode", ["match", "debrief"])
 def test_post_conclude_modes_still_allowed(mode):
     assert decide(mode=mode, cur=concluded_cursor()).allowed
+
+
+@pytest.mark.parametrize("email", [STUDENT, ADMIN])
+def test_debrief_on_active_session_is_409(email):
+    """The grader must not run mid-encounter: it would leak the answer key
+    and the unasked key questions (security finding f-f614db93)."""
+    d = decide(mode="debrief", email=email)
+    assert not d.allowed and d.status_code == 409
+
+
+def test_debrief_on_other_users_active_session_is_403():
+    """Ownership is checked before the concluded state, so no status leak."""
+    d = decide(mode="debrief", session=OTHER_CHAT)
+    assert not d.allowed and d.status_code == 403
 
 
 def test_concluded_check_does_not_bypass_ownership():

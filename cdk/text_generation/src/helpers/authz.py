@@ -160,6 +160,12 @@ def session_is_concluded(cur, session_id: str) -> bool:
 # chat and appends a turn, so it is refused on a concluded chat.
 POST_CONCLUDE_MODES = {"debrief", "match"}
 
+# Modes that may ONLY run once a chat is concluded. The debrief reads the
+# instructor answer key and the verbatim key questions, so running it on an
+# active chat would hand the student the answers mid-encounter
+# (security finding f-f614db93).
+CONCLUDED_ONLY_MODES = {"debrief"}
+
 
 def persona_in_group(cur, persona_id: str, simulation_group_id: str) -> bool:
     cur.execute(
@@ -182,7 +188,8 @@ def authorize_request(cur, *, mode: str, email: str, session_id: str,
         as chat), match, debrief: the caller must own the session, or be an
         admin. The session must belong to the persona and group either way.
         Chat (and unrecognised modes) are refused with 409 once the chat is
-        concluded; match and debrief still run.
+        concluded; match still runs. Debrief is refused with 409 until the
+        chat is concluded.
       - test_debrief: caller must instruct the group (or be admin); the
         session must belong to the persona and group.
       - test_system_prompt: caller must instruct the group (or be admin);
@@ -219,7 +226,11 @@ def authorize_request(cur, *, mode: str, email: str, session_id: str,
     owner_email = None if is_admin(cur, email) else email
     if not session_matches(cur, session_id, persona_id, simulation_group_id, owner_email):
         return _deny(403, "Access denied")
+    concluded = session_is_concluded(cur, session_id)
+    # The grader only runs on a finished encounter (security finding f-f614db93).
+    if mode in CONCLUDED_ONLY_MODES and not concluded:
+        return _deny(409, "Session not concluded")
     # A concluded chat is read-only for chat turns (security finding f-7d966e0e).
-    if mode not in POST_CONCLUDE_MODES and session_is_concluded(cur, session_id):
+    if mode not in POST_CONCLUDE_MODES and concluded:
         return _deny(409, "Session already concluded")
     return ALLOW

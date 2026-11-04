@@ -3919,6 +3919,33 @@ def fetch_debrief_prompt(simulation_group_id: str) -> str:
         )
 
 
+def debrief_exists(session_id: str) -> bool:
+    """True if a debrief row is already stored for this chat.
+
+    Fails closed: a DB error is treated as "exists" so the grader never runs
+    again on a chat whose debrief state is unknown (security finding f-f614db93).
+    """
+    try:
+        conn = _get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT 1 FROM "debriefs" WHERE chat_id = %s LIMIT 1',
+                (session_id,),
+            )
+            exists = cursor.fetchone() is not None
+            cursor.close()
+            return exists
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error checking for existing debrief: {type(e).__name__}")
+        return True
+
+
+DEBRIEF_ALREADY_GENERATED = {"status": "already_generated"}
+
+
 def generate_debrief(
     session_id: str,
     simulation_group_id: str,
@@ -3949,6 +3976,14 @@ def generate_debrief(
         items. The debrief includes matched/missed/additional categorization.
     """
     logger.info(f"📋 DEBRIEF GENERATION STARTED for session={session_id}")
+
+    # One debrief per chat. A repeat call must not re-run the grader: it would
+    # re-read the answer key, re-publish the stream frames and duplicate the
+    # question_interactions rows (security finding f-f614db93). This check runs
+    # before any S3, LLM or stream work.
+    if debrief_exists(session_id):
+        logger.info(f"📋 Debrief already exists for session={session_id} — skipping generation")
+        return dict(DEBRIEF_ALREADY_GENERATED)
 
     # Initialize degradation tracker — accumulates any errors that may affect score accuracy
     tracker = DegradedTracker()
