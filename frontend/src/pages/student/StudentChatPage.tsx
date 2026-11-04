@@ -160,6 +160,8 @@ function StudentChatPage() {
     setIsVoiceModeActive(true);
     setVoiceError(null);
     setVoiceSessionState('connecting');
+    // Every new audio client starts with the mic live; match the UI to it.
+    setIsMuted(false);
 
     // Reuse the existing Socket.IO connection (created on mount)
     if (!socketRef.current || !socketRef.current.connected) {
@@ -214,6 +216,8 @@ function StudentChatPage() {
         setVoiceSessionState(state);
         if (state === 'disconnected' || state === 'error') {
           setIsVoiceModeActive(false);
+          // The client clears its mute flag on teardown; keep the icon in sync.
+          setIsMuted(false);
         }
       },
       onError: (error) => {
@@ -229,6 +233,7 @@ function StudentChatPage() {
         // Server closed the voice session (e.g. Bedrock 60s timeout)
         setIsVoiceModeActive(false);
         setVoiceSessionState('idle');
+        setIsMuted(false);
         setVoiceError(message || 'Voice had an issue. Please reconnect to continue where you left off.');
         if (audioClientRef.current === client) audioClientRef.current = null;
         // Reset voice bubble tracking so next session starts fresh
@@ -1500,8 +1505,7 @@ function StudentChatPage() {
                     <button
                       onClick={() => {
                         if (!audioClientRef.current) return;
-                        audioClientRef.current.toggleMute();
-                        setIsMuted(!isMuted);
+                        setIsMuted(audioClientRef.current.toggleMute());
                       }}
                       className="p-3 rounded-full transition-colors"
                       style={{ backgroundColor: isMuted ? '#ef4444' : UI_COLORS.button.secondary, color: isMuted ? '#ffffff' : UI_COLORS.button.text }}
