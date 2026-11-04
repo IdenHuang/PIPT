@@ -13,7 +13,7 @@ from helpers.cohere_embeddings import CohereBedrockEmbeddings
 
 from helpers.chat import get_bedrock_llm, get_initial_student_query, get_student_query, set_stream_callback_url, get_default_system_prompt
 from helpers.seed_prompt import seed_prompt
-from helpers.authz import AuthzDecision, authorize_request, playground_history_key
+from helpers.authz import AuthzDecision, authorize_request, is_valid_uuid, playground_history_key
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO)
@@ -440,6 +440,27 @@ def _chat_has_ai_turn(session_id):
         return False
 
 
+def _stored_student_message(message_id, session_id):
+    """Return the stored text of a student message in this chat, or None.
+
+    mode=match grades whatever text it is given, so it must use the persisted
+    content, never the request body (security finding f-67d50d61). Scoping to
+    sender_type='student' matches fetch_tagged_messages, which only scores
+    student rows. DB errors propagate so the caller returns 500.
+    """
+    cur = connect_to_db().cursor()
+    try:
+        cur.execute(
+            """SELECT message_content FROM "messages"
+               WHERE message_id = %s AND chat_id = %s AND sender_type = 'student'""",
+            (message_id, session_id),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+    return row[0] if row else None
+
+
 def get_system_prompt(simulation_group_id):
     connection = connect_to_db()
     if connection is None:
@@ -647,9 +668,11 @@ def handler(event, context):
         try:
             body = {} if event.get("body") is None else json.loads(event.get("body"))
             message_id = body.get("message_id", "")
-            message_content = body.get("message_content", "")
+            # Any message_content in the body is ignored: matching runs on the
+            # stored text so a caller can't tag a message with questions it
+            # never asked (security finding f-67d50d61).
 
-            if not message_id or not message_content:
+            if not is_valid_uuid(message_id):
                 return {
                     "statusCode": 400,
                     "headers": {
@@ -658,7 +681,20 @@ def handler(event, context):
                         "Access-Control-Allow-Origin": _get_cors_origin(event),
                         "Access-Control-Allow-Methods": "*",
                     },
-                    "body": json.dumps("Missing required fields: message_id, message_content"),
+                    "body": json.dumps("Missing or invalid field: message_id"),
+                }
+
+            message_content = _stored_student_message(message_id, session_id)
+            if not message_content or not message_content.strip():
+                return {
+                    "statusCode": 404,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Headers": "*",
+                        "Access-Control-Allow-Origin": _get_cors_origin(event),
+                        "Access-Control-Allow-Methods": "*",
+                    },
+                    "body": json.dumps({"error": "Message not found"}),
                 }
 
             from helpers.chat import match_message_to_questions, get_cached_key_questions, cache_key_questions, fetch_org_thresholds
