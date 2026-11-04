@@ -444,7 +444,7 @@ def _stored_student_message(message_id, session_id):
     """Return the stored text of a student message in this chat, or None.
 
     mode=match grades whatever text it is given, so it must use the persisted
-    content, never the request body (security finding f-67d50d61). Scoping to
+    content, never the request body. Scoping to
     sender_type='student' matches fetch_tagged_messages, which only scores
     student rows. DB errors propagate so the caller returns 500.
     """
