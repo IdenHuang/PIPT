@@ -3665,6 +3665,10 @@ def fetch_student_id_for_chat(session_id: str) -> str:
         return ""
 
 
+class DebriefAlreadySaved(Exception):
+    """The chat already has a stored debrief; this run's result is discarded."""
+
+
 def save_debrief_to_db(
     session_id: str,
     student_id: str,
@@ -3680,7 +3684,14 @@ def save_debrief_to_db(
     overall_score: float,
     tracker: DegradedTracker = None,
 ) -> str:
-    """Insert a row into the debriefs table and return the debrief_id."""
+    """Insert a row into the debriefs table and return the debrief_id.
+
+    Raises DebriefAlreadySaved when the chat already has a debrief
+    (UNIQUE (chat_id)), so the caller stops before writing analytics or
+    publishing (security finding f-197f7ee1). Any other DB error is recorded
+    on the tracker and returns "".
+    """
+    conn = None
     try:
         conn = _get_db_connection()
         cursor = conn.cursor()
@@ -3709,14 +3720,22 @@ def save_debrief_to_db(
         debrief_id = cursor.fetchone()[0]
         conn.commit()
         cursor.close()
-        conn.close()
         logger.info(f"💾 Debrief saved: debrief_id={debrief_id}")
         return str(debrief_id)
+    except psycopg.errors.UniqueViolation:
+        logger.info(f"Debrief already saved for session={session_id}")
+        raise DebriefAlreadySaved(session_id)
     except Exception as e:
         logger.error(f"Error saving debrief: {e}")
         if tracker:
             tracker.record("save_debrief_to_db", f"db_error: {type(e).__name__}", "persistence_failed")
         return ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def save_question_interactions(
@@ -3946,7 +3965,95 @@ def debrief_exists(session_id: str) -> bool:
 DEBRIEF_ALREADY_GENERATED = {"status": "already_generated"}
 
 
+def _acquire_debrief_lock(session_id: str):
+    """Take the per-chat debrief lock on a dedicated connection.
+
+    Returns the open connection that holds the lock, or None when another
+    debrief run for this chat already holds it. The lock is session-level, so
+    it is held without an open transaction and released when the connection
+    closes (including if the Lambda dies). RDS Proxy pins a session that calls
+    pg_try_advisory_lock, so the lock stays on one backend for its lifetime:
+    https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy-pinning.html
+    """
+    conn = _get_db_connection()
+    try:
+        conn.autocommit = True
+        cursor = conn.cursor()
+        # hashtextextended gives a 64-bit key, so two chats are very unlikely
+        # to share a lock.
+        cursor.execute(
+            "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
+            (f"debrief:{session_id}",),
+        )
+        acquired = bool(cursor.fetchone()[0])
+        cursor.close()
+    except Exception:
+        conn.close()
+        raise
+    if not acquired:
+        conn.close()
+        return None
+    return conn
+
+
+def _release_debrief_lock(conn) -> None:
+    """Close the lock connection, which releases the advisory lock."""
+    try:
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error releasing debrief lock: {type(e).__name__}")
+
+
 def generate_debrief(
+    session_id: str,
+    simulation_group_id: str,
+    persona_id: str,
+    llm: ChatBedrock,
+    embeddings_model=None,
+    ddb_table_name: str = None,
+    patient_mode: str = "interview_practice",
+) -> dict:
+    """Generate the chat's debrief at most once (see _run_debrief_grader).
+
+    One debrief per chat. A repeat or concurrent call must not re-run the
+    grader: it would re-read the answer key, re-publish the stream frames and
+    duplicate the question_interactions rows (security findings f-f614db93,
+    f-197f7ee1). A per-chat advisory lock serialises callers; the existence
+    check runs while holding it, and the winner's INSERT lands before the lock
+    is released, so later callers see the row. All of this happens before any
+    S3, LLM or stream work. Lock or DB errors fail closed.
+    """
+    try:
+        lock_conn = _acquire_debrief_lock(session_id)
+    except Exception as e:
+        logger.error(f"Error acquiring debrief lock: {type(e).__name__}")
+        return dict(DEBRIEF_ALREADY_GENERATED)
+    if lock_conn is None:
+        logger.info(f"📋 Debrief already in progress for session={session_id} — skipping generation")
+        return dict(DEBRIEF_ALREADY_GENERATED)
+
+    try:
+        if debrief_exists(session_id):
+            logger.info(f"📋 Debrief already exists for session={session_id} — skipping generation")
+            return dict(DEBRIEF_ALREADY_GENERATED)
+        return _run_debrief_grader(
+            session_id=session_id,
+            simulation_group_id=simulation_group_id,
+            persona_id=persona_id,
+            llm=llm,
+            embeddings_model=embeddings_model,
+            ddb_table_name=ddb_table_name,
+            patient_mode=patient_mode,
+        )
+    except DebriefAlreadySaved:
+        # Another run stored this chat's debrief first. Its result stands.
+        logger.info(f"📋 Debrief already saved for session={session_id} — discarding this run")
+        return dict(DEBRIEF_ALREADY_GENERATED)
+    finally:
+        _release_debrief_lock(lock_conn)
+
+
+def _run_debrief_grader(
     session_id: str,
     simulation_group_id: str,
     persona_id: str,
@@ -3976,14 +4083,6 @@ def generate_debrief(
         items. The debrief includes matched/missed/additional categorization.
     """
     logger.info(f"📋 DEBRIEF GENERATION STARTED for session={session_id}")
-
-    # One debrief per chat. A repeat call must not re-run the grader: it would
-    # re-read the answer key, re-publish the stream frames and duplicate the
-    # question_interactions rows (security finding f-f614db93). This check runs
-    # before any S3, LLM or stream work.
-    if debrief_exists(session_id):
-        logger.info(f"📋 Debrief already exists for session={session_id} — skipping generation")
-        return dict(DEBRIEF_ALREADY_GENERATED)
 
     # Initialize degradation tracker — accumulates any errors that may affect score accuracy
     tracker = DegradedTracker()
@@ -4682,8 +4781,12 @@ The following is the instructor's answer key for this simulation case. Compare t
         tracker=tracker,
     )
 
-    # 6. Write per-question analytics
-    if key_questions and student_id:
+    # 6. Write per-question analytics, only against a stored debrief row. A
+    # duplicate save already raised DebriefAlreadySaved above; "" means the
+    # save failed (recorded on the tracker), so there is no row to attach to.
+    if not debrief_id:
+        logger.error(f"Debrief not saved for session={session_id}; skipping question_interactions")
+    elif key_questions and student_id:
         save_question_interactions(
             debrief_id=debrief_id,
             session_id=session_id,
