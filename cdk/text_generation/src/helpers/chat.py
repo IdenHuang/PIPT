@@ -3970,16 +3970,41 @@ DEBRIEF_ALREADY_GENERATED = {"status": "already_generated"}
 DEBRIEF_IN_PROGRESS = {"status": "in_progress"}
 
 
-# How long a debrief claim blocks other runs for the same chat. Longer than the
-# text generation Lambda's 300s timeout (api-service-stack.ts), so a live run's
-# claim never lapses under it; a claim left by a run that died lapses after this.
-DEBRIEF_CLAIM_SECONDS = 330
+# Who asked for the debrief (the debrief_trigger query parameter set by
+# studentFunction.js). "conclude" is the async invoke from conclude_interaction:
+# Lambda retries it only when the invocation fails, so contention and errors
+# must raise. "recovery" is the async invoke from get_debrief for a concluded
+# chat that still has no debrief; it is rate limited and does not raise.
+DEBRIEF_TRIGGER_CONCLUDE = "conclude"
+DEBRIEF_TRIGGER_RECOVERY = "recovery"
+
+
+class DebriefClaimHeld(Exception):
+    """Another run holds this chat's debrief claim. Raised for the conclude
+    trigger so Lambda's async retry tries again after the claim frees up."""
+
+
+# How long a debrief claim blocks other runs for the same chat. The holder
+# renews it every DEBRIEF_CLAIM_RENEW_SECONDS while it grades, so a live run
+# keeps it however long grading takes. A run that dies (timeout, out of memory)
+# stops renewing, and its claim lapses within this many seconds. That is before
+# Lambda's first async retry, about a minute after the failure.
+# https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-error-handling.html
+DEBRIEF_CLAIM_SECONDS = 45
+DEBRIEF_CLAIM_RENEW_SECONDS = 15
 # TTL for the claim item itself (the table's TTL attribute is expireAt).
 DEBRIEF_CLAIM_TTL_SECONDS = 24 * 60 * 60
+# At most one recovery run per chat in this window, however often the
+# student's page polls get_debrief.
+DEBRIEF_RECOVERY_INTERVAL_SECONDS = 5 * 60
 
 
 def _debrief_claim_key(session_id: str) -> dict:
     return {"SessionId": f"DEBRIEF_CLAIM#{session_id}"}
+
+
+def _debrief_recovery_key(session_id: str) -> dict:
+    return {"SessionId": f"DEBRIEF_RECOVERY#{session_id}"}
 
 
 def _claim_debrief(session_id: str, table_name: str) -> str | None:
@@ -4016,7 +4041,8 @@ def _release_debrief_claim(session_id: str, table_name: str, token: str) -> None
 
     Sets claimed_until to 0 rather than deleting, so the Lambda needs no
     DeleteItem permission; TTL removes the item later. If the release fails,
-    the claim lapses on its own after DEBRIEF_CLAIM_SECONDS.
+    the claim lapses on its own within DEBRIEF_CLAIM_SECONDS, because the
+    heartbeat has already stopped renewing it.
     """
     try:
         table = boto3.resource("dynamodb").Table(table_name)
@@ -4030,6 +4056,103 @@ def _release_debrief_claim(session_id: str, table_name: str, token: str) -> None
         logger.error(f"Error releasing debrief claim: {type(e).__name__}")
 
 
+def _renew_debrief_claim(table, session_id: str, token: str) -> bool:
+    """Push this run's claim out another DEBRIEF_CLAIM_SECONDS.
+
+    Returns False when the claim is no longer this run's: another run took it
+    over, or it was already released (claimed_until = 0), which a renewal must
+    not undo. Raises on any other DynamoDB error.
+    """
+    now = int(time.time())
+    try:
+        table.update_item(
+            Key=_debrief_claim_key(session_id),
+            UpdateExpression="SET claimed_until = :until",
+            ConditionExpression="claim_token = :token AND claimed_until > :zero",
+            ExpressionAttributeValues={
+                ":until": now + DEBRIEF_CLAIM_SECONDS,
+                ":token": token,
+                ":zero": 0,
+            },
+        )
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+    return True
+
+
+class _DebriefClaimHeartbeat:
+    """Renews a debrief claim in a background thread while the grader runs.
+
+    The thread stops when the run ends normally (stop() in generate_debrief's
+    finally) or when the Lambda sandbox dies, so the claim tracks whether the
+    run is alive instead of a fixed wall-clock lease.
+    """
+
+    def __init__(self, session_id: str, table_name: str, token: str):
+        self._session_id = session_id
+        self._table_name = table_name
+        self._token = token
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="debrief-claim-heartbeat", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.ident is not None:  # start() ran
+            self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        # boto3 resources are not thread safe; this thread gets its own session.
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/guide/resources.html#multithreading-or-multiprocessing-with-resources
+        try:
+            table = boto3.session.Session().resource("dynamodb").Table(self._table_name)
+        except Exception as e:
+            logger.error(f"Debrief claim heartbeat could not start: {type(e).__name__}")
+            return
+        while not self._stop.wait(DEBRIEF_CLAIM_RENEW_SECONDS):
+            try:
+                if not _renew_debrief_claim(table, self._session_id, self._token):
+                    logger.warning(
+                        f"Debrief claim for session={self._session_id} is no longer held by this run"
+                    )
+                    return
+            except Exception as e:
+                # Keep trying: one failed renewal leaves 30s of lease. If they
+                # all fail, the claim lapses and another run may take over; the
+                # debriefs unique constraint (DebriefAlreadySaved) still keeps
+                # one row per chat.
+                logger.error(f"Error renewing debrief claim: {type(e).__name__}")
+
+
+def _take_debrief_recovery_slot(session_id: str, table_name: str) -> bool:
+    """Allow one recovery run per chat per DEBRIEF_RECOVERY_INTERVAL_SECONDS.
+
+    get_debrief asks for recovery on every poll of a concluded chat that has no
+    debrief, so without this a failing chat would re-run the grader (and pay
+    for Bedrock) on each poll. Returns False when a recovery ran recently.
+    Raises on any other DynamoDB error.
+    """
+    now = int(time.time())
+    table = boto3.resource("dynamodb").Table(table_name)
+    try:
+        table.put_item(
+            Item={
+                **_debrief_recovery_key(session_id),
+                "next_allowed_at": now + DEBRIEF_RECOVERY_INTERVAL_SECONDS,
+                "expireAt": now + DEBRIEF_CLAIM_TTL_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(SessionId) OR next_allowed_at <= :now",
+            ExpressionAttributeValues={":now": now},
+        )
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+    return True
+
+
 def generate_debrief(
     session_id: str,
     simulation_group_id: str,
@@ -4038,6 +4161,7 @@ def generate_debrief(
     embeddings_model=None,
     ddb_table_name: str = None,
     patient_mode: str = "interview_practice",
+    trigger: str | None = None,
 ) -> dict:
     """Generate the chat's debrief at most once (see _run_debrief_grader).
 
@@ -4052,10 +4176,23 @@ def generate_debrief(
     the grader does not run and the error propagates, so main.py returns 500
     instead of a success-shaped "already_generated" (f-f412e8bc). Contention
     returns "in_progress"; "already_generated" means a stored row was confirmed.
+
+    The claim is renewed by a heartbeat while grading, so a run that dies frees
+    it within DEBRIEF_CLAIM_SECONDS (f-9a43bb3a). With trigger="conclude",
+    contention raises DebriefClaimHeld so Lambda's async retry tries again.
+    With trigger="recovery", the call is rate limited per chat.
     """
     if not ddb_table_name:
         logger.error("No DynamoDB table for the debrief claim — skipping generation")
         raise RuntimeError("No DynamoDB table configured for the debrief claim")
+    if trigger == DEBRIEF_TRIGGER_RECOVERY:
+        try:
+            if not _take_debrief_recovery_slot(session_id, ddb_table_name):
+                logger.info(f"📋 Debrief recovery ran recently for session={session_id} — skipping")
+                return dict(DEBRIEF_IN_PROGRESS)
+        except Exception as e:
+            logger.error(f"Error taking debrief recovery slot: {type(e).__name__}")
+            raise
     try:
         claim_token = _claim_debrief(session_id, ddb_table_name)
     except Exception as e:
@@ -4063,9 +4200,13 @@ def generate_debrief(
         raise
     if claim_token is None:
         logger.info(f"📋 Debrief in progress for session={session_id} — skipping generation")
+        if trigger == DEBRIEF_TRIGGER_CONCLUDE:
+            raise DebriefClaimHeld(session_id)
         return dict(DEBRIEF_IN_PROGRESS)
 
+    heartbeat = _DebriefClaimHeartbeat(session_id, ddb_table_name, claim_token)
     try:
+        heartbeat.start()
         if debrief_exists(session_id):
             logger.info(f"📋 Debrief already exists for session={session_id} — skipping generation")
             return dict(DEBRIEF_ALREADY_GENERATED)
@@ -4083,6 +4224,9 @@ def generate_debrief(
         logger.info(f"📋 Debrief already saved for session={session_id} — discarding this run")
         return dict(DEBRIEF_ALREADY_GENERATED)
     finally:
+        # Stop renewing before releasing, so a late renewal cannot re-hold
+        # a claim this run has just released.
+        heartbeat.stop()
         _release_debrief_claim(session_id, ddb_table_name, claim_token)
 
 

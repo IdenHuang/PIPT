@@ -57,6 +57,18 @@ def is_valid_uuid(value) -> bool:
         return False
 
 
+def canonical_uuid(value: str) -> str:
+    """Lowercase form of a UUID that passed is_valid_uuid.
+
+    is_valid_uuid accepts any letter case, and Postgres compares UUIDs
+    case-insensitively, so case variants pass authorization. DynamoDB keys,
+    the pgvector collection name and its source filter are case-sensitive,
+    so the handler uses this form for them (security findings f-5e543e74,
+    f-c7f52a9a).
+    """
+    return str(uuid.UUID(value))
+
+
 def is_valid_playground_session_id(value) -> bool:
     """True if value looks like a client-generated playground scratch ID."""
     return isinstance(value, str) and _PLAYGROUND_SESSION_RE.fullmatch(value) is not None

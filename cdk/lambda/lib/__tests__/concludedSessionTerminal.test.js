@@ -31,7 +31,8 @@ describe("POST /student/conclude_interaction is one-way", () => {
     const update = block.indexOf("AND status IS DISTINCT FROM 'concluded'");
     const conflict = block.indexOf("response.statusCode = 409;", update);
     const interactionWrite = block.indexOf('UPDATE "student_interactions"');
-    const debriefInvoke = block.indexOf('mode: "debrief"');
+    const debriefInvoke = block.indexOf("invokeDebriefGeneration(");
+    expect(debriefInvoke).toBeGreaterThan(-1);
     expect(conflict).toBeGreaterThan(update);
     expect(conflict).toBeLessThan(interactionWrite);
     expect(conflict).toBeLessThan(debriefInvoke);

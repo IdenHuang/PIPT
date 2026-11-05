@@ -20,6 +20,7 @@ from authz import (  # noqa: E402
     is_valid_uuid,
     playground_history_key,
 )
+from authz import canonical_uuid  # noqa: E402
 
 GROUP = "11111111-1111-4111-8111-111111111111"
 OTHER_GROUP = "22222222-2222-4222-8222-222222222222"
@@ -315,3 +316,27 @@ def test_is_valid_playground_session_id(value, expected):
 )
 def test_is_valid_uuid(value, expected):
     assert is_valid_uuid(value) is expected
+
+
+@pytest.mark.parametrize("value", [CHAT, CHAT.upper(), CHAT[:8].upper() + CHAT[8:]])
+def test_canonical_uuid_lowercases_case_variants(value):
+    """Case variants pass is_valid_uuid but must reach case-sensitive keys
+    (DynamoDB caches, pgvector collection) as one value (f-c7f52a9a)."""
+    assert is_valid_uuid(value)
+    assert canonical_uuid(value) == CHAT.lower()
+
+
+def test_handler_canonicalizes_every_uuid_param_after_authz():
+    """Source-level: main.handler lowercases all three IDs after authorization
+    and before any mode uses them (f-5e543e74, f-c7f52a9a)."""
+    import pathlib
+    import re
+
+    src = (pathlib.Path(__file__).parents[1] / "cdk/text_generation/src/main.py").read_text(encoding="utf-8")
+    body = src[src.index("def handler("):]
+    authz = body.index("decision = _authorize(")
+    first_mode = body.index('if mode == "debrief":')
+    for name in ("simulation_group_id", "persona_id", "session_id"):
+        m = re.search(rf"{name} = canonical_uuid\({name}\)", body)
+        assert m, f"{name} is not canonicalized"
+        assert authz < m.start() < first_mode

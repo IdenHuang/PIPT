@@ -88,14 +88,40 @@ def _forbid_grader(monkeypatch):
 TABLE = "conversation-table"
 TOKEN = "claim-token"
 
+_RealHeartbeat = chat._DebriefClaimHeartbeat
 
-def _run(ddb_table_name=TABLE):
+
+class _FakeHeartbeat:
+    """Stands in for the renewal thread in generate_debrief tests."""
+
+    instances: list = []
+
+    def __init__(self, session_id, table_name, token):
+        self.args = (session_id, table_name, token)
+        self.events = []
+        _FakeHeartbeat.instances.append(self)
+
+    def start(self):
+        self.events.append("start")
+
+    def stop(self):
+        self.events.append("stop")
+
+
+@pytest.fixture(autouse=True)
+def _no_heartbeat_thread(monkeypatch):
+    _FakeHeartbeat.instances = []
+    monkeypatch.setattr(chat, "_DebriefClaimHeartbeat", _FakeHeartbeat)
+
+
+def _run(ddb_table_name=TABLE, trigger=None):
     return chat.generate_debrief(
         session_id=SESSION,
         simulation_group_id="group",
         persona_id="persona",
         llm=None,
         ddb_table_name=ddb_table_name,
+        trigger=trigger,
     )
 
 
@@ -306,9 +332,178 @@ def test_claim_debrief_raises_on_other_errors(monkeypatch):
         chat._claim_debrief(SESSION, TABLE)
 
 
-def test_claim_outlives_the_lambda_timeout():
-    # text generation Lambda timeout is 300s (cdk/lib/api-service-stack.ts).
-    assert chat.DEBRIEF_CLAIM_SECONDS > 300
+def test_dead_runs_claim_lapses_before_the_first_async_retry():
+    """A run that dies stops renewing; its claim must lapse before Lambda's
+    first async retry (about 60s after the failure), or the retry finds it
+    held and the debrief is lost (f-9a43bb3a)."""
+    assert chat.DEBRIEF_CLAIM_SECONDS < 60
+    # At least two renewals per lease, so one failed renewal does not drop it.
+    assert chat.DEBRIEF_CLAIM_RENEW_SECONDS * 2 < chat.DEBRIEF_CLAIM_SECONDS
+
+
+def test_contention_raises_for_the_conclude_trigger(monkeypatch):
+    """A returned "in_progress" would end Lambda's async retries; raising
+    makes Lambda retry after the other run's claim frees up (f-9a43bb3a)."""
+    monkeypatch.setattr(chat, "_claim_debrief", lambda session_id, table_name: None)
+    _forbid_release(monkeypatch)
+    _forbid_grader(monkeypatch)
+    with pytest.raises(chat.DebriefClaimHeld):
+        _run(trigger=chat.DEBRIEF_TRIGGER_CONCLUDE)
+
+
+def test_contention_returns_in_progress_for_the_recovery_trigger(monkeypatch):
+    monkeypatch.setattr(chat, "_take_debrief_recovery_slot", lambda session_id, table_name: True)
+    monkeypatch.setattr(chat, "_claim_debrief", lambda session_id, table_name: None)
+    _forbid_release(monkeypatch)
+    _forbid_grader(monkeypatch)
+    assert _run(trigger=chat.DEBRIEF_TRIGGER_RECOVERY) == {"status": "in_progress"}
+
+
+def test_recovery_is_rate_limited_before_claiming(monkeypatch):
+    monkeypatch.setattr(chat, "_take_debrief_recovery_slot", lambda session_id, table_name: False)
+
+    def must_not_claim(*args):
+        raise AssertionError("claimed during a rate-limited recovery")
+
+    monkeypatch.setattr(chat, "_claim_debrief", must_not_claim)
+    _forbid_grader(monkeypatch)
+    assert _run(trigger=chat.DEBRIEF_TRIGGER_RECOVERY) == {"status": "in_progress"}
+
+
+def test_conclude_trigger_skips_the_recovery_rate_limit(monkeypatch):
+    def must_not_rate_limit(*args):
+        raise AssertionError("conclude run was rate limited")
+
+    monkeypatch.setattr(chat, "_take_debrief_recovery_slot", must_not_rate_limit)
+    lock = _hold_lock(monkeypatch)
+    monkeypatch.setattr(chat, "debrief_exists", lambda session_id: True)
+    _forbid_grader(monkeypatch)
+    _assert_skipped(_run(trigger=chat.DEBRIEF_TRIGGER_CONCLUDE))
+    assert lock.closed
+
+
+def test_heartbeat_runs_for_the_claim_and_stops_before_release(monkeypatch):
+    order = []
+    monkeypatch.setattr(chat, "_claim_debrief", lambda session_id, table_name: TOKEN)
+    monkeypatch.setattr(
+        chat, "_release_debrief_claim", lambda *args: order.append("release")
+    )
+
+    def exists(session_id):
+        order.append("check")
+        return True
+
+    monkeypatch.setattr(chat, "debrief_exists", exists)
+    _run()
+    (hb,) = _FakeHeartbeat.instances
+    assert hb.args == (SESSION, TABLE, TOKEN)
+    assert hb.events == ["start", "stop"]
+    assert order == ["check", "release"]
+
+
+def test_heartbeat_stops_when_the_grader_raises(monkeypatch):
+    _hold_lock(monkeypatch)
+    monkeypatch.setattr(chat, "debrief_exists", lambda session_id: False)
+
+    def boom(**kwargs):
+        raise RuntimeError("bedrock down")
+
+    monkeypatch.setattr(chat, "_run_debrief_grader", boom)
+    with pytest.raises(RuntimeError):
+        _run()
+    (hb,) = _FakeHeartbeat.instances
+    assert hb.events == ["start", "stop"]
+
+
+def test_renew_extends_only_a_held_unreleased_claim(monkeypatch):
+    table = _FakeTable()
+    monkeypatch.setattr(chat.time, "time", lambda: 2_000)
+    assert chat._renew_debrief_claim(table, SESSION, TOKEN) is True
+    (update,) = table.updates
+    assert update["Key"] == {"SessionId": f"DEBRIEF_CLAIM#{SESSION}"}
+    assert update["UpdateExpression"] == "SET claimed_until = :until"
+    # Never re-hold a claim another run took over, or one already released.
+    assert update["ConditionExpression"] == "claim_token = :token AND claimed_until > :zero"
+    assert update["ExpressionAttributeValues"] == {
+        ":until": 2_000 + chat.DEBRIEF_CLAIM_SECONDS,
+        ":token": TOKEN,
+        ":zero": 0,
+    }
+
+
+def test_renew_returns_false_when_the_claim_is_gone():
+    table = _FakeTable(update_error=_ConditionalCheckFailed())
+    assert chat._renew_debrief_claim(table, SESSION, TOKEN) is False
+
+
+def test_renew_raises_on_other_errors():
+    table = _FakeTable(update_error=RuntimeError("throttled"))
+    with pytest.raises(RuntimeError):
+        chat._renew_debrief_claim(table, SESSION, TOKEN)
+
+
+def _fake_heartbeat_session(monkeypatch, table):
+    class _Session:
+        def resource(self, service):
+            assert service == "dynamodb"
+            return type("R", (), {"Table": lambda self, name: table})()
+
+    class _Boto3:
+        session = type("S", (), {"Session": _Session})
+
+    monkeypatch.setattr(chat, "boto3", _Boto3)
+
+
+def test_real_heartbeat_renews_until_stopped(monkeypatch):
+    table = _FakeTable()
+    _fake_heartbeat_session(monkeypatch, table)
+    monkeypatch.setattr(chat, "DEBRIEF_CLAIM_RENEW_SECONDS", 0.01)
+    hb = _RealHeartbeat(SESSION, TABLE, TOKEN)
+    hb.start()
+    deadline = chat.time.monotonic() + 2
+    while len(table.updates) < 2 and chat.time.monotonic() < deadline:
+        chat.time.sleep(0.01)
+    hb.stop()
+    assert len(table.updates) >= 2
+    assert not hb._thread.is_alive()
+    renewals = len(table.updates)
+    chat.time.sleep(0.05)
+    assert len(table.updates) == renewals  # no renewal after stop()
+
+
+def test_real_heartbeat_stops_once_the_claim_is_lost(monkeypatch):
+    table = _FakeTable(update_error=_ConditionalCheckFailed())
+    _fake_heartbeat_session(monkeypatch, table)
+    monkeypatch.setattr(chat, "DEBRIEF_CLAIM_RENEW_SECONDS", 0.01)
+    hb = _RealHeartbeat(SESSION, TABLE, TOKEN)
+    hb.start()
+    hb._thread.join(timeout=2)
+    assert not hb._thread.is_alive()
+    assert len(table.updates) == 1
+    hb.stop()
+
+
+def test_heartbeat_stop_without_start_is_safe():
+    _RealHeartbeat(SESSION, TABLE, TOKEN).stop()
+
+
+def test_recovery_slot_is_one_conditional_put(monkeypatch):
+    table = _FakeTable()
+    _fake_dynamodb(monkeypatch, table)
+    monkeypatch.setattr(chat.time, "time", lambda: 3_000)
+    assert chat._take_debrief_recovery_slot(SESSION, TABLE) is True
+    (put,) = table.puts
+    item = put["Item"]
+    assert item["SessionId"] == f"DEBRIEF_RECOVERY#{SESSION}"
+    assert item["next_allowed_at"] == 3_000 + chat.DEBRIEF_RECOVERY_INTERVAL_SECONDS
+    assert item["expireAt"] > item["next_allowed_at"]
+    assert put["ConditionExpression"] == "attribute_not_exists(SessionId) OR next_allowed_at <= :now"
+    assert put["ExpressionAttributeValues"] == {":now": 3_000}
+
+
+def test_recovery_slot_false_when_recently_taken(monkeypatch):
+    _fake_dynamodb(monkeypatch, _FakeTable(put_error=_ConditionalCheckFailed()))
+    assert chat._take_debrief_recovery_slot(SESSION, TABLE) is False
 
 
 def test_release_debrief_claim_only_releases_own_token(monkeypatch):

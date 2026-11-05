@@ -8,6 +8,11 @@ const {
   verifySessionScope,
   isAdmin,
 } = require("./authz.js");
+const {
+  DEBRIEF_TRIGGER,
+  getPatientMode,
+  invokeDebriefGeneration,
+} = require("./debriefGeneration.js");
 let { SM_DB_CREDENTIALS, RDS_PROXY_ENDPOINT } = process.env;
 
 // SQL conneciton from global variable at lib.js
@@ -1584,6 +1589,50 @@ exports.handler = async (event, context) => {
                 status: "complete",
               });
             } else {
+              // Recovery: a concluded chat with no debrief well after it ended
+              // means the conclude-time run was lost (the async retries failed
+              // or the grader saved nothing). Ask for a recovery run. The text
+              // generation Lambda takes the per-chat claim and allows one
+              // recovery per chat per 5 minutes, so repeated polls are cheap.
+              const textGenFunctionName = process.env.TEXT_GEN_FUNCTION_NAME;
+              if (textGenFunctionName) {
+                try {
+                  const stale = await sqlConnection`
+                    SELECT si.persona_id, e.simulation_group_id
+                    FROM "chats" c
+                    JOIN "student_interactions" si
+                      ON c.student_interaction_id = si.student_interaction_id
+                    JOIN "enrollments" e
+                      ON si.enrollment_id = e.enrollment_id
+                    WHERE c.chat_id = ${sessionId}
+                      AND c.status = 'concluded'
+                      AND c.ended_at < NOW() - INTERVAL '5 minutes'
+                    LIMIT 1;
+                  `;
+                  if (stale.length > 0) {
+                    const { persona_id: patientId, simulation_group_id: simulationGroupId } = stale[0];
+                    const patientMode = await getPatientMode(sqlConnection, simulationGroupId, patientId);
+                    await invokeDebriefGeneration(
+                      {
+                        sessionId,
+                        simulationGroupId,
+                        patientId,
+                        patientMode,
+                        trigger: DEBRIEF_TRIGGER.RECOVERY,
+                        authorizer: event.requestContext.authorizer,
+                      },
+                      { functionName: textGenFunctionName }
+                    );
+                    logger.warn("Debrief missing for concluded chat; recovery requested", { sessionId });
+                  }
+                } catch (recoveryErr) {
+                  // The student still gets "generating"; the next poll tries again.
+                  logger.error("Failed to request debrief recovery", {
+                    error: recoveryErr.message,
+                    sessionId,
+                  });
+                }
+              }
               // Not an error; it's still generating
               response.statusCode = 202;
               response.body = JSON.stringify({
@@ -1660,37 +1709,11 @@ exports.handler = async (event, context) => {
               break;
             }
 
-            // Step 0: Determine patient mode by checking DTP/Recommendation assignments.
-            //a person with zero DTPS, recommendations, and questions is treated as 
-            // "conversation_only" — the student only chats and gets key question feedback.
-            // A persona with zero DTPs AND zero recommendations assigned is treated as
-            // "interview_practice" — the student only chats and gets key question feedback.
-            // Any DTP or recommendation assignment makes it "full_assessment" — the student
-            // must submit structured DTPs + recommendations at conclude time, which get
-            // matched against the instructor's expected items during debrief generation.
-            const [dtpCount] = await sqlConnection`
-              SELECT COUNT(*)::int AS count FROM simulation_group_dtps
-              WHERE simulation_group_id = ${simulationGroupId}
-                AND (persona_id = ${patientId} OR persona_id IS NULL);
-            `;
-            const [recCount] = await sqlConnection`
-              SELECT COUNT(*)::int AS count FROM simulation_group_recommendations
-              WHERE simulation_group_id = ${simulationGroupId}
-                AND (persona_id = ${patientId} OR persona_id IS NULL);
-            `;
-            const [quesCount] = await sqlConnection`
-              SELECT COUNT(*)::int AS count FROM simulation_group_questions
-              WHERE simulation_group_id = ${simulationGroupId}
-                AND (persona_id = ${patientId} OR persona_id IS NULL);
-            `;
-            // Must match the mode computed by GET /student/simulation_group_page and
-            // GET /instructor/view_patients, or the UI and this check disagree on
-            // whether a recommendation is required.
-            const patientMode = (quesCount.count === 0 && dtpCount.count === 0 && recCount.count === 0)
-              ? 'conversation_only'
-              : (dtpCount.count === 0 && recCount.count === 0)
-                ? 'interview_practice'
-                : 'full_assessment';
+            // Step 0: Determine patient mode from the DTP / recommendation /
+            // question assignments (see getPatientMode in debriefGeneration.js).
+            // full_assessment requires a recommendation; the debrief matches the
+            // structured submissions against the instructor's expected items.
+            const patientMode = await getPatientMode(sqlConnection, simulationGroupId, patientId);
 
             // Validate: full_assessment patients require a recommendation
             if (patientMode === 'full_assessment' && (!recommendation || !recommendation.trim())) {
@@ -1779,33 +1802,21 @@ exports.handler = async (event, context) => {
 
             // Step 5: Invoke the text generation Lambda asynchronously for debrief generation
             // The text gen Lambda will read the chat messages + recommendation from the DB
-            const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
-            const lambdaClient = new LambdaClient();
-
             const textGenFunctionName = process.env.TEXT_GEN_FUNCTION_NAME;
 
             if (textGenFunctionName) {
-              const debriefPayload = {
-                queryStringParameters: {
-                  simulation_group_id: simulationGroupId,
-                  session_id: sessionId,
-                  patient_id: patientId,
-                  mode: "debrief",
-                  patient_mode: patientMode,
-                },
-                headers: event.headers,
-                requestContext: event.requestContext,
-                body: JSON.stringify({ recommendation }),
-              };
-
-              const invokeCommand = new InvokeCommand({
-                FunctionName: textGenFunctionName,
-                InvocationType: "Event", // Async invocation — fire and forget
-                Payload: JSON.stringify(debriefPayload),
-              });
-
               try {
-                await lambdaClient.send(invokeCommand);
+                await invokeDebriefGeneration(
+                  {
+                    sessionId,
+                    simulationGroupId,
+                    patientId,
+                    patientMode,
+                    trigger: DEBRIEF_TRIGGER.CONCLUDE,
+                    authorizer: event.requestContext.authorizer,
+                  },
+                  { functionName: textGenFunctionName }
+                );
                 logger.info("Debrief generation Lambda invoked asynchronously", {
                   sessionId,
                   textGenFunctionName,

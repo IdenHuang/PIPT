@@ -2,6 +2,8 @@ import * as cdk from "aws-cdk-lib";
 import * as apigateway from "aws-cdk-lib/aws-apigateway";
 import * as lambda from "aws-cdk-lib/aws-lambda";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
+import * as lambdaDestinations from "aws-cdk-lib/aws-lambda-destinations";
+import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import { Construct } from "constructs";
@@ -1979,6 +1981,38 @@ export class ApiServiceStack extends cdk.Stack {
       textGenLambdaDockerFunc.functionName
     );
     textGenLambdaDockerFunc.grantInvoke(lambdaStudentFunction);
+
+    // Debrief runs are async invokes (studentFunction.js, debriefGeneration.js).
+    // Lambda retries a failed one twice; an event that still fails is sent here
+    // instead of being dropped, so a lost debrief is visible and can be
+    // replayed. The payload holds chat/group/patient IDs and the caller's
+    // email, not the JWT. The unqualified invoke runs $LATEST, which is what
+    // configureAsyncInvoke configures.
+    // https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-retain-records.html
+    const debriefFailureQueue = new sqs.Queue(this, `${id}-DebriefFailureQueue`, {
+      queueName: `${id}-DebriefFailures`,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
+      retentionPeriod: Duration.days(14),
+    });
+    textGenLambdaDockerFunc.configureAsyncInvoke({
+      retryAttempts: 2,
+      onFailure: new lambdaDestinations.SqsDestination(debriefFailureQueue),
+    });
+    new cloudwatch.Alarm(this, `${id}-DebriefFailureAlarm`, {
+      alarmName: `${id}-Debrief-GenerationFailed`,
+      alarmDescription:
+        "A debrief run failed after Lambda's async retries — see the DebriefFailures queue. " +
+        "The student's next visit to the debrief retries it (get_debrief recovery).",
+      metric: debriefFailureQueue.metricApproximateNumberOfMessagesVisible({
+        statistic: "Maximum",
+        period: Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
 
     // Create S3 Bucket to handle documents for each simulation group
     const dataIngestionBucket = new s3.Bucket(
