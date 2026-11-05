@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import uuid
 import boto3
 import logging
 import psycopg
@@ -622,6 +623,13 @@ def handler(event, context):
         # Bind playground history to the caller. The client ID is only a suffix,
         # so another instructor replaying it lands on a different DynamoDB key.
         session_id = playground_history_key(caller_email, session_id)
+    else:
+        # authorize_request passed is_valid_uuid for every other mode, which
+        # accepts any letter case. Postgres matches UUIDs case-insensitively but
+        # DynamoDB keys do not, so canonicalize once here; otherwise case
+        # variants of one chat get separate debrief/initial-prompt claims
+        # (security finding f-5e543e74).
+        session_id = str(uuid.UUID(session_id))
     if mode == "debrief":
         # TODO(refactor): Extract debrief mode handling into a helper function
         logger.info(f"📋 DEBRIEF MODE — generating debrief for session={session_id}")
