@@ -3,6 +3,7 @@ from boto3.dynamodb.types import Binary
 from concurrent.futures import Future, ThreadPoolExecutor
 import psycopg
 import os
+import uuid
 
 # RDS Proxy presents an ACM certificate; verify it (and the hostname) against
 # the Amazon Trust Services roots in the OS trust store.
@@ -3965,43 +3966,64 @@ def debrief_exists(session_id: str) -> bool:
 DEBRIEF_ALREADY_GENERATED = {"status": "already_generated"}
 
 
-def _acquire_debrief_lock(session_id: str):
-    """Take the per-chat debrief lock on a dedicated connection.
+# How long a debrief claim blocks other runs for the same chat. Longer than the
+# text generation Lambda's 300s timeout (api-service-stack.ts), so a live run's
+# claim never lapses under it; a claim left by a run that died lapses after this.
+DEBRIEF_CLAIM_SECONDS = 330
+# TTL for the claim item itself (the table's TTL attribute is expireAt).
+DEBRIEF_CLAIM_TTL_SECONDS = 24 * 60 * 60
 
-    Returns the open connection that holds the lock, or None when another
-    debrief run for this chat already holds it. The lock is session-level, so
-    it is held without an open transaction and released when the connection
-    closes (including if the Lambda dies). RDS Proxy pins a session that calls
-    pg_try_advisory_lock, so the lock stays on one backend for its lifetime:
-    https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy-pinning.html
+
+def _debrief_claim_key(session_id: str) -> dict:
+    return {"SessionId": f"DEBRIEF_CLAIM#{session_id}"}
+
+
+def _claim_debrief(session_id: str, table_name: str) -> str | None:
+    """Claim this chat's debrief run in the DynamoDB conversation table.
+
+    Returns the claim token, or None when another run holds a live claim.
+    The claim is one conditional PutItem, so no DB connection is held while
+    the grader runs. The old session-level advisory lock kept a pinned RDS
+    Proxy connection open for the whole run (security finding f-1829a8dd).
+    Raises on any other DynamoDB error; the caller fails closed.
+    https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html
     """
-    conn = _get_db_connection()
+    token = str(uuid.uuid4())
+    now = int(time.time())
+    table = boto3.resource("dynamodb").Table(table_name)
     try:
-        conn.autocommit = True
-        cursor = conn.cursor()
-        # hashtextextended gives a 64-bit key, so two chats are very unlikely
-        # to share a lock.
-        cursor.execute(
-            "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
-            (f"debrief:{session_id}",),
+        table.put_item(
+            Item={
+                **_debrief_claim_key(session_id),
+                "claim_token": token,
+                "claimed_until": now + DEBRIEF_CLAIM_SECONDS,
+                "expireAt": now + DEBRIEF_CLAIM_TTL_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(SessionId) OR claimed_until < :now",
+            ExpressionAttributeValues={":now": now},
         )
-        acquired = bool(cursor.fetchone()[0])
-        cursor.close()
-    except Exception:
-        conn.close()
-        raise
-    if not acquired:
-        conn.close()
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
         return None
-    return conn
+    return token
 
 
-def _release_debrief_lock(conn) -> None:
-    """Close the lock connection, which releases the advisory lock."""
+def _release_debrief_claim(session_id: str, table_name: str, token: str) -> None:
+    """Release this run's claim, and only this run's.
+
+    Sets claimed_until to 0 rather than deleting, so the Lambda needs no
+    DeleteItem permission; TTL removes the item later. If the release fails,
+    the claim lapses on its own after DEBRIEF_CLAIM_SECONDS.
+    """
     try:
-        conn.close()
+        table = boto3.resource("dynamodb").Table(table_name)
+        table.update_item(
+            Key=_debrief_claim_key(session_id),
+            UpdateExpression="SET claimed_until = :zero",
+            ConditionExpression="claim_token = :token",
+            ExpressionAttributeValues={":zero": 0, ":token": token},
+        )
     except Exception as e:
-        logger.error(f"Error releasing debrief lock: {type(e).__name__}")
+        logger.error(f"Error releasing debrief claim: {type(e).__name__}")
 
 
 def generate_debrief(
@@ -4018,17 +4040,21 @@ def generate_debrief(
     One debrief per chat. A repeat or concurrent call must not re-run the
     grader: it would re-read the answer key, re-publish the stream frames and
     duplicate the question_interactions rows (security findings f-f614db93,
-    f-197f7ee1). A per-chat advisory lock serialises callers; the existence
-    check runs while holding it, and the winner's INSERT lands before the lock
-    is released, so later callers see the row. All of this happens before any
-    S3, LLM or stream work. Lock or DB errors fail closed.
+    f-197f7ee1). A per-chat claim in DynamoDB serialises callers; the
+    existence check runs while holding it, and the winner's INSERT lands
+    before the claim is released, so later callers see the row. All of this
+    happens before any S3, LLM or stream work. The claim holds no DB
+    connection during grading (f-1829a8dd). Claim or DB errors fail closed.
     """
-    try:
-        lock_conn = _acquire_debrief_lock(session_id)
-    except Exception as e:
-        logger.error(f"Error acquiring debrief lock: {type(e).__name__}")
+    if not ddb_table_name:
+        logger.error("No DynamoDB table for the debrief claim — skipping generation")
         return dict(DEBRIEF_ALREADY_GENERATED)
-    if lock_conn is None:
+    try:
+        claim_token = _claim_debrief(session_id, ddb_table_name)
+    except Exception as e:
+        logger.error(f"Error claiming debrief: {type(e).__name__}")
+        return dict(DEBRIEF_ALREADY_GENERATED)
+    if claim_token is None:
         logger.info(f"📋 Debrief already in progress for session={session_id} — skipping generation")
         return dict(DEBRIEF_ALREADY_GENERATED)
 
@@ -4050,7 +4076,7 @@ def generate_debrief(
         logger.info(f"📋 Debrief already saved for session={session_id} — discarding this run")
         return dict(DEBRIEF_ALREADY_GENERATED)
     finally:
-        _release_debrief_lock(lock_conn)
+        _release_debrief_claim(session_id, ddb_table_name, claim_token)
 
 
 def _run_debrief_grader(
