@@ -762,7 +762,7 @@ Generate a response from the LLM. Supports multiple modes: chat, debrief, questi
 
 - `chat`, `match`, `debrief`: the caller must own `session_id` (admins bypass ownership). The session must belong to `patient_id` and `simulation_group_id`.
   - `chat` (and unrecognised modes) return `409` once the chat is concluded.
-  - `debrief` returns `409` until the chat is concluded. It is invoked by `conclude_interaction`; clients read results from `GET /student/get_debrief`. Only one debrief is generated per chat: a repeat call returns `{"status": "already_generated"}` without re-running the grader.
+  - `debrief` returns `409` until the chat is concluded. It is invoked by `conclude_interaction`; clients read results from `GET /student/get_debrief`. Only one debrief is generated per chat: a repeat call returns `{"status": "already_generated"}` without re-running the grader. A call made while another run is grading the same chat returns `{"status": "in_progress"}`. If the debrief state cannot be determined (claim or database error), the grader does not run and the call returns `500`.
 - `test_debrief`: the caller must be an instructor of `simulation_group_id` or an admin, and the session must belong to that persona and group.
 - `test_system_prompt`: the caller must be an instructor of `simulation_group_id` or an admin. `patient_id` must belong to the group, and `session_id` must be a playground scratch ID prefixed with `test-`.
 - Denials return `401` (no caller identity), `400` (malformed IDs), `403` (not permitted) or `409` (wrong chat state).

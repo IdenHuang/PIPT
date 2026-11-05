@@ -3942,8 +3942,9 @@ def fetch_debrief_prompt(simulation_group_id: str) -> str:
 def debrief_exists(session_id: str) -> bool:
     """True if a debrief row is already stored for this chat.
 
-    Fails closed: a DB error is treated as "exists" so the grader never runs
-    again on a chat whose debrief state is unknown (security finding f-f614db93).
+    Fails closed: a DB error raises, so the grader never runs on a chat whose
+    debrief state is unknown (security finding f-f614db93) and the caller
+    gets an error rather than a false "already generated" (f-f412e8bc).
     """
     try:
         conn = _get_db_connection()
@@ -3960,10 +3961,13 @@ def debrief_exists(session_id: str) -> bool:
             conn.close()
     except Exception as e:
         logger.error(f"Error checking for existing debrief: {type(e).__name__}")
-        return True
+        raise RuntimeError("Could not determine debrief state") from e
 
 
+# Returned only when the DB confirms a debrief row exists for the chat.
 DEBRIEF_ALREADY_GENERATED = {"status": "already_generated"}
+# Returned when another run holds the claim and no result is known yet.
+DEBRIEF_IN_PROGRESS = {"status": "in_progress"}
 
 
 # How long a debrief claim blocks other runs for the same chat. Longer than the
@@ -4044,19 +4048,22 @@ def generate_debrief(
     existence check runs while holding it, and the winner's INSERT lands
     before the claim is released, so later callers see the row. All of this
     happens before any S3, LLM or stream work. The claim holds no DB
-    connection during grading (f-1829a8dd). Claim or DB errors fail closed.
+    connection during grading. Claim or DB errors fail closed:
+    the grader does not run and the error propagates, so main.py returns 500
+    instead of a success-shaped "already_generated" (f-f412e8bc). Contention
+    returns "in_progress"; "already_generated" means a stored row was confirmed.
     """
     if not ddb_table_name:
         logger.error("No DynamoDB table for the debrief claim — skipping generation")
-        return dict(DEBRIEF_ALREADY_GENERATED)
+        raise RuntimeError("No DynamoDB table configured for the debrief claim")
     try:
         claim_token = _claim_debrief(session_id, ddb_table_name)
     except Exception as e:
         logger.error(f"Error claiming debrief: {type(e).__name__}")
-        return dict(DEBRIEF_ALREADY_GENERATED)
+        raise
     if claim_token is None:
-        logger.info(f"📋 Debrief already in progress for session={session_id} — skipping generation")
-        return dict(DEBRIEF_ALREADY_GENERATED)
+        logger.info(f"📋 Debrief in progress for session={session_id} — skipping generation")
+        return dict(DEBRIEF_IN_PROGRESS)
 
     try:
         if debrief_exists(session_id):

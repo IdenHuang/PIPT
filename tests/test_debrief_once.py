@@ -57,11 +57,13 @@ def test_debrief_exists_false_when_no_row(monkeypatch):
 
 
 def test_debrief_exists_fails_closed_on_db_error(monkeypatch):
+    """Unknown state raises rather than reporting a debrief exists (f-f412e8bc)."""
     def boom():
         raise RuntimeError("db down")
 
     monkeypatch.setattr(chat, "_get_db_connection", boom)
-    assert chat.debrief_exists(SESSION) is True
+    with pytest.raises(RuntimeError):
+        chat.debrief_exists(SESSION)
 
 
 GRADER_STEPS = (
@@ -166,17 +168,20 @@ def test_generate_debrief_skips_when_another_run_holds_the_lock(monkeypatch):
 
     monkeypatch.setattr(chat, "debrief_exists", must_not_check)
     _forbid_grader(monkeypatch)
-    _assert_skipped(_run())
+    # Contention is not a terminal state: no debrief row is known yet (f-f412e8bc).
+    assert _run() == {"status": "in_progress"}
 
 
 def test_generate_debrief_fails_closed_when_lock_errors(monkeypatch):
+    """A claim error stops the grader and surfaces as an error (f-f412e8bc)."""
     def boom(session_id, table_name):
         raise RuntimeError("dynamodb down")
 
     monkeypatch.setattr(chat, "_claim_debrief", boom)
     _forbid_release(monkeypatch)
     _forbid_grader(monkeypatch)
-    _assert_skipped(_run())
+    with pytest.raises(RuntimeError, match="dynamodb down"):
+        _run()
 
 
 def test_generate_debrief_fails_closed_without_claim_table(monkeypatch):
@@ -185,7 +190,23 @@ def test_generate_debrief_fails_closed_without_claim_table(monkeypatch):
 
     monkeypatch.setattr(chat, "_claim_debrief", must_not_claim)
     _forbid_grader(monkeypatch)
-    _assert_skipped(_run(ddb_table_name=None))
+    with pytest.raises(RuntimeError):
+        _run(ddb_table_name=None)
+
+
+def test_generate_debrief_fails_closed_when_existence_check_errors(monkeypatch):
+    """A DB error in the existence check stops the grader, raises, and still
+    releases the claim (f-f614db93, f-f412e8bc)."""
+    lock = _hold_lock(monkeypatch)
+
+    def db_down():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(chat, "_get_db_connection", db_down)
+    _forbid_grader(monkeypatch)
+    with pytest.raises(RuntimeError):
+        _run()
+    assert lock.closed
 
 
 def test_generate_debrief_discards_run_when_debrief_already_saved(monkeypatch):
