@@ -23,7 +23,8 @@ function handlerBlock(routeKey) {
 describe("POST /student/conclude_interaction authorization", () => {
   const block = handlerBlock("POST /student/conclude_interaction");
   const firstWrite = block.indexOf('UPDATE "chats"');
-  const firstAssignmentRead = block.indexOf("FROM simulation_group_dtps");
+  // Assignment reads live in getPatientMode (debriefGeneration.js).
+  const firstAssignmentRead = block.indexOf("getPatientMode(");
 
   test("handler still writes to chats (sanity check for the slice)", () => {
     expect(firstWrite).toBeGreaterThan(-1);

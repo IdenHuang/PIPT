@@ -13,7 +13,8 @@ from botocore.exceptions import ClientError
 
 from test_textgen_credentials_and_logging import main  # noqa: F401  (fixture)
 
-SESSION = "chat-1"
+# A real UUID: the handler canonicalizes session_id after authz (f-5e543e74).
+SESSION = "33333333-3333-4333-8333-333333333333"
 
 
 class FakeTable:
@@ -104,7 +105,11 @@ def chat(main, monkeypatch):  # noqa: F811
         event = {
             "headers": {},
             "queryStringParameters": {
-                "simulation_group_id": "g1", "session_id": SESSION, "patient_id": "p1", "stream": stream,
+                # Real UUIDs: the handler canonicalizes these after authz.
+                "simulation_group_id": "11111111-1111-4111-8111-111111111111",
+                "session_id": SESSION,
+                "patient_id": "22222222-2222-4222-8222-222222222222",
+                "stream": stream,
             },
             "requestContext": {"authorizer": {"userId": "u1", "email": "s@example.com"}},
             "body": json.dumps({"message_content": message}),

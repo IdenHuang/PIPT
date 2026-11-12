@@ -3,6 +3,7 @@ from boto3.dynamodb.types import Binary
 from concurrent.futures import Future, ThreadPoolExecutor
 import psycopg
 import os
+import uuid
 
 # RDS Proxy presents an ACM certificate; verify it (and the hostname) against
 # the Amazon Trust Services roots in the OS trust store.
@@ -3665,6 +3666,10 @@ def fetch_student_id_for_chat(session_id: str) -> str:
         return ""
 
 
+class DebriefAlreadySaved(Exception):
+    """The chat already has a stored debrief; this run's result is discarded."""
+
+
 def save_debrief_to_db(
     session_id: str,
     student_id: str,
@@ -3680,7 +3685,14 @@ def save_debrief_to_db(
     overall_score: float,
     tracker: DegradedTracker = None,
 ) -> str:
-    """Insert a row into the debriefs table and return the debrief_id."""
+    """Insert a row into the debriefs table and return the debrief_id.
+
+    Raises DebriefAlreadySaved when the chat already has a debrief
+    (UNIQUE (chat_id)), so the caller stops before writing analytics or
+    publishing (security finding f-197f7ee1). Any other DB error is recorded
+    on the tracker and returns "".
+    """
+    conn = None
     try:
         conn = _get_db_connection()
         cursor = conn.cursor()
@@ -3709,14 +3721,22 @@ def save_debrief_to_db(
         debrief_id = cursor.fetchone()[0]
         conn.commit()
         cursor.close()
-        conn.close()
         logger.info(f"💾 Debrief saved: debrief_id={debrief_id}")
         return str(debrief_id)
+    except psycopg.errors.UniqueViolation:
+        logger.info(f"Debrief already saved for session={session_id}")
+        raise DebriefAlreadySaved(session_id)
     except Exception as e:
         logger.error(f"Error saving debrief: {e}")
         if tracker:
             tracker.record("save_debrief_to_db", f"db_error: {type(e).__name__}", "persistence_failed")
         return ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def save_question_interactions(
@@ -3922,8 +3942,9 @@ def fetch_debrief_prompt(simulation_group_id: str) -> str:
 def debrief_exists(session_id: str) -> bool:
     """True if a debrief row is already stored for this chat.
 
-    Fails closed: a DB error is treated as "exists" so the grader never runs
-    again on a chat whose debrief state is unknown (security finding f-f614db93).
+    Fails closed: a DB error raises, so the grader never runs on a chat whose
+    debrief state is unknown (security finding f-f614db93) and the caller
+    gets an error rather than a false "already generated" (f-f412e8bc).
     """
     try:
         conn = _get_db_connection()
@@ -3940,13 +3961,276 @@ def debrief_exists(session_id: str) -> bool:
             conn.close()
     except Exception as e:
         logger.error(f"Error checking for existing debrief: {type(e).__name__}")
-        return True
+        raise RuntimeError("Could not determine debrief state") from e
 
 
+# Returned only when the DB confirms a debrief row exists for the chat.
 DEBRIEF_ALREADY_GENERATED = {"status": "already_generated"}
+# Returned when another run holds the claim and no result is known yet.
+DEBRIEF_IN_PROGRESS = {"status": "in_progress"}
+
+
+# Who asked for the debrief (the debrief_trigger query parameter set by
+# studentFunction.js). "conclude" is the async invoke from conclude_interaction:
+# Lambda retries it only when the invocation fails, so contention and errors
+# must raise. "recovery" is the async invoke from get_debrief for a concluded
+# chat that still has no debrief; it is rate limited and does not raise.
+DEBRIEF_TRIGGER_CONCLUDE = "conclude"
+DEBRIEF_TRIGGER_RECOVERY = "recovery"
+
+
+class DebriefClaimHeld(Exception):
+    """Another run holds this chat's debrief claim. Raised for the conclude
+    trigger so Lambda's async retry tries again after the claim frees up."""
+
+
+# How long a debrief claim blocks other runs for the same chat. The holder
+# renews it every DEBRIEF_CLAIM_RENEW_SECONDS while it grades, so a live run
+# keeps it however long grading takes. A run that dies (timeout, out of memory)
+# stops renewing, and its claim lapses within this many seconds. That is before
+# Lambda's first async retry, about a minute after the failure.
+# https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-error-handling.html
+DEBRIEF_CLAIM_SECONDS = 45
+DEBRIEF_CLAIM_RENEW_SECONDS = 15
+# TTL for the claim item itself (the table's TTL attribute is expireAt).
+DEBRIEF_CLAIM_TTL_SECONDS = 24 * 60 * 60
+# At most one recovery run per chat in this window, however often the
+# student's page polls get_debrief.
+DEBRIEF_RECOVERY_INTERVAL_SECONDS = 5 * 60
+
+
+def _debrief_claim_key(session_id: str) -> dict:
+    return {"SessionId": f"DEBRIEF_CLAIM#{session_id}"}
+
+
+def _debrief_recovery_key(session_id: str) -> dict:
+    return {"SessionId": f"DEBRIEF_RECOVERY#{session_id}"}
+
+
+def _claim_debrief(session_id: str, table_name: str) -> str | None:
+    """Claim this chat's debrief run in the DynamoDB conversation table.
+
+    Returns the claim token, or None when another run holds a live claim.
+    The claim is one conditional PutItem, so no DB connection is held while
+    the grader runs. The old session-level advisory lock kept a pinned RDS
+    Proxy connection open for the whole run (security finding f-1829a8dd).
+    Raises on any other DynamoDB error; the caller fails closed.
+    https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html
+    """
+    token = str(uuid.uuid4())
+    now = int(time.time())
+    table = boto3.resource("dynamodb").Table(table_name)
+    try:
+        table.put_item(
+            Item={
+                **_debrief_claim_key(session_id),
+                "claim_token": token,
+                "claimed_until": now + DEBRIEF_CLAIM_SECONDS,
+                "expireAt": now + DEBRIEF_CLAIM_TTL_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(SessionId) OR claimed_until < :now",
+            ExpressionAttributeValues={":now": now},
+        )
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
+        return None
+    return token
+
+
+def _release_debrief_claim(session_id: str, table_name: str, token: str) -> None:
+    """Release this run's claim, and only this run's.
+
+    Sets claimed_until to 0 rather than deleting, so the Lambda needs no
+    DeleteItem permission; TTL removes the item later. If the release fails,
+    the claim lapses on its own within DEBRIEF_CLAIM_SECONDS, because the
+    heartbeat has already stopped renewing it.
+    """
+    try:
+        table = boto3.resource("dynamodb").Table(table_name)
+        table.update_item(
+            Key=_debrief_claim_key(session_id),
+            UpdateExpression="SET claimed_until = :zero",
+            ConditionExpression="claim_token = :token",
+            ExpressionAttributeValues={":zero": 0, ":token": token},
+        )
+    except Exception as e:
+        logger.error(f"Error releasing debrief claim: {type(e).__name__}")
+
+
+def _renew_debrief_claim(table, session_id: str, token: str) -> bool:
+    """Push this run's claim out another DEBRIEF_CLAIM_SECONDS.
+
+    Returns False when the claim is no longer this run's: another run took it
+    over, or it was already released (claimed_until = 0), which a renewal must
+    not undo. Raises on any other DynamoDB error.
+    """
+    now = int(time.time())
+    try:
+        table.update_item(
+            Key=_debrief_claim_key(session_id),
+            UpdateExpression="SET claimed_until = :until",
+            ConditionExpression="claim_token = :token AND claimed_until > :zero",
+            ExpressionAttributeValues={
+                ":until": now + DEBRIEF_CLAIM_SECONDS,
+                ":token": token,
+                ":zero": 0,
+            },
+        )
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+    return True
+
+
+class _DebriefClaimHeartbeat:
+    """Renews a debrief claim in a background thread while the grader runs.
+
+    The thread stops when the run ends normally (stop() in generate_debrief's
+    finally) or when the Lambda sandbox dies, so the claim tracks whether the
+    run is alive instead of a fixed wall-clock lease.
+    """
+
+    def __init__(self, session_id: str, table_name: str, token: str):
+        self._session_id = session_id
+        self._table_name = table_name
+        self._token = token
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="debrief-claim-heartbeat", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.ident is not None:  # start() ran
+            self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        # boto3 resources are not thread safe; this thread gets its own session.
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/guide/resources.html#multithreading-or-multiprocessing-with-resources
+        try:
+            table = boto3.session.Session().resource("dynamodb").Table(self._table_name)
+        except Exception as e:
+            logger.error(f"Debrief claim heartbeat could not start: {type(e).__name__}")
+            return
+        while not self._stop.wait(DEBRIEF_CLAIM_RENEW_SECONDS):
+            try:
+                if not _renew_debrief_claim(table, self._session_id, self._token):
+                    logger.warning(
+                        f"Debrief claim for session={self._session_id} is no longer held by this run"
+                    )
+                    return
+            except Exception as e:
+                # Keep trying: one failed renewal leaves 30s of lease. If they
+                # all fail, the claim lapses and another run may take over; the
+                # debriefs unique constraint (DebriefAlreadySaved) still keeps
+                # one row per chat.
+                logger.error(f"Error renewing debrief claim: {type(e).__name__}")
+
+
+def _take_debrief_recovery_slot(session_id: str, table_name: str) -> bool:
+    """Allow one recovery run per chat per DEBRIEF_RECOVERY_INTERVAL_SECONDS.
+
+    get_debrief asks for recovery on every poll of a concluded chat that has no
+    debrief, so without this a failing chat would re-run the grader (and pay
+    for Bedrock) on each poll. Returns False when a recovery ran recently.
+    Raises on any other DynamoDB error.
+    """
+    now = int(time.time())
+    table = boto3.resource("dynamodb").Table(table_name)
+    try:
+        table.put_item(
+            Item={
+                **_debrief_recovery_key(session_id),
+                "next_allowed_at": now + DEBRIEF_RECOVERY_INTERVAL_SECONDS,
+                "expireAt": now + DEBRIEF_CLAIM_TTL_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(SessionId) OR next_allowed_at <= :now",
+            ExpressionAttributeValues={":now": now},
+        )
+    except table.meta.client.exceptions.ConditionalCheckFailedException:
+        return False
+    return True
 
 
 def generate_debrief(
+    session_id: str,
+    simulation_group_id: str,
+    persona_id: str,
+    llm: ChatBedrock,
+    embeddings_model=None,
+    ddb_table_name: str = None,
+    patient_mode: str = "interview_practice",
+    trigger: str | None = None,
+) -> dict:
+    """Generate the chat's debrief at most once (see _run_debrief_grader).
+
+    One debrief per chat. A repeat or concurrent call must not re-run the
+    grader: it would re-read the answer key, re-publish the stream frames and
+    duplicate the question_interactions rows (security findings f-f614db93,
+    f-197f7ee1). A per-chat claim in DynamoDB serialises callers; the
+    existence check runs while holding it, and the winner's INSERT lands
+    before the claim is released, so later callers see the row. All of this
+    happens before any S3, LLM or stream work. The claim holds no DB
+    connection during grading. Claim or DB errors fail closed:
+    the grader does not run and the error propagates, so main.py returns 500
+    instead of a success-shaped "already_generated" (f-f412e8bc). Contention
+    returns "in_progress"; "already_generated" means a stored row was confirmed.
+
+    The claim is renewed by a heartbeat while grading, so a run that dies frees
+    it within DEBRIEF_CLAIM_SECONDS (f-9a43bb3a). With trigger="conclude",
+    contention raises DebriefClaimHeld so Lambda's async retry tries again.
+    With trigger="recovery", the call is rate limited per chat.
+    """
+    if not ddb_table_name:
+        logger.error("No DynamoDB table for the debrief claim — skipping generation")
+        raise RuntimeError("No DynamoDB table configured for the debrief claim")
+    if trigger == DEBRIEF_TRIGGER_RECOVERY:
+        try:
+            if not _take_debrief_recovery_slot(session_id, ddb_table_name):
+                logger.info(f"📋 Debrief recovery ran recently for session={session_id} — skipping")
+                return dict(DEBRIEF_IN_PROGRESS)
+        except Exception as e:
+            logger.error(f"Error taking debrief recovery slot: {type(e).__name__}")
+            raise
+    try:
+        claim_token = _claim_debrief(session_id, ddb_table_name)
+    except Exception as e:
+        logger.error(f"Error claiming debrief: {type(e).__name__}")
+        raise
+    if claim_token is None:
+        logger.info(f"📋 Debrief in progress for session={session_id} — skipping generation")
+        if trigger == DEBRIEF_TRIGGER_CONCLUDE:
+            raise DebriefClaimHeld(session_id)
+        return dict(DEBRIEF_IN_PROGRESS)
+
+    heartbeat = _DebriefClaimHeartbeat(session_id, ddb_table_name, claim_token)
+    try:
+        heartbeat.start()
+        if debrief_exists(session_id):
+            logger.info(f"📋 Debrief already exists for session={session_id} — skipping generation")
+            return dict(DEBRIEF_ALREADY_GENERATED)
+        return _run_debrief_grader(
+            session_id=session_id,
+            simulation_group_id=simulation_group_id,
+            persona_id=persona_id,
+            llm=llm,
+            embeddings_model=embeddings_model,
+            ddb_table_name=ddb_table_name,
+            patient_mode=patient_mode,
+        )
+    except DebriefAlreadySaved:
+        # Another run stored this chat's debrief first. Its result stands.
+        logger.info(f"📋 Debrief already saved for session={session_id} — discarding this run")
+        return dict(DEBRIEF_ALREADY_GENERATED)
+    finally:
+        # Stop renewing before releasing, so a late renewal cannot re-hold
+        # a claim this run has just released.
+        heartbeat.stop()
+        _release_debrief_claim(session_id, ddb_table_name, claim_token)
+
+
+def _run_debrief_grader(
     session_id: str,
     simulation_group_id: str,
     persona_id: str,
@@ -3976,14 +4260,6 @@ def generate_debrief(
         items. The debrief includes matched/missed/additional categorization.
     """
     logger.info(f"📋 DEBRIEF GENERATION STARTED for session={session_id}")
-
-    # One debrief per chat. A repeat call must not re-run the grader: it would
-    # re-read the answer key, re-publish the stream frames and duplicate the
-    # question_interactions rows (security finding f-f614db93). This check runs
-    # before any S3, LLM or stream work.
-    if debrief_exists(session_id):
-        logger.info(f"📋 Debrief already exists for session={session_id} — skipping generation")
-        return dict(DEBRIEF_ALREADY_GENERATED)
 
     # Initialize degradation tracker — accumulates any errors that may affect score accuracy
     tracker = DegradedTracker()
@@ -4682,8 +4958,12 @@ The following is the instructor's answer key for this simulation case. Compare t
         tracker=tracker,
     )
 
-    # 6. Write per-question analytics
-    if key_questions and student_id:
+    # 6. Write per-question analytics, only against a stored debrief row. A
+    # duplicate save already raised DebriefAlreadySaved above; "" means the
+    # save failed (recorded on the tracker), so there is no row to attach to.
+    if not debrief_id:
+        logger.error(f"Debrief not saved for session={session_id}; skipping question_interactions")
+    elif key_questions and student_id:
         save_question_interactions(
             debrief_id=debrief_id,
             session_id=session_id,

@@ -66,7 +66,11 @@ def match(main, monkeypatch):  # noqa: F811
         event = {
             "headers": {},
             "queryStringParameters": {
-                "simulation_group_id": "g1", "session_id": SESSION, "patient_id": "p1", "mode": "match",
+                # Real UUIDs: the handler canonicalizes these after authz.
+                "simulation_group_id": "11111111-1111-4111-8111-111111111111",
+                "session_id": SESSION,
+                "patient_id": "22222222-2222-4222-8222-222222222222",
+                "mode": "match",
             },
             "requestContext": {"authorizer": {"userId": "u1", "email": "s@example.com"}},
             "body": json.dumps(body),

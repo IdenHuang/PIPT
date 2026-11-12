@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import uuid
 import boto3
 import logging
 import psycopg
@@ -13,7 +14,13 @@ from helpers.cohere_embeddings import CohereBedrockEmbeddings
 
 from helpers.chat import get_bedrock_llm, get_initial_student_query, get_student_query, set_stream_callback_url, get_default_system_prompt
 from helpers.seed_prompt import seed_prompt
-from helpers.authz import AuthzDecision, authorize_request, is_valid_uuid, playground_history_key
+from helpers.authz import (
+    AuthzDecision,
+    authorize_request,
+    canonical_uuid,
+    is_valid_uuid,
+    playground_history_key,
+)
 
 # Set up basic logging
 logging.basicConfig(level=logging.INFO)
@@ -618,15 +625,35 @@ def handler(event, context):
             },
             'body': json.dumps({"error": decision.reason}),
         }
+    # authorize_request passed is_valid_uuid for these IDs, which accepts any
+    # letter case. Postgres matches UUIDs case-insensitively, but DynamoDB keys
+    # and the pgvector collection name / source filter do not, so lowercase
+    # them once here. Otherwise case variants get separate debrief and
+    # initial-prompt claims (f-5e543e74), miss the DTPCACHE#/RECCACHE# entries,
+    # and retrieve none of the persona's documents (f-c7f52a9a).
+    simulation_group_id = canonical_uuid(simulation_group_id)
+    persona_id = canonical_uuid(persona_id)
     if mode == "test_system_prompt":
         # Bind playground history to the caller. The client ID is only a suffix,
         # so another instructor replaying it lands on a different DynamoDB key.
         session_id = playground_history_key(caller_email, session_id)
+    else:
+        session_id = canonical_uuid(session_id)
     if mode == "debrief":
         # TODO(refactor): Extract debrief mode handling into a helper function
         logger.info(f"📋 DEBRIEF MODE — generating debrief for session={session_id}")
-        from helpers.chat import generate_debrief
+        from helpers.chat import (
+            DEBRIEF_TRIGGER_CONCLUDE,
+            DEBRIEF_TRIGGER_RECOVERY,
+            DebriefClaimHeld,
+            generate_debrief,
+        )
         patient_mode = query_params.get("patient_mode", "interview_practice")
+        # Set by studentFunction.js on its async invokes. Any other value
+        # (e.g. a direct API Gateway call) keeps the synchronous behaviour.
+        trigger = query_params.get("debrief_trigger")
+        if trigger not in (DEBRIEF_TRIGGER_CONCLUDE, DEBRIEF_TRIGGER_RECOVERY):
+            trigger = None
         try:
             llm = get_bedrock_llm(bedrock_llm_id=BEDROCK_LLM_ID, streaming=False)
             debrief_result = generate_debrief(
@@ -637,6 +664,7 @@ def handler(event, context):
                 embeddings_model=embeddings,
                 ddb_table_name=TABLE_NAME,
                 patient_mode=patient_mode,
+                trigger=trigger,
             )
             return {
                 "statusCode": 200,
@@ -648,9 +676,19 @@ def handler(event, context):
                 },
                 "body": json.dumps(debrief_result, default=str),
             }
+        except DebriefClaimHeld:
+            # Only raised for the conclude trigger. Fail the async invocation
+            # so Lambda retries it after the other run's claim frees up.
+            logger.info(f"📋 Debrief claim held for session={session_id} — failing so Lambda retries")
+            raise
         except Exception as e:
             logger.error(f"Debrief generation failed: {e}")
             logger.exception("Full debrief error:")
+            if trigger == DEBRIEF_TRIGGER_CONCLUDE:
+                # A returned 500 counts as success for an async invoke, so
+                # Lambda would never retry. Raise instead; after the retries,
+                # the event goes to the failure queue (api-service-stack.ts).
+                raise
             return {
                 "statusCode": 500,
                 "headers": {
