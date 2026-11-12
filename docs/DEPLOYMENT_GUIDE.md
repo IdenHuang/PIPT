@@ -79,7 +79,7 @@ The application deploys to **`ca-central-1`** but makes cross-region calls to `u
 
 | Model | Region | Purpose |
 |-------|--------|---------|
-| **Anthropic Claude Sonnet 4.6** (`us.anthropic.claude-sonnet-4-6`) | `us-east-1` | Primary LLM for text generation |
+| **Anthropic Claude Sonnet 5.5** (`us.anthropic.claude-sonnet-5-5`) | `us-east-1` | Primary LLM for text generation |
 | **Cohere Embed v4** (`cohere.embed-v4:0`) | `us-east-1` | Document and query embeddings |
 | **Amazon Nova Sonic 2.0** (`amazon.nova-2-sonic-v1:0`) | `us-east-1` | Voice interactions (via AgentCore) |
 
@@ -1313,7 +1313,7 @@ aws secretsmanager create-secret \
 
 ### Text generation or embeddings not working
 
-**Cause:** Claude Sonnet 4.6 and Cohere Embed v4 are called in `us-east-1` via cross-region inference, but the models may not be accessible there.
+**Cause:** Claude Sonnet 5.5 and Cohere Embed v4 are called in `us-east-1` via cross-region inference, but the models may not be accessible there.
 
 **Fix:**
 

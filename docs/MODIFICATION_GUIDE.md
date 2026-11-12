@@ -364,13 +364,17 @@ const bedrockLLMParameter = new ssm.StringParameter(
   {
     parameterName: `/${id}/BedrockLLMId`,
     description: "Parameter containing the Bedrock LLM ID",
-    stringValue: "us.anthropic.claude-sonnet-4-6", // ← Change this
+    stringValue: "us.anthropic.claude-sonnet-5-5", // ← Change this
   }
 );
 ```
 
-3. Ensure the model is enabled in your Bedrock console (Model access).
-4. Deploy:
+3. Update the matching model ARNs in the same places, or calls are denied or go unmonitored:
+   - IAM: `bedrockPolicyStatement` in `cdk/lib/api-service-stack.ts` and the task role policy in `cdk/lib/ecs-socket-stack.ts` (both the `inference-profile/` and `foundation-model/` ARNs).
+   - CloudWatch: the `ModelId` dimension of the `BedrockInvocationAlarm` and `BedrockTokenAlarm` metrics in `cdk/lib/api-service-stack.ts`.
+4. Check the request settings in `get_bedrock_llm()` (`cdk/text_generation/src/helpers/chat.py`) against the new model. Claude Sonnet 5.5 rejects `temperature`, `top_p` and `top_k`, and runs with thinking unless told otherwise; see the [Sonnet 5.5 migration guide](https://platform.claude.com/docs/en/models/sonnet-5-5/migration-guide).
+5. Ensure the model is enabled in your Bedrock console (Model access).
+6. Deploy:
 
 ```bash
 npx cdk deploy <REPO NAME HERE>-Api -c StackPrefix=<STACK PREFIX HERE> -c githubRepo=<REPO NAME HERE>
@@ -399,7 +403,7 @@ const embeddingModelParameter = new ssm.StringParameter(
 
 | Parameter | Default Value | Purpose |
 |-----------|---------------|---------|
-| `/{id}/PIPT/BedrockLLMId` | `us.anthropic.claude-sonnet-4-6` | Primary chat and debrief LLM (cross-region inference profile) |
+| `/{id}/PIPT/BedrockLLMId` | `us.anthropic.claude-sonnet-5-5` | Primary chat and debrief LLM (cross-region inference profile) |
 | `/{id}/PIPT/EmbeddingModelId` | `cohere.embed-v4:0` | Document and query embeddings |
 | `/{id}/PIPT/TableName` | `DynamoDB-Conversation-Table` | DynamoDB table for conversations |
 

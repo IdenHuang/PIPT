@@ -1,11 +1,24 @@
 # Changelog
 
 > **Type:** Changelog
-> **Last updated:** 2026-05-30
+> **Last updated:** 2026-11-12
 
 All notable changes to the PIPT project are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
+
+## [2026-11-12]
+
+### Changed
+
+- Switched the primary chat and debrief LLM from Claude Sonnet 4.6 to Claude Sonnet 5.5 (`us.anthropic.claude-sonnet-5-5`), set by the `/{id}/BedrockLLMId` SSM parameter in `cdk/lib/api-service-stack.ts`
+- `get_bedrock_llm()` in `cdk/text_generation/src/helpers/chat.py` no longer sends `temperature`, which Sonnet 5.5 rejects
+- `get_bedrock_llm()` now sends `thinking: {"type": "between_tools"}` so Sonnet 5.5 answers without up-front thinking and returns plain-text responses, matching Sonnet 4.6 behavior
+- `get_bedrock_llm()` now takes an `effort` argument (`low`, `medium` or `high`, default `medium`); debrief and test-debrief generation in `cdk/text_generation/src/main.py` use `high`
+- Bedrock IAM permissions in the Api and EcsSocket stacks now allow the Sonnet 5.5 inference profile and foundation model instead of Sonnet 4.6
+- Bedrock invocation and input-token spike alarms now track the Sonnet 5.5 model ID
+- Updated model references in `README.md`, `DEPLOYMENT_GUIDE.md`, `ARCHITECTURE_DEEP_DIVE.md` and `MODIFICATION_GUIDE.md`
+- `MODIFICATION_GUIDE.md` now lists the IAM, alarm and request-setting updates needed when changing the LLM
 
 ## [2026-05-30]
 

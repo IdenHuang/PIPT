@@ -93,8 +93,8 @@ export class EcsSocketStack extends Stack {
               resources: [
                 // Same models/inference profiles as the textGen Lambda role
                 // (cdk/lib/api-service-stack.ts, bedrockPolicyStatement).
-                "arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-4-6",
-                "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6",
+                "arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-5-5",
+                "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5-5",
                 `arn:aws:bedrock:${this.region}::foundation-model/amazon.titan-embed-text-v2:0`,
                 "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0",
                 "arn:aws:bedrock:us-east-1::foundation-model/cohere.embed-v4:0",

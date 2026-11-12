@@ -134,22 +134,38 @@ class DegradedTracker:
 
 def get_bedrock_llm(
     bedrock_llm_id: str,
-    temperature: float = 0,
-    streaming: bool = False
+    streaming: bool = False,
+    effort: str = "medium",
 ) -> ChatBedrock:
     """
-    Retrieve a Bedrock LLM instance.
-    
+    Retrieve a Bedrock LLM instance for Claude Sonnet 5.5.
+
+    Sonnet 5.5 request rules (see
+    https://platform.claude.com/docs/en/models/sonnet-5-5/migration-guide):
+    - temperature, top_p and top_k return a 400 error, so none are sent.
+    - Adaptive thinking is on by default. "between_tools" turns off
+      up-front thinking; with no tools bound, responses contain only text
+      blocks, so resp.content stays a plain string for callers.
+    - "between_tools" accepts effort "low", "medium" or "high" only.
+      Chat uses "medium" (latency-sensitive); debriefs pass "high".
+
     Guardrails are NOT applied at the LLM level to avoid blocking the
     trusted system prompt. Instead, use apply_text_guardrail() to screen
     student input before the LLM call and AI output after.
     """
-    # Hardcoded to us-east-1 where Claude Sonnet 4.6 is available
+    if effort not in ("low", "medium", "high"):
+        raise ValueError(f"Unsupported effort for between_tools thinking: {effort}")
+
+    # Hardcoded to us-east-1; the us. inference profile routes to
+    # us-east-1, us-east-2 and us-west-2.
     region = 'us-east-1'
-    
+
     base_kwargs = {
         "model_id": bedrock_llm_id,
-        "model_kwargs": dict(temperature=temperature),
+        "model_kwargs": {
+            "thinking": {"type": "between_tools"},
+            "output_config": {"effort": effort},
+        },
         "streaming": streaming,
         "region_name": region
     }
