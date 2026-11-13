@@ -132,11 +132,15 @@ describe('server.js wiring', () => {
   function block(marker: string): string {
     const start = server.indexOf(marker);
     if (start === -1) throw new Error(`${marker} not found`);
-    return server.slice(start, server.indexOf('\n  });', start));
+    // Handlers end with "});" or, when wrapped in guardHandler, "}));".
+    const end = server.slice(start).search(/\n  \}\)?\);/);
+    return server.slice(start, end === -1 ? undefined : start + end);
   }
 
+  // Socket events are registered through the `on(...)` wrapper in server.js,
+  // which also checks token expiry before the handler runs.
   test('voice-preview limits are keyed on the user identity, not socket.id', () => {
-    const handler = block('socket.on("voice-preview",');
+    const handler = block('on("voice-preview",');
     expect(handler).toMatch(/voicePreviewLimiter\.tryAcquire\(limiterKey\(socket\)\)/);
     expect(handler).not.toMatch(/socket\.id/);
     // The limit is checked before any process is spawned.
@@ -145,14 +149,14 @@ describe('server.js wiring', () => {
 
   test('disconnect does not clear rate-limit history', () => {
     expect(server).not.toMatch(/voicePreviewTimestamps/);
-    const disconnect = block('socket.on("disconnect", () => {');
+    const disconnect = block('socket.on("disconnect", guardHandler("disconnect", socket, () => {');
     expect(disconnect).toMatch(/stopTtsProcess\(\)/);
     expect(disconnect).not.toMatch(/\.delete\(/);
   });
 
   test('every TTS process exit path releases its concurrency slot', () => {
     expect(server).toMatch(/child\.releaseVoiceSlot = slot\.release/);
-    const handler = block('socket.on("voice-preview",');
+    const handler = block('on("voice-preview",');
     expect(handler).toMatch(/on\("close"[\s\S]*?child\.releaseVoiceSlot\(\)/);
     expect(handler).toMatch(/on\("error"[\s\S]*?child\.releaseVoiceSlot\(\)/);
     expect(server).not.toMatch(/ttsProcess\.kill\(\)/);

@@ -131,6 +131,51 @@ export class CICDStack extends cdk.Stack {
       ],
     });
 
+    // Test stage: the CDK/Lambda/socket-server Jest suites and the Python
+    // pytest suite run once per commit, before any image is built. A failing
+    // test stops the pipeline, so nothing is pushed or deployed. The project
+    // uses its own CDK-generated role (logs only); it needs no AWS access.
+    const testProject = new codebuild.PipelineProject(this, "TestProject", {
+      projectName: `${id}-Tests`,
+      description: "Runs the Jest and pytest suites before images are built",
+      environment: {
+        buildImage: codebuild.LinuxBuildImage.STANDARD_7_0,
+      },
+      buildSpec: codebuild.BuildSpec.fromObject({
+        version: "0.2",
+        phases: {
+          install: {
+            "runtime-versions": { nodejs: 22, python: "3.12" },
+            commands: [
+              "cd $CODEBUILD_SRC_DIR/cdk && npm ci --no-audit --no-fund",
+              // Socket-server tests load its modules, which require its own dependencies.
+              "cd $CODEBUILD_SRC_DIR/cdk/socket-server && npm ci --no-audit --no-fund",
+              // Python test dependencies. tests/conftest.py stubs the other
+              // text-generation dependencies (LangChain, pydantic).
+              'pip install --quiet pytest==9.2.0 hypothesis==6.170.15 boto3==1.44.2 "psycopg[binary]==3.3.9"',
+            ],
+          },
+          build: {
+            commands: [
+              "cd $CODEBUILD_SRC_DIR/cdk && npx jest --silent --ci",
+              "cd $CODEBUILD_SRC_DIR && python -m pytest -q -p no:cacheprovider",
+            ],
+          },
+        },
+      }),
+    });
+
+    pipeline.addStage({
+      stageName: "Test",
+      actions: [
+        new codepipeline_actions.CodeBuildAction({
+          actionName: "Run_Tests",
+          project: testProject,
+          input: sourceOutput,
+        }),
+      ],
+    });
+
     // Create build actions for each Lambda function
     const buildActions: codepipeline_actions.CodeBuildAction[] = [];
 

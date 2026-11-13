@@ -1749,11 +1749,18 @@ def are_clinically_contradictory(text_a: str, text_b: str) -> bool:
     Checks whether one text contains a word from one side of a known antonym
     pair while the other text contains the paired antonym, indicating that the
     two submissions recommend opposite actions for the same drug/intervention.
+
+    A word only counts if it is in one text and not the other. A single
+    recommendation often uses both sides of a pair ("discontinue atenolol and
+    initiate amlodipine"); without this rule it would contradict itself, and a
+    student who wrote the same recommendation could never be matched.
     """
     words_a = set(re.findall(r"[a-z]+", text_a.lower()))
     words_b = set(re.findall(r"[a-z]+", text_b.lower()))
+    only_a = words_a - words_b
+    only_b = words_b - words_a
     for word1, word2 in _CLINICAL_ANTONYM_PAIRS:
-        if (word1 in words_a and word2 in words_b) or (word2 in words_a and word1 in words_b):
+        if (word1 in only_a and word2 in only_b) or (word2 in only_a and word1 in only_b):
             return True
     return False
 
