@@ -152,6 +152,34 @@ describe("student route wiring", () => {
     }
   );
 
+  describe("POST /student/create_ai_message (finding f-ce3bad91)", () => {
+    const block = handlerBlock("POST /student/create_ai_message");
+    const insertAt = 'INSERT INTO "messages"';
+
+    test("binds chat, persona and group to the caller before inserting", () => {
+      expect(block).not.toContain("verifySessionOwnership(");
+      const checkAt = block.search(
+        /verifySessionScope\(\s*sqlConnection, sessionId, patientId, simulationGroupId, userEmailAttribute\s*\)/
+      );
+      expect(checkAt).toBeGreaterThan(-1);
+      expect(checkAt).toBeLessThan(block.indexOf(insertAt));
+      expect(block).toMatch(FORBIDDEN);
+    });
+
+    test("refuses a concluded chat with 409 before inserting", () => {
+      expectCheckBefore(block, "c.status AS chat_status", insertAt);
+      expectCheckBefore(block, "aiGroupSettings[0].chat_status === 'concluded'", insertAt);
+      expect(block).toMatch(
+        /chat_status === 'concluded'\) \{\s+response\.statusCode = 409;[\s\S]*?break;/
+      );
+    });
+
+    test("enforces max_messages_per_chat before inserting", () => {
+      expectCheckBefore(block, "aiGroupSettings[0].max_messages_per_chat", insertAt);
+      expectCheckBefore(block, "aiMessageCount[0].count >= maxAiMessages", insertAt);
+    });
+  });
+
   test("GET /student/patient_context reads the persona only within the authorized group", () => {
     const block = handlerBlock("GET /student/patient_context");
     expect(block).toMatch(

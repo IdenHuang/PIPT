@@ -141,6 +141,24 @@ def verify_session_ownership(session_id, user_email):
         return False
 
 
+def get_chat_status(session_id):
+    """Return the chat's status, or None if the chat does not exist.
+
+    Raises on database errors so the caller fails closed.
+    """
+    conn = connect_to_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("""SELECT status FROM chats WHERE chat_id = %s""", (session_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+
 def lambda_handler(event, context):
     query_params = event.get("queryStringParameters", {})
 
@@ -189,6 +207,32 @@ def lambda_handler(event, context):
                 "headers": get_cors_headers(event),
                 'body': json.dumps('Forbidden')
             }
+
+    # A concluded chat is read-only for everyone, admins included: its transcript
+    # is the graded record, and deleting turns would also restore message quota.
+    # Checked before any DynamoDB or RDS mutation. Security finding f-ce3bad91.
+    try:
+        chat_status = get_chat_status(session_id)
+    except Exception as e:
+        logger.error(f"Error reading chat status: {e}")
+        return {
+            'statusCode': 500,
+            "headers": get_cors_headers(event),
+            'body': json.dumps("Internal server error")
+        }
+    if chat_status is None:
+        return {
+            'statusCode': 404,
+            "headers": get_cors_headers(event),
+            'body': json.dumps('Session not found')
+        }
+    if chat_status == 'concluded':
+        logger.warning(f"Refused delete on concluded chat: user={user_email} session={session_id} admin={is_admin}")
+        return {
+            'statusCode': 409,
+            "headers": get_cors_headers(event),
+            'body': json.dumps('Session already concluded.')
+        }
 
     try:
         # Fetch the conversation history from DynamoDB
