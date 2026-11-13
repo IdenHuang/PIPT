@@ -1,5 +1,6 @@
 import os
 import json
+import uuid
 import boto3
 from botocore.config import Config
 from botocore.signers import CloudFrontSigner
@@ -39,6 +40,13 @@ s3 = boto3.client(
 connection = None
 db_secret = None
 cf_private_key = None
+
+def canonical_uuid(value):
+    """Lower-case canonical form of a UUID string, or None if it is not a UUID."""
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 def get_secret(secret_name):
     global db_secret
@@ -247,6 +255,17 @@ def lambda_handler(event, context):
             'statusCode': 400,
             "headers": get_cors_headers(event),
             'body': json.dumps('Missing required parameters: simulation_group_id or persona_id')
+        }
+
+    # The IDs build case-sensitive S3 prefixes, so use the canonical lower-case
+    # form (security finding f-5babf2f8).
+    simulation_group_id = canonical_uuid(simulation_group_id)
+    persona_id = canonical_uuid(persona_id)
+    if not simulation_group_id or not persona_id:
+        return {
+            'statusCode': 400,
+            "headers": get_cors_headers(event),
+            'body': json.dumps('Invalid simulation_group_id or persona_id')
         }
 
     # Verify the caller may access this group's persona (see get_file_access)

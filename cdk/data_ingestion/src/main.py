@@ -5,6 +5,7 @@ import boto3
 from botocore.config import Config
 import psycopg2
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import NamedTuple
 from urllib.parse import unquote_plus
@@ -268,6 +269,13 @@ def mark_error_unless_completed(persona_id: str, file_path: str) -> bool:
     connection.commit()
     return changed
 
+def _is_canonical_uuid(value):
+    """True only for the lower-case hyphenated form str(uuid.UUID(...)) produces."""
+    try:
+        return str(uuid.UUID(value)) == value
+    except (ValueError, AttributeError, TypeError):
+        return False
+
 def parse_s3_file_path(file_key):
     # Assuming the file path is of the format: {simulation_group_id}/{persona_id}/{documents or info}/{file_name}.{file_type}
     try:
@@ -279,6 +287,14 @@ def parse_s3_file_path(file_key):
             raise ValueError(f"Unexpected file path format: {file_key}")
 
         simulation_group_id, persona_id, file_category, filename_with_ext = parts
+
+        # The persona segment becomes the pgvector collection name, compared by
+        # exact string, while the retriever and delete paths use the canonical
+        # lower-case UUID. Reject any other spelling so ingestion cannot create a
+        # case-variant collection nothing else reads or drops (security finding
+        # f-5babf2f8).
+        if not (_is_canonical_uuid(simulation_group_id) and _is_canonical_uuid(persona_id)):
+            raise ValueError(f"Non-canonical UUID in S3 key: {file_key}")
 
         # Split filename and extension
         if '.' not in filename_with_ext:

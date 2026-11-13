@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import uuid
 import boto3
 import psycopg2
 from aws_lambda_powertools import Logger
@@ -26,6 +27,13 @@ secrets_manager_client = boto3.client('secretsmanager')
 # Global variables for caching
 connection = None
 db_secret = None
+
+def canonical_uuid(value):
+    """Lower-case canonical form of a UUID string, or None if it is not a UUID."""
+    try:
+        return str(uuid.UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 def get_secret():
     global db_secret
@@ -205,6 +213,17 @@ def lambda_handler(event, context):
             'statusCode': 400,
             "headers": get_cors_headers(event),
             'body': json.dumps('Missing required parameters: simulation_group_id, persona_id, file_name, file_type, or folder_type')
+        }
+
+    # Both IDs build S3 keys and the pgvector lookup, which are case-sensitive,
+    # so use the canonical lower-case form (security finding f-5babf2f8).
+    simulation_group_id = canonical_uuid(simulation_group_id)
+    persona_id = canonical_uuid(persona_id)
+    if not simulation_group_id or not persona_id:
+        return {
+            'statusCode': 400,
+            "headers": get_cors_headers(event),
+            'body': json.dumps('Invalid simulation_group_id or persona_id')
         }
 
     # Verify the requesting instructor owns this simulation group
