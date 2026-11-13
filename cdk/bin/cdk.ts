@@ -15,6 +15,7 @@ import { TurnServerStack } from "../lib/turn-server-stack";
 import { CICDStack } from "../lib/cicd-stack";
 import { CloudFrontWafStack } from "../lib/cloudfront-waf-stack";
 import { AuditTrailStack } from "../lib/audit-trail-stack";
+import { MonitoringStack } from "../lib/monitoring-stack";
 
 const app = new cdk.App();
 
@@ -59,6 +60,12 @@ const cicdStack = new CICDStack(app, `${StackPrefix}-CICD`, {
       sourceDir: "cdk/voice-agent",
     },
   ],
+});
+
+// Alarm topic. Database, Api and EcsSocket attach their alarms to
+// the topic by ARN, so they depend on this stack (see addDependency below).
+const monitoringStack = new MonitoringStack(app, `${StackPrefix}-Monitoring`, StackPrefix, {
+  env,
 });
 
 const vpcStack = new VpcStack(app, `${StackPrefix}-VpcStack`, {
@@ -144,6 +151,11 @@ const amplifyStack = new AmplifyStack(
 // addDependency ensures EcsSocket deploys first (creates the param)
 // without creating a cross-stack CloudFormation export.
 amplifyStack.addDependency(ecsSocketStack);
+// These stacks reference the alarm topic by ARN, not by export, so the
+// ordering has to be declared.
+dbStack.addDependency(monitoringStack);
+apiStack.addDependency(monitoringStack);
+ecsSocketStack.addDependency(monitoringStack);
 // Tag all resources for cost allocation.
 // EcsSocket stack excluded entirely — AWS::CloudFront::VpcOrigin cannot be
 // updated (even tag changes) while attached to a distribution. Any resource

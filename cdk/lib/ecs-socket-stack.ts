@@ -14,6 +14,8 @@ import { DatabaseStack } from "./database-stack";
 import { TurnServerStack } from "./turn-server-stack";
 import { LogProtection } from "./log-protection";
 import { approvedImageTag } from "./approved-image";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
+import { importAlarmTopic, notifyOnAllAlarms } from "./monitoring-stack";
 
 /** SSM parameter name where the socket URL is published for other stacks to read. */
 export const getSocketUrlSsmParam = (stackPrefix: string) => `/${stackPrefix}/socket-url`;
@@ -362,7 +364,7 @@ export class EcsSocketStack extends Stack {
       port: 80,
       protocol: elbv2.Protocol.TCP,
     });
-    listener.addTargets("EcsTargetGroupV2", {
+    const targetGroup = listener.addTargets("EcsTargetGroupV2", {
       protocol: elbv2.Protocol.TCP,
       port: 80,
       targets: [service],
@@ -375,6 +377,26 @@ export class EcsSocketStack extends Stack {
         timeout: Duration.seconds(10),
       },
     });
+
+    // 6.0) Alarm when no socket task is healthy behind the NLB: all text chat
+    // and voice is down. NLB HealthyHostCount needs no Container Insights.
+    // Rolling deploys start the new task before stopping the old one, so a
+    // normal deploy doesn't trip it.
+    new cloudwatch.Alarm(this, "SocketNoHealthyTaskAlarm", {
+      alarmName: `${id}-Socket-NoHealthyTask`,
+      alarmDescription:
+        "No healthy socket-server task behind the NLB for 3 minutes: text chat and voice are down. " +
+        "Check the ECS service events and the Socket log group.",
+      metric: targetGroup.metrics.healthyHostCount({
+        statistic: "Minimum",
+        period: Duration.minutes(1),
+      }),
+      threshold: 1,
+      evaluationPeriods: 3,
+      comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+    });
+    notifyOnAllAlarms(this, importAlarmTopic(this, stackPrefix));
 
     // 6.1) Publish the VPC-internal callback URL for the text-generation Lambda.
     // The Lambda runs in the same VPC and reaches the internal NLB directly,

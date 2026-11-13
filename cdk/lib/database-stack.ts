@@ -7,8 +7,11 @@ import * as rds from 'aws-cdk-lib/aws-rds';
 import * as ec2 from "aws-cdk-lib/aws-ec2";
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+
 import { VpcStack } from './vpc-stack';
 import { resolveLogRetention } from './log-protection';
+import { importAlarmTopic, notifyOnAllAlarms } from './monitoring-stack';
 
 export class DatabaseStack extends Stack {
     public readonly dbInstance: rds.DatabaseInstance;
@@ -106,7 +109,9 @@ export class DatabaseStack extends Stack {
             allowMajorVersionUpgrade: false,
             autoMinorVersionUpgrade: true,
             backupRetention: Duration.days(7),
-            deleteAutomatedBackups: true,
+            // Keep automated backups if the instance is deleted, so point-in-time
+            // restore is still possible. They expire with the retention period.
+            deleteAutomatedBackups: false,
             deletionProtection: true,
             databaseName: "pipt",
             publiclyAccessible: false,
@@ -184,6 +189,42 @@ export class DatabaseStack extends Stack {
         this.dbInstance.grantConnect(rdsProxyRole);
 
         this.rdsProxyEndpoint = rdsProxy.endpoint;
+
+        this.createAlarms(id);
+        const stackPrefix = this.node.tryGetContext('StackPrefix') ?? 'PIPT';
+        notifyOnAllAlarms(this, importAlarmTopic(this, stackPrefix));
+    }
+
+    /**
+     * Storage and memory alarms. Storage autoscaling stops at maxAllocatedStorage,
+     * and memory pressure is the main risk if the instance class is reduced.
+     */
+    protected createAlarms(id: string): void {
+        new cloudwatch.Alarm(this, `${id}-FreeStorageSpaceAlarm`, {
+            alarmName: `${id}-RDS-LowFreeStorage`,
+            alarmDescription: 'RDS free storage below 10 GiB; storage autoscaling stops at maxAllocatedStorage',
+            metric: this.dbInstance.metricFreeStorageSpace({
+                statistic: 'Minimum',
+                period: Duration.minutes(5),
+            }),
+            threshold: 10 * 1024 ** 3,
+            evaluationPeriods: 1,
+            comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+            treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        });
+
+        new cloudwatch.Alarm(this, `${id}-FreeableMemoryAlarm`, {
+            alarmName: `${id}-RDS-LowFreeableMemory`,
+            alarmDescription: 'RDS freeable memory below 256 MiB for 15 minutes; the instance may be undersized',
+            metric: this.dbInstance.metricFreeableMemory({
+                statistic: 'Average',
+                period: Duration.minutes(5),
+            }),
+            threshold: 256 * 1024 ** 2,
+            evaluationPeriods: 3,
+            comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+            treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+        });
     }
 
 }

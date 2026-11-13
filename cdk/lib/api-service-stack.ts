@@ -40,9 +40,13 @@ import * as route53 from "aws-cdk-lib/aws-route53";
 import { LogProtection, logWebAclToCloudWatch } from "./log-protection";
 import { getImageTagSsmParam } from "./cicd-stack";
 import { approvedImageTag } from "./approved-image";
+import { importAlarmTopic, notifyOnAllAlarms } from "./monitoring-stack";
 
 /** Largest REST API request body the WAF lets through (matches the KB_64 inspection limit). */
 export const WAF_MAX_BODY_BYTES = 64 * 1024;
+
+/** Days a deleted or overwritten object stays recoverable in the versioned document and embedding buckets. */
+export const NONCURRENT_VERSION_RETENTION_DAYS = 30;
 
 /** WAF statement matching the request URI path (case-insensitive). */
 function wafUriPathIs(
@@ -179,6 +183,16 @@ export class ApiServiceStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
+    // Shared by the versioned document and embedding buckets: deleted or
+    // overwritten objects stay recoverable for this many days, then expire,
+    // and the delete markers left behind are cleaned up.
+    // https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-configuration-examples.html
+    const recoverableDeleteLifecycleRule: s3.LifecycleRule = {
+      id: "ExpireNoncurrentVersions",
+      noncurrentVersionExpiration: cdk.Duration.days(NONCURRENT_VERSION_RETENTION_DAYS),
+      expiredObjectDeleteMarker: true,
+    };
+
     const embeddingStorageBucket = new s3.Bucket(
       this,
       `${id}-embeddingStorageBucket`,
@@ -194,8 +208,12 @@ export class ApiServiceStack extends cdk.Stack {
             allowedOrigins,
           },
         ],
+        // Versioned so an accidental delete or overwrite can be undone for
+        // NONCURRENT_VERSION_RETENTION days (see recoverableDeleteLifecycleRule).
+        versioned: true,
         lifecycleRules: [
           { abortIncompleteMultipartUploadAfter: cdk.Duration.days(1) },
+          recoverableDeleteLifecycleRule,
         ],
         // When deleting the stack, need to empty the Bucket and delete it manually
         removalPolicy: cdk.RemovalPolicy.RETAIN,
@@ -1223,6 +1241,8 @@ export class ApiServiceStack extends cdk.Stack {
           "dynamodb:CreateTable",
           "dynamodb:DescribeTable",
           "dynamodb:UpdateTimeToLive",
+          "dynamodb:DescribeContinuousBackups",
+          "dynamodb:UpdateContinuousBackups",
         ],
         resources: [
           `arn:aws:dynamodb:${this.region}:${this.account}:table/${dynamoTableName}`,
@@ -1236,6 +1256,11 @@ export class ApiServiceStack extends cdk.Stack {
 
     new cdk.CustomResource(this, `${id}-EnsureConversationTableResource`, {
       serviceToken: ensureTableProvider.serviceToken,
+      // Point-in-time recovery (35-day restore window). Adding this property
+      // makes the next deploy send an Update, which enables PITR on the
+      // existing table; Create enables it on a new one.
+      // https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/PointInTimeRecovery.html
+      properties: { PointInTimeRecovery: "true" },
     });
 
     // Shared table — not owned by this stack (used across multiple stack prefixes)
@@ -2014,6 +2039,25 @@ export class ApiServiceStack extends cdk.Stack {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
 
+    // Chat turns (sync, via API Gateway) and debriefs (async) share the
+    // function's reserved concurrency. A throttled chat turn fails for the
+    // student; a throttled debrief is retried later. The FunctionName
+    // dimension covers $LATEST and the live alias together.
+    new cloudwatch.Alarm(this, `${id}-TextGenThrottleAlarm`, {
+      alarmName: `${id}-TextGen-Throttled`,
+      alarmDescription:
+        "Text generation Lambda was throttled: reserved concurrency is used up, so chat turns " +
+        "are failing. Usually many debriefs running at once at the end of a class.",
+      metric: textGenLambdaDockerFunc.metricThrottles({
+        statistic: "Sum",
+        period: Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
     // Create S3 Bucket to handle documents for each simulation group
     const dataIngestionBucket = new s3.Bucket(
       this,
@@ -2031,8 +2075,14 @@ export class ApiServiceStack extends cdk.Stack {
             allowedOrigins,
           },
         ],
+        // Versioned so a case document deleted by mistake can be restored for
+        // NONCURRENT_VERSION_RETENTION days. A delete still fires
+        // s3:ObjectRemoved:DeleteMarkerCreated, which the ingestion Lambda
+        // handles like any other removal (its embeddings are deleted).
+        versioned: true,
         lifecycleRules: [
           { abortIncompleteMultipartUploadAfter: cdk.Duration.days(1) },
+          recoverableDeleteLifecycleRule,
         ],
         // When deleting the stack, need to empty the Bucket and delete it manually
         removalPolicy: cdk.RemovalPolicy.RETAIN,
@@ -2366,6 +2416,36 @@ export class ApiServiceStack extends cdk.Stack {
         metricValue: "1",
       }
     );
+
+    // S3 invokes ingestion asynchronously. Lambda retries a failed event twice;
+    // one that still fails (an unhandled exception or a timeout) lands here
+    // instead of being dropped. Each message holds the original S3 event
+    // (bucket and object key), so the upload can be found and re-uploaded.
+    // https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-retain-records.html
+    const ingestionFailureQueue = new sqs.Queue(this, `${id}-IngestionFailureQueue`, {
+      queueName: `${id}-IngestionFailures`,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
+      retentionPeriod: Duration.days(14),
+    });
+    dataIngestLambdaDockerFunc.configureAsyncInvoke({
+      retryAttempts: 2,
+      onFailure: new lambdaDestinations.SqsDestination(ingestionFailureQueue),
+    });
+    new cloudwatch.Alarm(this, `${id}-IngestionFailureAlarm`, {
+      alarmName: `${id}-Ingestion-Failed`,
+      alarmDescription:
+        "A document upload or delete failed ingestion after Lambda's async retries — see the " +
+        "IngestionFailures queue for the S3 key. Re-upload the file after fixing the cause.",
+      metric: ingestionFailureQueue.metricApproximateNumberOfMessagesVisible({
+        statistic: "Maximum",
+        period: Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
 
     // Define the CloudWatch Alarm for Lambda timeout
     const timeoutAlarm = new cloudwatch.Alarm(
@@ -3190,5 +3270,8 @@ export class ApiServiceStack extends cdk.Stack {
       description: 'Secrets Manager ARN for Cognito credentials',
       exportName: `${id}-CognitoSecretArn`,
     });
+
+    // Last, so every alarm defined above notifies the alarm topic.
+    notifyOnAllAlarms(this, importAlarmTopic(this, stackPrefix));
   }
 }

@@ -9,7 +9,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [2026-11-12]
 
+### Added
+
+- `{StackPrefix}-Monitoring` stack (`cdk/lib/monitoring-stack.ts`): a KMS-encrypted SNS alarm topic (no subscriptions are created)
+- Every CloudWatch alarm in the Database, Api and EcsSocket stacks now notifies the alarm topic; until now no alarm had an action
+- New alarms: RDS free storage below 10 GiB, RDS freeable memory below 256 MiB, text-generation Lambda throttling, document-ingestion failures, and no healthy socket-server task behind the NLB
+- Document-ingestion events that still fail after Lambda's two async retries go to the `{StackPrefix}-Api-IngestionFailures` SQS queue instead of being dropped
+- Point-in-time recovery on the DynamoDB conversation table, enabled by the `EnsureConversationTable` custom resource on Create and Update
+- Versioning on the document (data ingestion) and embedding buckets; deleted or overwritten objects stay recoverable for 30 days
+- `DEPLOYMENT_GUIDE.md`: alarm and data-recovery sections
+
 ### Changed
+
+- RDS automated backups are kept when the instance is deleted (`deleteAutomatedBackups: false`)
 
 - Switched the primary chat and debrief LLM from Claude Sonnet 4.6 to Claude Sonnet 5.5 (`us.anthropic.claude-sonnet-5-5`), set by the `/{id}/BedrockLLMId` SSM parameter in `cdk/lib/api-service-stack.ts`
 - `get_bedrock_llm()` in `cdk/text_generation/src/helpers/chat.py` no longer sends `temperature`, which Sonnet 5.5 rejects

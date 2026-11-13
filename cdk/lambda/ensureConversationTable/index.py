@@ -28,36 +28,59 @@ TABLE_NAME = os.environ["TABLE_NAME"]
 #   Existing deploy: table already exists, Lambda returns success immediately.
 #   Fresh deploy: table is created with the correct schema before any Lambda needs it.
 #   CDK never owns the table lifecycle, so cdk destroy won't wipe chat history.
+#
+# Point-in-time recovery: when the resource property PointInTimeRecovery is "true",
+# Create and Update both enable it (an idempotent call), so existing tables get it on
+# the next deploy. Delete never touches the table. A rollback sends Update with the
+# old properties, which don't set the flag, so a rollback makes no change.
+
+
+def _wait_for_active():
+    for _ in range(30):
+        resp = dynamodb.describe_table(TableName=TABLE_NAME)
+        if resp["Table"]["TableStatus"] == "ACTIVE":
+            return
+        time.sleep(5)
+
+
+def _enable_point_in_time_recovery():
+    # https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_UpdateContinuousBackups.html
+    dynamodb.update_continuous_backups(
+        TableName=TABLE_NAME,
+        PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True},
+    )
 
 
 def handler(event, context):
     request_type = event.get("RequestType")
+    properties = event.get("ResourceProperties") or {}
+    want_pitr = str(properties.get("PointInTimeRecovery", "")).lower() == "true"
 
-    if request_type in ("Update", "Delete"):
+    if request_type == "Delete":
         return {"PhysicalResourceId": TABLE_NAME}
 
-    # Create — idempotent
-    try:
-        dynamodb.create_table(
-            TableName=TABLE_NAME,
-            KeySchema=[{"AttributeName": "SessionId", "KeyType": "HASH"}],
-            AttributeDefinitions=[{"AttributeName": "SessionId", "AttributeType": "S"}],
-            BillingMode="PAY_PER_REQUEST",
-        )
+    if request_type == "Create":
+        try:
+            dynamodb.create_table(
+                TableName=TABLE_NAME,
+                KeySchema=[{"AttributeName": "SessionId", "KeyType": "HASH"}],
+                AttributeDefinitions=[{"AttributeName": "SessionId", "AttributeType": "S"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
 
-        # Wait for ACTIVE before enabling TTL
-        for _ in range(30):
-            resp = dynamodb.describe_table(TableName=TABLE_NAME)
-            if resp["Table"]["TableStatus"] == "ACTIVE":
-                break
-            time.sleep(5)
+            # Wait for ACTIVE before enabling TTL
+            _wait_for_active()
 
-        dynamodb.update_time_to_live(
-            TableName=TABLE_NAME,
-            TimeToLiveSpecification={"Enabled": True, "AttributeName": "expireAt"},
-        )
+            dynamodb.update_time_to_live(
+                TableName=TABLE_NAME,
+                TimeToLiveSpecification={"Enabled": True, "AttributeName": "expireAt"},
+            )
 
-    except dynamodb.exceptions.ResourceInUseException:
-        pass  # Table already exists — nothing to do
+        except dynamodb.exceptions.ResourceInUseException:
+            pass  # Table already exists — nothing to do
+
+    if want_pitr:
+        _wait_for_active()
+        _enable_point_in_time_recovery()
 
     return {"PhysicalResourceId": TABLE_NAME}
