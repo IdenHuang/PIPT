@@ -15,6 +15,7 @@ const cognitoClient = new CognitoIdentityProviderClient();
 const DEFAULT_DEBRIEF_PROMPT = fs.readFileSync(path.join(__dirname, "defaultDebriefPrompt.txt"), "utf8").trim();
 const { seedPrompt } = require("./seedPrompt.js");
 const { generateAccessCode } = require("./accessCode.js");
+const { enrollInstructor } = require("./enrollInstructor.js");
 const DEFAULT_SYSTEM_PROMPT = fs.readFileSync(path.join(__dirname, "defaultSystemPrompt.txt"), "utf8").trim();
 
 // SQL conneciton from global variable at libadmin.js
@@ -214,71 +215,32 @@ exports.handler = async (event, context) => {
               break;
             }
 
-            // Retrieve user_id from users table based on the instructor email
-            const userResult = await sqlConnectionTableCreator`
-                  SELECT user_id
-                  FROM "users"
-                  WHERE user_email = ${instructor_email};
-                `;
-
-            const user_id = userResult[0]?.user_id;
-
-            if (!user_id) {
-              response.statusCode = 400;
-              response.body = JSON.stringify({
-                error: "Instructor email not found",
-              });
-              break;
-            }
-
-            // Insert enrollment into enrollments table with current timestamp for the 'instructor' role
-            const enrollment = await sqlConnectionTableCreator`
-                  INSERT INTO "enrollments" (enrollment_id, simulation_group_id, user_id, enrollment_type, time_enrolled)
-                  VALUES (uuid_generate_v4(), ${simulation_group_id}, ${user_id}, 'instructor', CURRENT_TIMESTAMP)
-                  ON CONFLICT (simulation_group_id, user_id) 
-                  DO UPDATE SET 
-                      enrollment_id = EXCLUDED.enrollment_id,
-                      enrollment_type = EXCLUDED.enrollment_type,
-                      time_enrolled = EXCLUDED.time_enrolled
-                  RETURNING enrollment_id;
-                `;
-
-            const enrollment_id = enrollment[0]?.enrollment_id;
-
-            if (enrollment_id) {
-              // Retrieve all persona IDs associated with the simulation group
-              const personasResult = await sqlConnectionTableCreator`
-                    SELECT persona_id
-                    FROM "personas"
-                    WHERE simulation_group_id = ${simulation_group_id};
-                  `;
-
-              // Insert a record into student_interactions for each persona in the simulation group
-              // ON CONFLICT handles the case where the user was previously enrolled (e.g. as student)
-              const studentInteractionInsertions = personasResult.map(
-                (persona) => {
-                  return sqlConnectionTableCreator`
-                      INSERT INTO "student_interactions" (student_interaction_id, persona_id, enrollment_id, persona_score, last_accessed, persona_context_embedding, is_completed)
-                      VALUES (uuid_generate_v4(), ${persona.persona_id}, ${enrollment_id}, 0, CURRENT_TIMESTAMP, NULL, FALSE)
-                      ON CONFLICT (persona_id, enrollment_id)
-                      DO UPDATE SET last_accessed = CURRENT_TIMESTAMP;
-                    `;
-                }
-              );
-
-              // Execute all insertions
-              await Promise.all(studentInteractionInsertions);
-            }
-
-            response.body = JSON.stringify({
-              message: "Instructor enrolled and patients linked successfully.",
+            // Role check, student-promotion guard and role_audit_log row all
+            // live in enrollInstructor (one transaction).
+            const result = await enrollInstructor(sqlConnectionTableCreator, {
+              actor,
+              simulationGroupId: simulation_group_id,
+              instructorEmail: instructor_email,
             });
-
-            // Optionally insert into User Engagement Log (uncomment if needed)
-            // await sqlConnectionTableCreator`
-            //   INSERT INTO "user_engagement_log" (log_id, user_id, simulation_group_id, patient_id, enrolment_id, timestamp, engagement_type)
-            //   VALUES (uuid_generate_v4(), ${user_id}, ${simulation_group_id}, null, ${enrolment_id}, CURRENT_TIMESTAMP, 'enrollment_created');
-            // `;
+            response.statusCode = result.statusCode;
+            response.body = JSON.stringify(result.body);
+            if (result.audit) {
+              logger.info("ROLE_CHANGE", {
+                action: "enroll_instructor",
+                actorEmail: actor.email,
+                targetEmail: result.audit.targetEmail,
+                simulationGroupId: simulation_group_id,
+                oldRoles: result.audit.roles,
+                newRoles: result.audit.roles,
+              });
+            } else {
+              logger.warn("enroll_instructor rejected", {
+                actorEmail: actor.email,
+                simulationGroupId: simulation_group_id,
+                statusCode: result.statusCode,
+                reason: result.body.error,
+              });
+            }
           } catch (err) {
             response.statusCode = 500;
             logger.error("Operation failed", { error: err.message, stack: err.stack });
@@ -387,7 +349,7 @@ exports.handler = async (event, context) => {
             let groups;
 
             if (instructorId) {
-              // Use user_id directly — skip email lookup
+              // Use user_id directly â€” skip email lookup
               groups = await sqlConnectionTableCreator`
                 SELECT g.simulation_group_id, g.group_name, g.group_description
                 FROM "enrollments" e
@@ -599,7 +561,7 @@ exports.handler = async (event, context) => {
 
                   logger.info("S3 cleanup completed", { bucket, simulation_group_id, totalDeleted });
                 } catch (s3Err) {
-                  // Log but don't fail the delete — DB cleanup is more critical
+                  // Log but don't fail the delete â€” DB cleanup is more critical
                   logger.error("S3 cleanup failed", { error: s3Err.message, bucket, simulation_group_id });
                 }
               }
@@ -1213,7 +1175,7 @@ exports.handler = async (event, context) => {
           response.body = JSON.stringify({ error: "Internal server error" });
         }
         break;
-      // ── Organization CRUD ──────────────────────────────────────────────
+      // â”€â”€ Organization CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       case "GET /admin/organizations":
         try {
           const orgs = await sqlConnectionTableCreator`
@@ -1349,7 +1311,7 @@ exports.handler = async (event, context) => {
           response.body = JSON.stringify({ error: "organization_id is required" });
         }
         break;
-      // ── Organization Thresholds ────────────────────────────────────────
+      // â”€â”€ Organization Thresholds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       case "GET /admin/organization_thresholds":
         if (
           event.queryStringParameters != null &&
@@ -1447,7 +1409,7 @@ exports.handler = async (event, context) => {
           response.body = JSON.stringify({ error: "organization_id is required" });
         }
         break;
-      // ── Question Bank CRUD ─────────────────────────────────────────────
+      // â”€â”€ Question Bank CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       case "GET /admin/question_bank":
         if (
           event.queryStringParameters != null &&
@@ -1612,7 +1574,7 @@ exports.handler = async (event, context) => {
           response.body = JSON.stringify({ error: "question_id and organization_id are required" });
         }
         break;
-      // ── Message Limit ────────────────────────────────────────────────
+      // â”€â”€ Message Limit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       case "POST /admin/update_group_message_limit":
         if (
           event.queryStringParameters != null &&
@@ -1667,7 +1629,7 @@ exports.handler = async (event, context) => {
           response.body = JSON.stringify({ error: "simulation_group_id and request body are required" });
         }
         break;
-      // ── Issue Reports & Debrief Feedback ─────────────────────────────
+      // â”€â”€ Issue Reports & Debrief Feedback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       case "GET /admin/issue_reports":
         if (
           event.queryStringParameters != null &&
@@ -1808,7 +1770,7 @@ exports.handler = async (event, context) => {
           response.body = JSON.stringify({ error: "feedback_id is required" });
         }
         break;
-      // ── DTP Bank CRUD ──────────────────────────────────────────────────
+      // â”€â”€ DTP Bank CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       case "GET /admin/dtp_bank":
         if (
           event.queryStringParameters != null &&
@@ -1966,7 +1928,7 @@ exports.handler = async (event, context) => {
           response.body = JSON.stringify({ error: "dtp_id and organization_id are required" });
         }
         break;
-      // ── Recommendations Bank CRUD ─────────────────────────────────────────
+      // â”€â”€ Recommendations Bank CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
       case "GET /admin/recommendations_bank":
         if (
           event.queryStringParameters != null &&
