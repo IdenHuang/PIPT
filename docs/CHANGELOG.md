@@ -11,26 +11,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
-- `{StackPrefix}-Monitoring` stack (`cdk/lib/monitoring-stack.ts`): a KMS-encrypted SNS alarm topic (no subscriptions are created)
-- Every CloudWatch alarm in the Database, Api and EcsSocket stacks now notifies the alarm topic; until now no alarm had an action
-- New alarms: RDS free storage below 10 GiB, RDS freeable memory below 256 MiB, text-generation Lambda throttling, document-ingestion failures, and no healthy socket-server task behind the NLB
-- Document-ingestion events that still fail after Lambda's two async retries go to the `{StackPrefix}-Api-IngestionFailures` SQS queue instead of being dropped
-- Point-in-time recovery on the DynamoDB conversation table, enabled by the `EnsureConversationTable` custom resource on Create and Update
-- Versioning on the document (data ingestion) and embedding buckets; deleted or overwritten objects stay recoverable for 30 days
-- `DEPLOYMENT_GUIDE.md`: alarm and data-recovery sections
+- **Monitoring and recovery:** an encrypted SNS alarm topic (`{StackPrefix}-Monitoring` stack) that every alarm publishes to, new alarms for RDS storage and memory, text-generation throttling, ingestion failures and socket-server health, failure queues for document ingestion and debrief runs, DynamoDB point-in-time recovery, versioning on the document and embedding buckets, and RDS backups kept if the instance is deleted
+- **Audit logging:** structured `AUDIT` and `AUTHZ_DENY` log lines in the Lambda handlers, an authorization-denial spike alarm, a role-change audit table (migration `004_role_audit_log`), API Gateway access logs, WAF request logs, S3 and CloudFront access logs, and an optional CloudTrail stack (`-c EnableCloudTrail=true`)
+- **Log protection:** CloudWatch log groups are encrypted with a customer-managed KMS key and have a finite retention (`-c LogRetentionDays`, default 365)
+- **Image delivery pipeline:** images use immutable tags and must pass a CRITICAL/HIGH vulnerability scan before release. They are deployed by digest, with an approved-tag pointer in SSM and a rollback command printed for each deploy
+- **Security headers and CSP** for the Amplify frontend (Report-Only by default, `-c CspEnforce=true` to enforce)
+- **Admin bootstrap Lambda** for promoting the first administrator
+- Test suites covering authorization, socket sessions, streaming, debriefs and text generation (Jest and pytest)
 
 ### Changed
 
-- RDS automated backups are kept when the instance is deleted (`deleteAutomatedBackups: false`)
+- Switched the chat and debrief LLM from Claude Sonnet 4.6 to Claude Sonnet 5.5, including IAM permissions, alarms and request settings (no `temperature`; per-call `effort`, `high` for debriefs)
+- Debrief generation runs asynchronously, at most one run per chat (claimed in DynamoDB), with automatic retries and recovery of lost runs. A debrief is only produced for a concluded chat
+- Concluded sessions are final: no further messages, and each chat allows only one initial prompt
+- The voice agent takes its prompt and patient context only from the server, never from the client
+- Faster chat streaming: removed 5-second stalls in streamed replies, and live chat keeps working during deploys
+- Dependency updates across the frontend, CDK and Python services, and Docker base images patched to clear image-scan findings
 
-- Switched the primary chat and debrief LLM from Claude Sonnet 4.6 to Claude Sonnet 5.5 (`us.anthropic.claude-sonnet-5-5`), set by the `/{id}/BedrockLLMId` SSM parameter in `cdk/lib/api-service-stack.ts`
-- `get_bedrock_llm()` in `cdk/text_generation/src/helpers/chat.py` no longer sends `temperature`, which Sonnet 5.5 rejects
-- `get_bedrock_llm()` now sends `thinking: {"type": "between_tools"}` so Sonnet 5.5 answers without up-front thinking and returns plain-text responses, matching Sonnet 4.6 behavior
-- `get_bedrock_llm()` now takes an `effort` argument (`low`, `medium` or `high`, default `medium`); debrief and test-debrief generation in `cdk/text_generation/src/main.py` use `high`
-- Bedrock IAM permissions in the Api and EcsSocket stacks now allow the Sonnet 5.5 inference profile and foundation model instead of Sonnet 4.6
-- Bedrock invocation and input-token spike alarms now track the Sonnet 5.5 model ID
-- Updated model references in `README.md`, `DEPLOYMENT_GUIDE.md`, `ARCHITECTURE_DEEP_DIVE.md` and `MODIFICATION_GUIDE.md`
-- `MODIFICATION_GUIDE.md` now lists the IAM, alarm and request-setting updates needed when changing the LLM
+### Security
+
+- **Authorization:** every student, instructor and admin route checks organization, group, patient and session ownership on the server. Object-level checks cover files, profile pictures, question banks and streams. Preview enrollment is limited to staff, and scores supplied by the client or the model are no longer trusted
+- **Authentication:** hardened JWT authorizers. The socket server verifies tokens with `aws-jwt-verify`, rate-limits reauthentication and JWKS fetches, and closes sockets when their ID token expires. The Cognito identity pool role has no permissions
+- **Stream and socket hardening:** stream callbacks are bound to a per-request nonce and an SSM-configured URL, `/stream-callback` is blocked at CloudFront, the NLB accepts only CloudFront and in-VPC traffic, socket events are validated, and voice-preview limits are per user
+- **AI safety:** the voice agent and chat refuse to run when the Bedrock guardrail is missing or unavailable, AI audio is gated on the guardrail verdict, every turn is screened before grading, answer keys are kept out of student chat, and chat text is redacted from guardrail logs
+- **Least-privilege IAM:** IAM roles are scoped to specific resources (Secrets Manager, Bedrock models, ECR repositories, CodeBuild, Cognito triggers and the socket redeploy). Broad managed policies such as `AmazonS3FullAccess` were removed. Database access uses separate `app_rw` and `app_tc` users instead of the master credential, with rotated credentials and a privilege-regression alarm
+- **Data protection:** the Cognito user pool and database are retained and deletion-protected, tokens and secrets are redacted from logs, group access codes use a cryptographically secure random generator, presigned uploads are bound to the persona's group, and CORS allows only exact origins
+- **WAF:** path-scoped XSS and body-size rules replace the blanket managed rules that blocked legitimate clinical content
+
+### Fixed
+
+- Debriefs: stale instructor recommendation caches, errors reported as successes, and stuck or duplicate runs
+- Text generation: message caps resolved from the chat's group, wildcard CORS origins, playground turns no longer written to the database, matching on the stored message text, and canonical session IDs
+- Ingestion: URL-encoded S3 keys, chunk source IDs, and a timeout sweep scoped to stuck rows
+- Voice: reconnecting after a timeout, a microphone stuck on "connecting", and the mute icon after a session ends
+- Admin promotion and Cognito/database role mismatches; the global system prompt is scoped to the null organization
 
 ## [2026-05-30]
 
