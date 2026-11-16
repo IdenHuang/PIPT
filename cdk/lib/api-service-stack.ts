@@ -40,9 +40,13 @@ import * as route53 from "aws-cdk-lib/aws-route53";
 import { LogProtection, logWebAclToCloudWatch } from "./log-protection";
 import { getImageTagSsmParam } from "./cicd-stack";
 import { approvedImageTag } from "./approved-image";
+import { importAlarmTopic, notifyOnAllAlarms } from "./monitoring-stack";
 
 /** Largest REST API request body the WAF lets through (matches the KB_64 inspection limit). */
 export const WAF_MAX_BODY_BYTES = 64 * 1024;
+
+/** Days a deleted or overwritten object stays recoverable in the versioned document and embedding buckets. */
+export const NONCURRENT_VERSION_RETENTION_DAYS = 30;
 
 /** WAF statement matching the request URI path (case-insensitive). */
 function wafUriPathIs(
@@ -76,6 +80,11 @@ export class ApiServiceStack extends cdk.Stack {
   public readonly apiGW_basedURL: string;
   public readonly secret: secretsmanager.ISecret;
   public readonly streamCallbackSecret: secretsmanager.ISecret;
+  /**
+   * Attached only to the text-gen Lambda. The socket NLB admits /stream-callback
+   * traffic from this group alone, not from every API Lambda or the whole VPC.
+   */
+  public readonly textGenLambdaSg: ec2.SecurityGroup;
   public readonly appSyncApi: appsync.GraphqlApi;
   public getEndpointUrl = () => this.api.url;
   public getUserPoolId = () => this.userPool.userPoolId;
@@ -179,6 +188,16 @@ export class ApiServiceStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
+    // Shared by the versioned document and embedding buckets: deleted or
+    // overwritten objects stay recoverable for this many days, then expire,
+    // and the delete markers left behind are cleaned up.
+    // https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-configuration-examples.html
+    const recoverableDeleteLifecycleRule: s3.LifecycleRule = {
+      id: "ExpireNoncurrentVersions",
+      noncurrentVersionExpiration: cdk.Duration.days(NONCURRENT_VERSION_RETENTION_DAYS),
+      expiredObjectDeleteMarker: true,
+    };
+
     const embeddingStorageBucket = new s3.Bucket(
       this,
       `${id}-embeddingStorageBucket`,
@@ -194,8 +213,12 @@ export class ApiServiceStack extends cdk.Stack {
             allowedOrigins,
           },
         ],
+        // Versioned so an accidental delete or overwrite can be undone for
+        // NONCURRENT_VERSION_RETENTION days (see recoverableDeleteLifecycleRule).
+        versioned: true,
         lifecycleRules: [
           { abortIncompleteMultipartUploadAfter: cdk.Duration.days(1) },
+          recoverableDeleteLifecycleRule,
         ],
         // When deleting the stack, need to empty the Bucket and delete it manually
         removalPolicy: cdk.RemovalPolicy.RETAIN,
@@ -747,6 +770,14 @@ export class ApiServiceStack extends cdk.Stack {
       "Allow API Lambda functions to access RDS Proxy"
     );
 
+    // Identifies the text-gen Lambda to the socket NLB (see textGenLambdaSg).
+    // It carries no ingress rules; database access still comes from apiLambdaSg.
+    this.textGenLambdaSg = new ec2.SecurityGroup(this, `${id}-textGenLambdaSg`, {
+      vpc: vpcStack.vpc,
+      description: "Text-gen Lambda; the only source allowed to reach the socket NLB from the VPC",
+      allowAllOutbound: true,
+    });
+
     const lambdaStudentFunction = new lambda.Function(
       this,
       `${id}-studentFunction`,
@@ -1223,6 +1254,8 @@ export class ApiServiceStack extends cdk.Stack {
           "dynamodb:CreateTable",
           "dynamodb:DescribeTable",
           "dynamodb:UpdateTimeToLive",
+          "dynamodb:DescribeContinuousBackups",
+          "dynamodb:UpdateContinuousBackups",
         ],
         resources: [
           `arn:aws:dynamodb:${this.region}:${this.account}:table/${dynamoTableName}`,
@@ -1236,6 +1269,11 @@ export class ApiServiceStack extends cdk.Stack {
 
     new cdk.CustomResource(this, `${id}-EnsureConversationTableResource`, {
       serviceToken: ensureTableProvider.serviceToken,
+      // Point-in-time recovery (35-day restore window). Adding this property
+      // makes the next deploy send an Update, which enables PITR on the
+      // existing table; Create enables it on a new one.
+      // https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/PointInTimeRecovery.html
+      properties: { PointInTimeRecovery: "true" },
     });
 
     // Shared table — not owned by this stack (used across multiple stack prefixes)
@@ -1299,7 +1337,7 @@ export class ApiServiceStack extends cdk.Stack {
       metric: new cloudwatch.Metric({
         namespace: "AWS/Bedrock",
         metricName: "InvocationCount",
-        dimensionsMap: { ModelId: "us.anthropic.claude-sonnet-4-6" },
+        dimensionsMap: { ModelId: "us.anthropic.claude-sonnet-5-5" },
         statistic: "Sum",
         period: cdk.Duration.minutes(5),
       }),
@@ -1315,7 +1353,7 @@ export class ApiServiceStack extends cdk.Stack {
       metric: new cloudwatch.Metric({
         namespace: "AWS/Bedrock",
         metricName: "InputTokenCount",
-        dimensionsMap: { ModelId: "us.anthropic.claude-sonnet-4-6" },
+        dimensionsMap: { ModelId: "us.anthropic.claude-sonnet-5-5" },
         statistic: "Sum",
         period: cdk.Duration.hours(1),
       }),
@@ -1332,7 +1370,7 @@ export class ApiServiceStack extends cdk.Stack {
       {
         parameterName: `/${id}/BedrockLLMId`,
         description: "Parameter containing the Bedrock LLM ID",
-        stringValue: "us.anthropic.claude-sonnet-4-6",
+        stringValue: "us.anthropic.claude-sonnet-5-5",
       }
     );
 
@@ -1845,7 +1883,7 @@ export class ApiServiceStack extends cdk.Stack {
         timeout: cdk.Duration.seconds(300),
         reservedConcurrentExecutions: 25,
         vpc: vpcStack.vpc, // Pass the VPC
-        securityGroups: [apiLambdaSg],
+        securityGroups: [apiLambdaSg, this.textGenLambdaSg],
         functionName: `${id}-TextGenLambdaDockerFunction`,
         environment: {
           // Least-privilege app_rw user (DML only), not the RDS master credential.
@@ -1906,9 +1944,9 @@ export class ApiServiceStack extends cdk.Stack {
         "bedrock:ApplyGuardrail", // Required for guardrails
       ],
       resources: [
-        // Claude Sonnet 4.6 — US cross-region inference profile
-        "arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-4-6",
-        "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6",
+        // Claude Sonnet 5.5 — US cross-region inference profile
+        "arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-5-5",
+        "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5-5",
         "arn:aws:bedrock:" +
           this.region +
           "::foundation-model/amazon.titan-embed-text-v2:0",
@@ -2014,6 +2052,25 @@ export class ApiServiceStack extends cdk.Stack {
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
 
+    // Chat turns (sync, via API Gateway) and debriefs (async) share the
+    // function's reserved concurrency. A throttled chat turn fails for the
+    // student; a throttled debrief is retried later. The FunctionName
+    // dimension covers $LATEST and the live alias together.
+    new cloudwatch.Alarm(this, `${id}-TextGenThrottleAlarm`, {
+      alarmName: `${id}-TextGen-Throttled`,
+      alarmDescription:
+        "Text generation Lambda was throttled: reserved concurrency is used up, so chat turns " +
+        "are failing. Usually many debriefs running at once at the end of a class.",
+      metric: textGenLambdaDockerFunc.metricThrottles({
+        statistic: "Sum",
+        period: Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+
     // Create S3 Bucket to handle documents for each simulation group
     const dataIngestionBucket = new s3.Bucket(
       this,
@@ -2031,8 +2088,14 @@ export class ApiServiceStack extends cdk.Stack {
             allowedOrigins,
           },
         ],
+        // Versioned so a case document deleted by mistake can be restored for
+        // NONCURRENT_VERSION_RETENTION days. A delete still fires
+        // s3:ObjectRemoved:DeleteMarkerCreated, which the ingestion Lambda
+        // handles like any other removal (its embeddings are deleted).
+        versioned: true,
         lifecycleRules: [
           { abortIncompleteMultipartUploadAfter: cdk.Duration.days(1) },
+          recoverableDeleteLifecycleRule,
         ],
         // When deleting the stack, need to empty the Bucket and delete it manually
         removalPolicy: cdk.RemovalPolicy.RETAIN,
@@ -2366,6 +2429,36 @@ export class ApiServiceStack extends cdk.Stack {
         metricValue: "1",
       }
     );
+
+    // S3 invokes ingestion asynchronously. Lambda retries a failed event twice;
+    // one that still fails (an unhandled exception or a timeout) lands here
+    // instead of being dropped. Each message holds the original S3 event
+    // (bucket and object key), so the upload can be found and re-uploaded.
+    // https://docs.aws.amazon.com/lambda/latest/dg/invocation-async-retain-records.html
+    const ingestionFailureQueue = new sqs.Queue(this, `${id}-IngestionFailureQueue`, {
+      queueName: `${id}-IngestionFailures`,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      enforceSSL: true,
+      retentionPeriod: Duration.days(14),
+    });
+    dataIngestLambdaDockerFunc.configureAsyncInvoke({
+      retryAttempts: 2,
+      onFailure: new lambdaDestinations.SqsDestination(ingestionFailureQueue),
+    });
+    new cloudwatch.Alarm(this, `${id}-IngestionFailureAlarm`, {
+      alarmName: `${id}-Ingestion-Failed`,
+      alarmDescription:
+        "A document upload or delete failed ingestion after Lambda's async retries — see the " +
+        "IngestionFailures queue for the S3 key. Re-upload the file after fixing the cause.",
+      metric: ingestionFailureQueue.metricApproximateNumberOfMessagesVisible({
+        statistic: "Maximum",
+        period: Duration.minutes(5),
+      }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
 
     // Define the CloudWatch Alarm for Lambda timeout
     const timeoutAlarm = new cloudwatch.Alarm(
@@ -2890,7 +2983,11 @@ export class ApiServiceStack extends cdk.Stack {
         logGroup: fn.logGroup,
         metricNamespace: authzDenialMetricNamespace,
         metricName: authzDenialMetricName,
-        filterPattern: logs.FilterPattern.stringValue("$.message", "=", "AUTHZ_DENY"),
+        // Text pattern, not a JSON one: with the default text log format the
+        // runtime prefixes each line with timestamp, request ID and level, so
+        // the event is not a JSON document and `$.message` can never match.
+        // https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/FilterAndPatternSyntax.html
+        filterPattern: logs.FilterPattern.literal('"AUTHZ_DENY"'),
         metricValue: "1",
         defaultValue: 0,
       });
@@ -3190,5 +3287,8 @@ export class ApiServiceStack extends cdk.Stack {
       description: 'Secrets Manager ARN for Cognito credentials',
       exportName: `${id}-CognitoSecretArn`,
     });
+
+    // Last, so every alarm defined above notifies the alarm topic.
+    notifyOnAllAlarms(this, importAlarmTopic(this, stackPrefix));
   }
 }

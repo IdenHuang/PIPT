@@ -178,8 +178,12 @@ describe('server.js wiring', () => {
   });
 
   test('text-generation registers with a nonce, sends it to the Lambda, and releases by nonce', () => {
-    const start = server.indexOf('socket.on("text-generation"');
-    const block = server.slice(start, server.indexOf('socket.on(', start + 1));
+    // Registered through the `on(...)` wrapper in server.js; the block runs to
+    // the next registration.
+    const start = server.indexOf('\n  on("text-generation"');
+    expect(start).toBeGreaterThan(-1);
+    const next = server.slice(start + 1).search(/\n  (socket\.)?on\(/);
+    const block = server.slice(start, next === -1 ? undefined : start + 1 + next);
     expect(block).toMatch(/const streamNonce = textStreamSockets\.register\(sessionId, socket,/);
     expect(block).toMatch(/"X-Stream-Nonce": streamNonce/);
     expect(block).toMatch(/if \(!deferRelease\) textStreamSockets\.release\(sessionId, streamNonce\)/);

@@ -605,6 +605,11 @@ Create an AI response message for a session (used internally after text generati
 }
 ```
 
+**Errors:**
+
+- `403 Forbidden`: the session is not the caller's, or does not belong to `patient_id` and `simulation_group_id`; or the group's `max_messages_per_chat` limit for AI messages is reached
+- `409 Conflict`: the session is concluded and its transcript is read-only
+
 **Example (cURL):**
 
 ```bash
@@ -669,6 +674,12 @@ Delete the last message exchange (student + AI pair) in a session.
 - `session_id` (string, required): ID of the session
 
 **Response:** `200 OK`
+
+**Errors:**
+
+- `403 Forbidden`: the session is not the caller's (admins bypass)
+- `404 Not Found`: the session does not exist
+- `409 Conflict`: the session is concluded and its transcript is read-only (applies to admins too)
 
 **Example (cURL):**
 

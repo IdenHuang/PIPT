@@ -170,6 +170,13 @@ def lambda_handler(event, context):
             'body': json.dumps('Invalid simulation_group_id or patient_id')
         }
 
+    # is_uuid accepts any letter case and Postgres compares UUIDs case-insensitively,
+    # but S3 keys and the pgvector collection name are case-sensitive. Use the
+    # lower-case form so every key lands under the prefix the other paths list
+    # and delete (security finding f-5babf2f8).
+    simulation_group_id = str(uuid.UUID(simulation_group_id))
+    persona_id = str(uuid.UUID(persona_id))
+
     # Validate file_name to prevent path traversal and special character issues
     if not SAFE_FILENAME.match(file_name):
         return {

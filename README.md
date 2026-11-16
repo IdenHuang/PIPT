@@ -87,7 +87,7 @@ For a detailed breakdown of each component, data flows, and the full database sc
 ### Backend
 
 - AWS Lambda (Node.js 22 and Python 3.12) for serverless compute
-- Amazon Bedrock with Claude Sonnet 4.6 (Anthropic) for LLM inference
+- Amazon Bedrock with Claude Sonnet 5.5 (Anthropic) for LLM inference
 - Cohere Embed v4 via Amazon Bedrock for vector embeddings
 - LangChain for AI orchestration (chat, debriefs, question matching)
 - PostgreSQL 16 (Amazon RDS) with pgvector for relational and vector data storage
@@ -131,4 +131,4 @@ Licenses of libraries and tools used by the system are listed below:
 
 [Anthropic Acceptable Use Policy](https://www.anthropic.com/legal/aup) -  For Cohere Embed English v3, accessed via Amazon Bedrock for vector embeddings.
 
-[Cohere terms of use](https://cohere.com/terms-of-use) - For Claude Haiku 4.5 and Claude Sonnet 4.6, accessed via Amazon Bedrock for text generation.
+[Cohere terms of use](https://cohere.com/terms-of-use) - For Claude Haiku 4.5 and Claude Sonnet 5.5, accessed via Amazon Bedrock for text generation.

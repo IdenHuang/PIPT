@@ -79,7 +79,7 @@ The application deploys to **`ca-central-1`** but makes cross-region calls to `u
 
 | Model | Region | Purpose |
 |-------|--------|---------|
-| **Anthropic Claude Sonnet 4.6** (`us.anthropic.claude-sonnet-4-6`) | `us-east-1` | Primary LLM for text generation |
+| **Anthropic Claude Sonnet 5.5** (`us.anthropic.claude-sonnet-5-5`) | `us-east-1` | Primary LLM for text generation |
 | **Cohere Embed v4** (`cohere.embed-v4:0`) | `us-east-1` | Document and query embeddings |
 | **Amazon Nova Sonic 2.0** (`amazon.nova-2-sonic-v1:0`) | `us-east-1` | Voice interactions (via AgentCore) |
 
@@ -612,6 +612,7 @@ cdk deploy --all \
 
 The CDK app creates the following stacks in dependency order:
 
+0. **`{StackPrefix}-Monitoring`** : SNS alarm topic (KMS-encrypted). Database, Api and EcsSocket depend on it
 1. **`{StackPrefix}-CICD`** : ECR repositories, CodeBuild projects, CodePipeline
 2. **`{StackPrefix}-VpcStack`** : VPC, subnets, NAT gateway, VPC endpoints
 3. **`{StackPrefix}-Database`** : RDS PostgreSQL instance, RDS Proxy, secrets
@@ -623,6 +624,28 @@ The CDK app creates the following stacks in dependency order:
 9. **`{StackPrefix}-Amplify`** : Amplify hosting for the React frontend
 
 > **Note:** `--all` handles the dependency order automatically. Deployment takes approximately 30–45 minutes on first run.
+
+### Alarms
+
+Every CloudWatch alarm in the Database, Api and EcsSocket stacks publishes to the `{StackPrefix}-Alarms` SNS topic in the Monitoring stack. Each stack attaches its alarms in one call at the end of its constructor (`notifyOnAllAlarms` in `cdk/lib/monitoring-stack.ts`), so a new alarm is covered automatically.
+
+The stack creates no subscriptions on the topic. Alarm states are visible in the CloudWatch console either way; to have notifications delivered, subscribe to the topic in the SNS console or connect it to AWS Chatbot.
+
+| Alarm | Stack | Fires when |
+|---|---|---|
+| `{StackPrefix}-Database-RDS-LowFreeStorage` | Database | Free storage < 10 GiB |
+| `{StackPrefix}-Database-RDS-LowFreeableMemory` | Database | Freeable memory < 256 MiB for 15 min |
+| `{StackPrefix}-Api-TextGen-Throttled` | Api | Any text-generation throttle in 5 min (chat turns are failing) |
+| `{StackPrefix}-Api-Ingestion-Failed` | Api | A document event failed after Lambda's async retries; the S3 key is in the `{StackPrefix}-Api-IngestionFailures` queue |
+| `{StackPrefix}-Api-Debrief-GenerationFailed` | Api | A debrief run failed after retries; see `{StackPrefix}-Api-DebriefFailures` |
+| `{StackPrefix}-EcsSocket-Socket-NoHealthyTask` | EcsSocket | No healthy socket task behind the NLB for 3 min (text chat and voice are down) |
+| DynamoDB, Bedrock, CloudFront, authorization-denial, read/write privilege and ingestion-timeout alarms | Api | As described in each alarm's description |
+
+### Data recovery settings
+
+- **RDS:** 7-day automated backups. They are kept if the instance is deleted (`deleteAutomatedBackups: false`), so a point-in-time restore is still possible until they expire.
+- **DynamoDB conversation table:** point-in-time recovery (35-day window), enabled by the `EnsureConversationTable` custom resource on Create and Update.
+- **Document and embedding buckets:** versioned. A deleted or overwritten object can be restored for 30 days (`NONCURRENT_VERSION_RETENTION_DAYS` in `api-service-stack.ts`), after which the old version expires. To restore one, find the version to bring back with `aws s3api list-object-versions --bucket <bucket> --prefix <key>`, then copy it over the current key: `aws s3api copy-object --bucket <bucket> --key <key> --copy-source "<bucket>/<key>?versionId=<version-id>"`. The copy fires `s3:ObjectCreated:Copy`, so a case document is re-ingested and its embeddings are rebuilt. (Deleting the delete marker instead also brings the file back, but fires no create event, so the document would not be re-ingested.) Versioning can be suspended later, but not removed from a bucket.
 
 ### VPC Configuration
 
@@ -1313,7 +1336,7 @@ aws secretsmanager create-secret \
 
 ### Text generation or embeddings not working
 
-**Cause:** Claude Sonnet 4.6 and Cohere Embed v4 are called in `us-east-1` via cross-region inference, but the models may not be accessible there.
+**Cause:** Claude Sonnet 5.5 and Cohere Embed v4 are called in `us-east-1` via cross-region inference, but the models may not be accessible there.
 
 **Fix:**
 

@@ -205,6 +205,8 @@ export class VpcStack extends Stack {
         ],
       });
 
+      this.exportValue(this.vpc.vpcCidrBlock);
+
       this.vpc.addFlowLog(`${id}-vpcFlowLog`);
 
       // Populate private subnet CIDRs for downstream security-group rules (e.g., DatabaseStack)

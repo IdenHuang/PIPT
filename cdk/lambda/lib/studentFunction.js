@@ -882,13 +882,58 @@ exports.handler = async (event, context) => {
           }
 
           try {
-            // Authorization: verify session ownership (admins bypass)
+            // Authorization: the chat must be the caller's own AND belong to the
+            // supplied persona and group, since both are written below (admins
+            // bypass). Security finding f-ce3bad91.
             const isAdminUserAi = await isAdmin(sqlConnection, userEmailAttribute);
             if (!isAdminUserAi) {
-              const ownership = await verifySessionOwnership(sqlConnection, sessionId, userEmailAttribute);
-              if (!ownership.authorized) {
+              const aiScope = await verifySessionScope(
+                sqlConnection, sessionId, patientId, simulationGroupId, userEmailAttribute
+              );
+              if (!aiScope.authorized) {
                 response.statusCode = 403;
                 response.body = JSON.stringify({ error: "Forbidden" });
+                break;
+              }
+            }
+
+            // Same group/status lookup as create_message: resolve the group from
+            // the chat itself and fail closed if it cannot be resolved.
+            const aiGroupSettings = await sqlConnection`
+              SELECT sg.max_messages_per_chat, c.status AS chat_status
+              FROM "chats" c
+              JOIN "student_interactions" si ON si.student_interaction_id = c.student_interaction_id
+              JOIN "enrollments" e ON e.enrollment_id = si.enrollment_id
+              JOIN "simulation_groups" sg ON sg.simulation_group_id = e.simulation_group_id
+              WHERE c.chat_id = ${sessionId};
+            `;
+            if (aiGroupSettings.length === 0) {
+              response.statusCode = 403;
+              response.body = JSON.stringify({ error: "Forbidden" });
+              break;
+            }
+            // A concluded chat is read-only: its transcript is the graded record
+            // instructors review, so no turns may be appended.
+            if (aiGroupSettings[0].chat_status === 'concluded') {
+              response.statusCode = 409;
+              response.body = JSON.stringify({ error: "Session already concluded." });
+              break;
+            }
+            // Cap AI turns at the group's per-chat limit (NULL = unlimited), so
+            // this route cannot grow a transcript past what create_message allows.
+            const maxAiMessages = aiGroupSettings[0].max_messages_per_chat;
+            if (maxAiMessages != null) {
+              const aiMessageCount = await sqlConnection`
+                SELECT COUNT(*)::int AS count FROM "messages"
+                WHERE chat_id = ${sessionId} AND sender_type = 'ai';
+              `;
+              if (aiMessageCount[0].count >= maxAiMessages) {
+                response.statusCode = 403;
+                response.body = JSON.stringify({
+                  error: "Message limit reached",
+                  message: `This conversation has reached the maximum of ${maxAiMessages} messages.`,
+                  max_messages: maxAiMessages,
+                });
                 break;
               }
             }
@@ -1510,9 +1555,12 @@ exports.handler = async (event, context) => {
 
             // 3a) Fetch student's own submissions + status from chats table
             const chatRow = await sqlConnection`
-              SELECT dtp_submission, recommendation_submission, status
-              FROM "chats"
-              WHERE chat_id = ${sessionId}
+              SELECT c.dtp_submission, c.recommendation_submission, c.status,
+                EXISTS (
+                  SELECT 1 FROM "messages" m WHERE m.chat_id = c.chat_id
+                ) AS has_messages
+              FROM "chats" c
+              WHERE c.chat_id = ${sessionId}
               LIMIT 1;
             `;
             const rawDtp = chatRow[0]?.dtp_submission ?? null;
@@ -1536,6 +1584,22 @@ exports.handler = async (event, context) => {
               response.statusCode = 200;
               response.body = JSON.stringify({
                 status: "not_concluded",
+                generated_text: null,
+                dtp_submission: dtpSubmission,
+                recommendation_submission: recommendationSubmission,
+              });
+              break;
+            }
+
+            // A concluded chat with no messages can never get a debrief: the
+            // grader returns "No chat transcript found" without saving a row.
+            // Return a terminal status instead of sleeping ~19s in the retry
+            // loop and requesting recovery on every poll (security finding
+            // f-7ad37f17).
+            if (!chatRow[0]?.has_messages) {
+              response.statusCode = 200;
+              response.body = JSON.stringify({
+                status: "no_transcript",
                 generated_text: null,
                 dtp_submission: dtpSubmission,
                 recommendation_submission: recommendationSubmission,
@@ -2149,6 +2213,6 @@ exports.handler = async (event, context) => {
     response.body = JSON.stringify(error.message);
   }
   logger.logResponse(response);
-
+  logger.audit(event, { actorId: cognito_id, statusCode: response.statusCode });
   return response;
 };

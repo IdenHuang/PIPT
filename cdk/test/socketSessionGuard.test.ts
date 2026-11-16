@@ -73,11 +73,13 @@ describe('server.js wiring', () => {
   const socketDir = path.join(__dirname, '..', 'socket-server');
   const server = fs.readFileSync(path.join(socketDir, 'server.js'), 'utf8');
 
+  // Socket events are registered through the `on(...)` wrapper in server.js
+  // (it checks token expiry first). A block runs to the next registration.
   function eventBlock(event: string): string {
-    const start = server.indexOf(`socket.on("${event}"`);
+    const start = server.indexOf(`\n  on("${event}"`);
     if (start === -1) throw new Error(`event not found: ${event}`);
-    const next = server.indexOf('socket.on(', start + 1);
-    return server.slice(start, next);
+    const next = server.slice(start + 1).search(/\n  (socket\.)?on\(/);
+    return server.slice(start, next === -1 ? undefined : start + 1 + next);
   }
 
   test.each([

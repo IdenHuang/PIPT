@@ -17,7 +17,10 @@
  *   logger.info("Processing request", { route: "GET /admin/instructors" });
  *   logger.error("Query failed", { error: err.message, stack: err.stack });
  *   // Before returning from a handler (no-op for GET):
- *   logger.audit(event, { actorEmail, statusCode: response.statusCode });
+ *   logger.audit(event, {
+ *     actorId: event.requestContext.authorizer.userId,
+ *     statusCode: response.statusCode,
+ *   });
  */
 
 const REDACTED = "[REDACTED]";
@@ -133,11 +136,16 @@ const ID_PARAM = /_id$/;
  * PATCH or DELETE); other methods are ignored. Query it in CloudWatch Logs
  * Insights with `filter message = "AUDIT"`.
  *
+ * The actor is recorded by Cognito `sub` (the authorizer's `userId`), not by
+ * email, so the log holds a pseudonymous identifier. Resolve it to a person
+ * with `SELECT user_email FROM users WHERE cognito_sub = '<actorId>'` or
+ * `aws cognito-idp list-users --filter 'sub = "<actorId>"'`.
+ *
  * @param {object} event - API Gateway proxy event
- * @param {{actorEmail?: string, statusCode: number, scope?: object}} details
+ * @param {{actorId?: string, statusCode: number, scope?: object}} details
  *   `scope` is the parent object the caller was authorized against, if any.
  */
-function audit(event, { actorEmail, statusCode, scope } = {}) {
+function audit(event, { actorId, statusCode, scope } = {}) {
   const method = event?.httpMethod;
   if (!MUTATING_METHODS.has(method)) return;
 
@@ -148,7 +156,7 @@ function audit(event, { actorEmail, statusCode, scope } = {}) {
 
   _log("INFO", "AUDIT", {
     action: `${method} ${event.resource}`,
-    actorEmail,
+    actorId,
     sourceIp: event.requestContext?.identity?.sourceIp,
     apiRequestId: event.requestContext?.requestId,
     targetIds,

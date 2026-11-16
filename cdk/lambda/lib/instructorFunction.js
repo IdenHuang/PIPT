@@ -2677,7 +2677,7 @@ exports.handler = async (event, context) => {
             // 1) Authorize via source-of-truth join:
             // chats -> student_interactions -> personas (personas carries simulation_group_id)
             const accessCheck = await sqlConnection`
-              SELECT c.chat_id
+              SELECT c.chat_id, c.status
               FROM "chats" c
               JOIN "student_interactions" si
                 ON c.student_interaction_id = si.student_interaction_id
@@ -2693,6 +2693,19 @@ exports.handler = async (event, context) => {
               response.statusCode = 404;
               response.body = JSON.stringify({
                 error: "Chat not found in this simulation group.",
+              });
+              break;
+            }
+
+            // A chat that is not concluded has no debrief and none is being
+            // generated. Return a terminal status instead of sleeping ~19s in
+            // the retry loop below (security finding f-7ad37f17; mirrors the
+            // student get_debrief guard).
+            if (accessCheck[0].status !== 'concluded') {
+              response.statusCode = 200;
+              response.body = JSON.stringify({
+                status: "not_concluded",
+                generated_text: null,
               });
               break;
             }
@@ -4210,7 +4223,7 @@ exports.handler = async (event, context) => {
   }
   logger.logResponse(response);
   logger.audit(event, {
-    actorEmail: userEmailAttribute,
+    actorId: event.requestContext.authorizer.userId,
     statusCode: response.statusCode,
     scope: authorizedScope,
   });

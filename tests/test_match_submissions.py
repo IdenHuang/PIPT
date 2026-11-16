@@ -215,10 +215,16 @@ def test_contradictory_continue_vs_discontinue_not_matched():
 @pytest.mark.integration
 def test_agreeing_discontinue_is_matched():
     """Student saying 'discontinue naproxen' SHOULD match instructor 'discontinue naproxen'."""
-    model = MockEmbeddingsModel(dimension=64)
-    instructor_items = _make_instructor_items(
-        ["Mary should discontinue naproxen due to GI bleeding risk"], model
+    instructor_text = "Mary should discontinue naproxen due to GI bleeding risk"
+    # The hash-based mock gives unrelated vectors to any two different
+    # sentences, so give the student's paraphrase the instructor's vector:
+    # this test checks the contradiction filter, not embedding similarity.
+    base = MockEmbeddingsModel(dimension=64)
+    model = MockEmbeddingsModel(
+        dimension=64,
+        lookup={"Mary should discontinue naproxen": base.embed_query(instructor_text)},
     )
+    instructor_items = _make_instructor_items([instructor_text], model)
 
     result = match_submissions(
         ["Mary should discontinue naproxen"], instructor_items, model

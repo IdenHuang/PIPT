@@ -105,7 +105,7 @@ Amazon S3 stores uploaded persona documents (PDFs) and generated embeddings. Pre
 
 ### AI Services
 
-Amazon Bedrock provides LLM inference (Claude Sonnet 4.6 via cross-region inference profile `us.anthropic.claude-sonnet-4-6`), text embeddings (Cohere Embed v4 `cohere.embed-v4:0`) and voice interactions (Nova Sonic 2.0). All model calls route to `us-east-1` regardless of deployment region.
+Amazon Bedrock provides LLM inference (Claude Sonnet 5.5 via cross-region inference profile `us.anthropic.claude-sonnet-5-5`), text embeddings (Cohere Embed v4 `cohere.embed-v4:0`) and voice interactions (Nova Sonic 2.0). All model calls route to `us-east-1` regardless of deployment region.
 
 A Docker Lambda (`text_generation`) handles chat, debrief generation, and semantic question matching via LangChain. A separate Docker Lambda (`data_ingestion`) processes uploaded PDFs into vector embeddings. See [Data Ingestion](./DATA_INGESTION.md) for pipeline details.
 

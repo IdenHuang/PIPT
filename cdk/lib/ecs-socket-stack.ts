@@ -14,6 +14,8 @@ import { DatabaseStack } from "./database-stack";
 import { TurnServerStack } from "./turn-server-stack";
 import { LogProtection } from "./log-protection";
 import { approvedImageTag } from "./approved-image";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
+import { importAlarmTopic, notifyOnAllAlarms } from "./monitoring-stack";
 
 /** SSM parameter name where the socket URL is published for other stacks to read. */
 export const getSocketUrlSsmParam = (stackPrefix: string) => `/${stackPrefix}/socket-url`;
@@ -93,8 +95,8 @@ export class EcsSocketStack extends Stack {
               resources: [
                 // Same models/inference profiles as the textGen Lambda role
                 // (cdk/lib/api-service-stack.ts, bedrockPolicyStatement).
-                "arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-4-6",
-                "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6",
+                "arn:aws:bedrock:*:*:inference-profile/us.anthropic.claude-sonnet-5-5",
+                "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-5-5",
                 `arn:aws:bedrock:${this.region}::foundation-model/amazon.titan-embed-text-v2:0`,
                 "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0",
                 "arn:aws:bedrock:us-east-1::foundation-model/cohere.embed-v4:0",
@@ -116,7 +118,11 @@ export class EcsSocketStack extends Stack {
                 "bedrock-agentcore:InvokeAgentRuntime",
                 "bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStream",
               ],
-              resources: ["*"],
+              // Only the PIPT voice agent. AgentCore checks the identity policy
+              // against both the runtime and the endpoint being invoked
+              // (DEFAULT here), so both ARNs are listed.
+              // https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/resource-based-policies.html#resource-based-policies-hierarchical-authorization
+              resources: [resolvedVoiceAgentEndpoint, `${resolvedVoiceAgentEndpoint}/*`],
             }),
             // No sts:AssumeRole here: the socket server never assumes another role,
             // and an unscoped AssumeRole would let it pivot into any role that trusts
@@ -190,8 +196,8 @@ export class EcsSocketStack extends Stack {
       allowAllOutbound: true,
     });
     // Only CloudFront (origin-facing prefix list, as the VPC origins docs
-    // recommend) and in-VPC callers (the text-gen Lambda's /stream-callback
-    // POSTs) may reach the NLB; not 0.0.0.0/0.
+    // recommend) and the text-gen Lambda's security group (its /stream-callback
+    // POSTs) may reach the NLB; not 0.0.0.0/0 or the rest of the VPC.
     // https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-vpc-origins.html
     const cloudFrontOriginFacing = ec2.PrefixList.fromLookup(this, "CloudFrontOriginFacing", {
       prefixListName: "com.amazonaws.global.cloudfront.origin-facing",
@@ -202,9 +208,9 @@ export class EcsSocketStack extends Stack {
       "CloudFront VPC Origin inbound"
     );
     nlbSg.addIngressRule(
-      ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      apiServiceStack.textGenLambdaSg,
       ec2.Port.tcp(80),
-      "In-VPC stream callbacks (text-gen Lambda)"
+      "Stream callbacks from the text-gen Lambda"
     );
 
     const nlb = new elbv2.NetworkLoadBalancer(this, "SocketNLBInternal", {
@@ -344,12 +350,10 @@ export class EcsSocketStack extends Stack {
       });
     }
 
-    // 5.1) Allow the internal NLB to reach the service on port 80 (VPC traffic only)
-    service.connections.allowFrom(
-      ec2.Peer.ipv4(vpc.vpcCidrBlock),
-      ec2.Port.tcp(80),
-      "Allow NLB to reach ECS service"
-    );
+    // 5.1) Only the NLB may reach the service on port 80. Referencing the NLB's
+    // security group covers both forwarded traffic and health checks.
+    // https://docs.aws.amazon.com/elasticloadbalancing/latest/network/target-group-register-targets.html#target-security-groups
+    service.connections.allowFrom(nlbSg, ec2.Port.tcp(80), "Allow NLB to reach ECS service");
 
 
 
@@ -362,7 +366,7 @@ export class EcsSocketStack extends Stack {
       port: 80,
       protocol: elbv2.Protocol.TCP,
     });
-    listener.addTargets("EcsTargetGroupV2", {
+    const targetGroup = listener.addTargets("EcsTargetGroupV2", {
       protocol: elbv2.Protocol.TCP,
       port: 80,
       targets: [service],
@@ -375,6 +379,26 @@ export class EcsSocketStack extends Stack {
         timeout: Duration.seconds(10),
       },
     });
+
+    // 6.0) Alarm when no socket task is healthy behind the NLB: all text chat
+    // and voice is down. NLB HealthyHostCount needs no Container Insights.
+    // Rolling deploys start the new task before stopping the old one, so a
+    // normal deploy doesn't trip it.
+    new cloudwatch.Alarm(this, "SocketNoHealthyTaskAlarm", {
+      alarmName: `${id}-Socket-NoHealthyTask`,
+      alarmDescription:
+        "No healthy socket-server task behind the NLB for 3 minutes: text chat and voice are down. " +
+        "Check the ECS service events and the Socket log group.",
+      metric: targetGroup.metrics.healthyHostCount({
+        statistic: "Minimum",
+        period: Duration.minutes(1),
+      }),
+      threshold: 1,
+      evaluationPeriods: 3,
+      comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+    });
+    notifyOnAllAlarms(this, importAlarmTopic(this, stackPrefix));
 
     // 6.1) Publish the VPC-internal callback URL for the text-generation Lambda.
     // The Lambda runs in the same VPC and reaches the internal NLB directly,

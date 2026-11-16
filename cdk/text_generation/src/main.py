@@ -655,7 +655,7 @@ def handler(event, context):
         if trigger not in (DEBRIEF_TRIGGER_CONCLUDE, DEBRIEF_TRIGGER_RECOVERY):
             trigger = None
         try:
-            llm = get_bedrock_llm(bedrock_llm_id=BEDROCK_LLM_ID, streaming=False)
+            llm = get_bedrock_llm(bedrock_llm_id=BEDROCK_LLM_ID, streaming=False, effort="high")
             debrief_result = generate_debrief(
                 session_id=session_id,
                 simulation_group_id=simulation_group_id,
@@ -810,7 +810,7 @@ def handler(event, context):
                     "body": json.dumps({"error": "debrief_prompt is required"}),
                 }
 
-            llm = get_bedrock_llm(bedrock_llm_id=BEDROCK_LLM_ID, streaming=False)
+            llm = get_bedrock_llm(bedrock_llm_id=BEDROCK_LLM_ID, streaming=False, effort="high")
             result = generate_test_debrief(
                 session_id=session_id,
                 simulation_group_id=simulation_group_id,
