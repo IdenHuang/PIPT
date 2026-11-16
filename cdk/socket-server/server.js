@@ -278,24 +278,6 @@ app.post("/stream-callback", (req, res) => {
   res.status(200).json({ ok: true });
 });
 
-// ─── TURN Credential Generation (RFC 5389) ───────────────────────────────────
-// NOTE: Currently unused — retained for future TURN server integration.
-/**
- * Generate time-limited TURN credentials using HMAC-SHA1.
- * @param {string} username — unique identifier (e.g. socket.userId)
- * @param {string} sharedSecret — TURN shared secret
- * @param {number} ttlSeconds — credential lifetime (max 24 hours)
- * @returns {{ username: string, credential: string }}
- */
-function generateTurnCredentials(username, sharedSecret, ttlSeconds = 86400) { // eslint-disable-line no-unused-vars
-  const timestamp = Math.floor(Date.now() / 1000) + ttlSeconds;
-  const turnUsername = `${timestamp}:${username}`;
-  const hmac = crypto.createHmac("sha1", sharedSecret);
-  hmac.update(turnUsername);
-  const turnPassword = hmac.digest("base64");
-  return { username: turnUsername, credential: turnPassword };
-}
-
 // ─── Voice Preview & Connection Limits ────────────────────────────────────────
 // Keyed on the authenticated identity (not socket.id) so reconnecting or
 // opening parallel sockets does not reset the budget. State outlives the

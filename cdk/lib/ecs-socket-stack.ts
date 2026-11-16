@@ -11,7 +11,6 @@ import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import { VpcStack } from "./vpc-stack";
 import { DatabaseStack } from "./database-stack";
-import { TurnServerStack } from "./turn-server-stack";
 import { LogProtection } from "./log-protection";
 import { approvedImageTag } from "./approved-image";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
@@ -49,7 +48,6 @@ export class EcsSocketStack extends Stack {
     db: DatabaseStack,
     apiServiceStack: any,
     socketServerRepo: ecr.IRepository,
-    turnServerStack: TurnServerStack,
     voiceAgentEndpoint: string | undefined,
     stackPrefix: string,
     dynamoTableName: string,
@@ -175,8 +173,6 @@ export class EcsSocketStack extends Stack {
       })
     );
 
-    // Grant ECS task role permission to read the TURN shared secret
-    turnServerStack.turnSecret.grantRead(taskRole);
 
     // REVIEW: The task role is also used as the execution role. These should be separate:
     // - Task role: permissions the application code needs at runtime (Bedrock, DynamoDB, etc.)
@@ -257,8 +253,6 @@ export class EcsSocketStack extends Stack {
         TEXT_GENERATION_ENDPOINT: apiServiceStack.getEndpointUrl(),
         APPSYNC_GRAPHQL_URL: apiServiceStack.appSyncApi.graphqlUrl,
         SOCKET_EXECUTION_ROLE_ARN: taskRole.roleArn,
-        TURN_SERVER_URL: turnServerStack.turnServerUrl,
-        STUN_SERVER_URL: turnServerStack.stunServerUrl,
         BEDROCK_GUARDRAIL_ID: apiServiceStack.getGuardrailId(),
         // Guardrail IDs are regional; the guardrail lives in the Api stack's region.
         BEDROCK_GUARDRAIL_REGION: apiServiceStack.region,
@@ -266,9 +260,6 @@ export class EcsSocketStack extends Stack {
         SM_STREAM_CALLBACK_SECRET: apiServiceStack.streamCallbackSecret.secretName,
         ALLOWED_ORIGINS: apiServiceStack.getAllowedOriginsEnv(),
         ...(resolvedVoiceAgentEndpoint ? { VOICE_AGENT_ENDPOINT: resolvedVoiceAgentEndpoint } : {}),
-      },
-      secrets: {
-        TURN_SHARED_SECRET: ecs.Secret.fromSecretsManager(turnServerStack.turnSecret),
       },
     });
 

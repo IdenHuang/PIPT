@@ -618,10 +618,9 @@ The CDK app creates the following stacks in dependency order:
 3. **`{StackPrefix}-Database`** : RDS PostgreSQL instance, RDS Proxy, secrets
 4. **`{StackPrefix}-CloudFrontWaf`** : WAF Web ACL for CloudFront (deployed to `us-east-1`)
 5. **`{StackPrefix}-Api`** : API Gateway, Lambda functions, Cognito, AppSync, S3, CloudFront
-6. **`{StackPrefix}-TurnServer`** : TURN server for WebRTC
-7. **`{StackPrefix}-EcsSocket`** : ECS Fargate service for Socket.IO
-8. **`{StackPrefix}-DBFlow`** : Database migration runner (triggers on deploy)
-9. **`{StackPrefix}-Amplify`** : Amplify hosting for the React frontend
+6. **`{StackPrefix}-EcsSocket`** : ECS Fargate service for Socket.IO
+7. **`{StackPrefix}-DBFlow`** : Database migration runner (triggers on deploy)
+8. **`{StackPrefix}-Amplify`** : Amplify hosting for the React frontend
 
 > **Note:** `--all` handles the dependency order automatically. Deployment takes approximately 30–45 minutes on first run.
 
@@ -1217,7 +1216,6 @@ To delete individual stacks, destroy them in reverse dependency order:
 cdk destroy <YOUR-STACK-PREFIX>-Amplify -c StackPrefix=<YOUR-STACK-PREFIX> -c githubRepo=<REPO NAME HERE> -c githubBranch=main --profile <YOUR-AWS-PROFILE>
 cdk destroy <YOUR-STACK-PREFIX>-DBFlow -c StackPrefix=<YOUR-STACK-PREFIX> -c githubRepo=<REPO NAME HERE> -c githubBranch=main --profile <YOUR-AWS-PROFILE>
 cdk destroy <YOUR-STACK-PREFIX>-EcsSocket -c StackPrefix=<YOUR-STACK-PREFIX> -c githubRepo=<REPO NAME HERE> -c githubBranch=main --profile <YOUR-AWS-PROFILE>
-cdk destroy <YOUR-STACK-PREFIX>-TurnServer -c StackPrefix=<YOUR-STACK-PREFIX> -c githubRepo=<REPO NAME HERE> -c githubBranch=main --profile <YOUR-AWS-PROFILE>
 cdk destroy <YOUR-STACK-PREFIX>-Api -c StackPrefix=<YOUR-STACK-PREFIX> -c githubRepo=<REPO NAME HERE> -c githubBranch=main --profile <YOUR-AWS-PROFILE>
 cdk destroy <YOUR-STACK-PREFIX>-CloudFrontWaf -c StackPrefix=<YOUR-STACK-PREFIX> -c githubRepo=<REPO NAME HERE> -c githubBranch=main --profile <YOUR-AWS-PROFILE>
 cdk destroy <YOUR-STACK-PREFIX>-Database -c StackPrefix=<YOUR-STACK-PREFIX> -c githubRepo=<REPO NAME HERE> -c githubBranch=main --profile <YOUR-AWS-PROFILE>

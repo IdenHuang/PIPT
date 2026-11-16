@@ -11,7 +11,6 @@ import {
   getSocketEcsClusterSsmParam,
   getSocketEcsServiceSsmParam,
 } from "../lib/ecs-socket-stack";
-import { TurnServerStack } from "../lib/turn-server-stack";
 import { CICDStack } from "../lib/cicd-stack";
 import { CloudFrontWafStack } from "../lib/cloudfront-waf-stack";
 import { AuditTrailStack } from "../lib/audit-trail-stack";
@@ -103,12 +102,6 @@ const apiStack = new ApiServiceStack(
   sesVerifiedDomain || undefined,
   { env, crossRegionReferences: true }
 );
-const turnServerStack = new TurnServerStack(
-  app,
-  `${StackPrefix}-TurnServer`,
-  vpcStack,
-  { env }
-);
 
 // Voice agent is hosted on Bedrock AgentCore — pass the runtime ARN
 // to the socket-server so it can connect via SigV4-signed WebSocket.
@@ -122,7 +115,6 @@ const ecsSocketStack = new EcsSocketStack(
   dbStack,
   apiStack,
   cicdStack.ecrRepositories["socketServer"],
-  turnServerStack,
   voiceAgentArn,
   StackPrefix,
   apiStack.getDynamoTableName(),
@@ -166,7 +158,6 @@ cdk.Tags.of(vpcStack).add("Project", StackPrefix);
 cdk.Tags.of(dbStack).add("Project", StackPrefix);
 cdk.Tags.of(cloudFrontWafStack).add("Project", StackPrefix);
 cdk.Tags.of(apiStack).add("Project", StackPrefix);
-cdk.Tags.of(turnServerStack).add("Project", StackPrefix);
 cdk.Tags.of(dbFlowStack).add("Project", StackPrefix);
 cdk.Tags.of(amplifyStack).add("Project", StackPrefix);
 
