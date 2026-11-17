@@ -619,7 +619,9 @@ VOICE MODE OVERRIDE (IMPORTANT):
         })
     
     async def end_audio_input(self):
-        self._buffered_ai_message = ""
+        # Save, then clear, the AI buffer so user text can't contaminate it.
+        # Clearing without saving lost the patient's last reply on exit.
+        self._persist_buffered_ai_message("end_audio")
 
         await self.send_event({
         "event": {
@@ -633,15 +635,7 @@ VOICE MODE OVERRIDE (IMPORTANT):
     
     async def end_session(self):
         # Flush any remaining buffered AI message before closing
-        if self._buffered_ai_message and self._buffered_ai_message != self._last_persisted_ai_message:
-            try:
-                langchain_chat_history.add_message(self.session_id, "ai", self._buffered_ai_message)
-                self._save_message_to_db(self.session_id, False, self._buffered_ai_message, None)
-                self._last_persisted_ai_message = self._buffered_ai_message
-                logger.info(f"💬 [PERSIST] AI (final) | {self.session_id} | {self._buffered_ai_message[:30]}")
-            except Exception as e:
-                logger.error(f"Failed to persist final AI message: {e}")
-            self._buffered_ai_message = ""
+        self._persist_buffered_ai_message("end_session")
 
         # Flush any remaining buffered user message
         if hasattr(self, '_current_user_input') and self._current_user_input and self._current_user_input.strip():
@@ -745,18 +739,10 @@ VOICE MODE OVERRIDE (IMPORTANT):
             new_role = content_start.get("role")
             print(f"🔍 DEBUG ROLE SET: {new_role}", flush=True)
 
-            # Flush buffered AI message when the AI turn ends
+            # Fallback flush when the role switches. Normally the reply was
+            # already saved at its END_TURN contentEnd (below).
             if self.role == "ASSISTANT" and new_role != "ASSISTANT":
-                if self._buffered_ai_message and self._buffered_ai_message != self._last_persisted_ai_message:
-                    try:
-                        cleaned = self._clean_transcript(self._buffered_ai_message)
-                        langchain_chat_history.add_message(self.session_id, "ai", cleaned)
-                        self._save_message_to_db(self.session_id, False, cleaned, None)
-                        self._last_persisted_ai_message = self._buffered_ai_message
-                        logger.info(f"💬 [PERSIST] AI | {self.session_id} | {cleaned[:30]}")
-                    except Exception as e:
-                        logger.error(f"Failed to persist buffered AI message: {e}")
-                self._buffered_ai_message = ""
+                self._persist_buffered_ai_message("role_change")
 
             # Flush buffered user message when the user turn ends
             if self.role == "USER" and new_role != "USER":
@@ -777,9 +763,17 @@ VOICE MODE OVERRIDE (IMPORTANT):
                 self._emitted_texts_this_turn = set()
                 self._audio_gate.reset_turn()
                 self._in_speculative_text = False
+            # Track whether this block is the FINAL transcript of what the
+            # patient actually said; only its end marks a complete reply.
+            self._in_final_ai_text = False
             # optional SPECULATIVE check
             if "additionalModelFields" in content_start:
                 fields = json.loads(content_start["additionalModelFields"])
+                self._in_final_ai_text = (
+                    new_role == "ASSISTANT"
+                    and content_start.get("type") == "TEXT"
+                    and fields.get("generationStage") == "FINAL"
+                )
                 self.display_assistant_text = (fields.get("generationStage") == "SPECULATIVE")
                 if new_role == "ASSISTANT" and self.display_assistant_text:
                     # Planned text for the next spoken segment: hold its audio
@@ -954,6 +948,17 @@ VOICE MODE OVERRIDE (IMPORTANT):
                     self._send_audio(b64)
             elif content_end.get("type") == "AUDIO":
                 self._audio_gate.close_segment()
+            # Save the patient's reply as soon as Nova Sonic finishes the turn
+            # (END_TURN) or the student barges in (INTERRUPTED), instead of
+            # waiting for a next turn that never comes if the student exits.
+            # https://docs.aws.amazon.com/nova/latest/nova2-userguide/sonic-output-events.html
+            if (
+                getattr(self, "_in_final_ai_text", False)
+                and content_end.get("type") == "TEXT"
+                and content_end.get("stopReason") in ("END_TURN", "INTERRUPTED")
+            ):
+                self._in_final_ai_text = False
+                self._persist_buffered_ai_message(content_end.get("stopReason"))
 
         # audioOutput — only forwarded once its text has passed the guardrail
         elif "audioOutput" in evt:
@@ -1078,6 +1083,9 @@ VOICE MODE OVERRIDE (IMPORTANT):
             user_text = self._clean_transcript(user_text)
             loop = asyncio.get_event_loop()
             message_id = await loop.run_in_executor(None, self._save_message_to_db, self.session_id, True, user_text, None)
+            if getattr(self, "_chat_concluded", False):
+                # Chat concluded: skip history and question matching too.
+                return
             # Also add to chat history
             await loop.run_in_executor(None, langchain_chat_history.add_message, self.session_id, "user", user_text)
             logger.info(f"💾 User audio message saved: {user_text[:30]}...")
@@ -1126,6 +1134,30 @@ VOICE MODE OVERRIDE (IMPORTANT):
     #     ...
     # ── End empathy evaluation methods ──────────────────────────────────────
     
+    def _persist_buffered_ai_message(self, reason):
+        """Save the buffered patient reply (once) and clear the buffer.
+
+        Called at turn end, mic stop, role change and session end. The
+        _last_persisted_ai_message check keeps a reply from being saved twice
+        when more than one of those fires for the same turn.
+        """
+        buffered = self._buffered_ai_message
+        self._buffered_ai_message = ""
+        if not buffered or buffered == self._last_persisted_ai_message:
+            return
+        try:
+            cleaned = self._clean_transcript(buffered)
+            if not cleaned:
+                return
+            self._save_message_to_db(self.session_id, False, cleaned, None)
+            self._last_persisted_ai_message = buffered
+            if getattr(self, "_chat_concluded", False):
+                return
+            langchain_chat_history.add_message(self.session_id, "ai", cleaned)
+            logger.info(f"💬 [PERSIST] AI ({reason}) | {self.session_id} | {cleaned[:30]}")
+        except Exception as e:
+            logger.error(f"Failed to persist AI message ({reason}): {e}")
+
     def _save_message_to_db(self, session_id, student_sent, message_content, empathy_evaluation=None):
         """Optimized DB save with connection pooling"""
         try:
@@ -1135,15 +1167,26 @@ VOICE MODE OVERRIDE (IMPORTANT):
             sender = "student" if student_sent else "ai"
             msg_id = str(uuid.uuid4())
             
+            # A concluded chat is final (its debrief grades this transcript), so
+            # a voice session still open after conclusion must not append to it.
+            # The status check is part of the INSERT itself, leaving no window
+            # for conclude_interaction to commit between check and write.
             cursor.execute(
-                'INSERT INTO "messages" (message_id, chat_id, sender_type, message_content, sent_at) VALUES (%s, %s, %s, %s, NOW())',
-                (msg_id, session_id, sender, message_content)
+                'INSERT INTO "messages" (message_id, chat_id, sender_type, message_content, sent_at) '
+                'SELECT %s, %s, %s, %s, NOW() '
+                'WHERE EXISTS (SELECT 1 FROM "chats" WHERE chat_id = %s AND status IS DISTINCT FROM \'concluded\')',
+                (msg_id, session_id, sender, message_content, session_id)
             )
+            inserted = cursor.rowcount
             
             conn.commit()
             cursor.close()
             pg_conn_pool.putconn(conn)  # Return to pool
             
+            if not inserted:
+                self._chat_concluded = True
+                logger.warning(f"Message not saved: chat {session_id} is concluded")
+                return None
             logger.info(f"💾 Message saved to DB: message_id={msg_id}")
             return msg_id
                 

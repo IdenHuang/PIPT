@@ -283,9 +283,38 @@ async function verifySessionScope(sessionId, personaId, simulationGroupId, userE
   }
 }
 
+/**
+ * True if the chat is concluded (its debrief is graded and final), so no new
+ * voice turns may be added. Fails closed: a query error is treated as
+ * concluded.
+ *
+ * @param {string} sessionId - The chat_id
+ * @returns {Promise<boolean>}
+ */
+async function isSessionConcluded(sessionId) {
+  const runQuery = (sql) => sql`
+    SELECT 1 FROM chats
+    WHERE chat_id = ${sessionId} AND status = 'concluded';
+  `;
+  try {
+    const result = await runWithAuthRetry(runQuery, "concluded check");
+    return result.length > 0;
+  } catch (error) {
+    logger.error("Concluded-session check error", {
+      component: "session-auth",
+      operation: "isSessionConcluded",
+      sessionId,
+      errorCode: error.code || error.routine,
+      error: error.message,
+    });
+    return true;
+  }
+}
+
 module.exports = {
   verifySessionOwnership,
   verifySessionScope,
+  isSessionConcluded,
   getDbConnection,
   refreshDbConnection,
   runWithAuthRetry,

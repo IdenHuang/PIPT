@@ -5,7 +5,7 @@ const { Server } = require("socket.io");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
 const { verifyToken, hydrateVerifier } = require("./auth");
-const { verifySessionScope } = require("./session-auth");
+const { verifySessionScope, isSessionConcluded } = require("./session-auth");
 const { authorizeSessionRequest } = require("./session-guard");
 const { resolveRelayToken } = require("./relay-token");
 const { fetchPatientContext } = require("./patient-context");
@@ -547,6 +547,19 @@ io.on("connection", (socket) => {
       return;
     }
     if (isStale()) return;
+    // A concluded chat is final; voice must not reopen it.
+    const concluded = await isSessionConcluded(sessionId);
+    if (isStale()) return;
+    if (concluded) {
+      logger.warn("start-nova-sonic refused: chat is concluded", {
+        component: "server",
+        operation: "start-nova-sonic",
+        userEmail: socket.userEmail,
+        sessionId,
+      });
+      socket.emit("nova-error", { error: "This interaction has been concluded." });
+      return;
+    }
 
     // ── Caller's ID token for upstream calls (required) ────────────────────
     // The client sends a fresh token with each start. It is verified and bound

@@ -22,6 +22,35 @@ import { supportsVoiceMode } from '@/lib/browser';
 import { useResizablePanel } from '@/hooks/useResizablePanel';
 import ResizeHandle from '@/components/ResizeHandle';
 
+// Lowercase, drop punctuation and collapse whitespace, so a live voice bubble
+// matches its saved copy despite the server's transcript cleanup.
+const normalizeForMatch = (text: string) =>
+  text.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+
+/**
+ * Merge the DB transcript fetched when voice mode ends with the live voice
+ * bubbles on screen. The server may still be saving the patient's last reply
+ * when that fetch returns, so replacing the chat with it dropped the reply.
+ * Live bubbles (ids starting "voice-") with no saved copy are kept at the end;
+ * the next load replaces them with the saved messages.
+ */
+function mergeVoiceBubbles(dbMessages: Message[], current: Message[]): Message[] {
+  const savedBySender = new Map<string, string[]>();
+  for (const m of dbMessages) {
+    const list = savedBySender.get(m.sender_type) ?? [];
+    list.push(normalizeForMatch(m.message_content));
+    savedBySender.set(m.sender_type, list);
+  }
+  const unsaved = current.filter((m) => {
+    if (!m.message_id.startsWith('voice-')) return false;
+    const text = normalizeForMatch(m.message_content);
+    if (!text) return false;
+    const saved = savedBySender.get(m.sender_type) ?? [];
+    return !saved.some((s) => s.length > 0 && (s.includes(text) || text.includes(s)));
+  });
+  return unsaved.length > 0 ? [...dbMessages, ...unsaved] : dbMessages;
+}
+
 /**
  * StudentChatPage Component
  * 
@@ -156,7 +185,7 @@ function StudentChatPage() {
    * Start a voice session when the mic button is clicked.
    */
   const handleStartVoiceMode = useCallback(() => {
-    if (sessionCompleted || isAiResponding) return;
+    if (sessionStatus !== 'active' || sessionCompleted || isAiResponding) return;
     setIsVoiceModeActive(true);
     setVoiceError(null);
     setVoiceSessionState('connecting');
@@ -333,7 +362,7 @@ function StudentChatPage() {
             if (sid) {
               studentService.fetchMessages(sid).then((msgs) => {
                 if (msgs.length > 0) {
-                  setMessages(msgs);
+                  setMessages((prev) => mergeVoiceBubbles(msgs, prev));
                   // Safety net: re-confirm sessionCompleted from DB messages
                   // in case state was lost during voice cleanup
                   const wasCompleted = msgs.some((m) =>
@@ -368,7 +397,7 @@ function StudentChatPage() {
       setVoiceSessionState('error');
     });
     } // end startAudioClient
-  }, [patient, routeChatId, patientId, groupId, sessionId, isAiResponding]);
+  }, [patient, routeChatId, patientId, groupId, sessionId, isAiResponding, sessionStatus, sessionCompleted]);
 
   /**
    * Stop the voice session when the X button is clicked.
@@ -384,7 +413,7 @@ function StudentChatPage() {
     if (sid) {
       studentService.fetchMessages(sid).then((msgs) => {
         if (msgs.length > 0) {
-          setMessages(msgs);
+          setMessages((prev) => mergeVoiceBubbles(msgs, prev));
           // Re-check for session completion in case the marker was persisted
           // but the real-time event was missed (e.g. user clicked stop late)
           const wasCompleted = msgs.some((m) =>
@@ -400,6 +429,16 @@ function StudentChatPage() {
       });
     }
   }, [cleanupVoiceSession, sessionId, routeChatId]);
+
+  // Once the student concludes, the chat is final. The input area unmounts,
+  // but a voice session opened earlier would keep the mic live and let the
+  // student go on talking to the patient, so end it here.
+  useEffect(() => {
+    if (sessionStatus === 'active') return;
+    if (isVoiceModeActive || audioClientRef.current) {
+      handleStopVoiceMode();
+    }
+  }, [sessionStatus, isVoiceModeActive, handleStopVoiceMode]);
 
   // Clean up WebRTC and socket on unmount or navigation away
   useEffect(() => {
@@ -478,7 +517,7 @@ function StudentChatPage() {
           if (sid) {
             studentService.fetchMessages(sid).then((msgs) => {
               if (msgs.length > 0) {
-                setMessages(msgs);
+                setMessages((prev) => mergeVoiceBubbles(msgs, prev));
               }
             });
           }
@@ -850,7 +889,7 @@ function StudentChatPage() {
    * Handle sending a message — uses AppSync streaming for real-time chunks
    */
   const handleSendMessage = async () => {
-    if (!inputMessage.trim() || !groupId || !patientId || !sessionId || isAiResponding || sessionCompleted || messageLimitReached) return;
+    if (!inputMessage.trim() || !groupId || !patientId || !sessionId || isAiResponding || sessionCompleted || messageLimitReached || sessionStatus !== 'active') return;
 
     // Create student message
     const studentMessage: Message = {
