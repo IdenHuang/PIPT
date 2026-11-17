@@ -526,6 +526,8 @@ io.on("connection", (socket) => {
     // ── Session authorization (fail closed; see session-guard.js) ─────────
     // The caller must own the chat and it must belong to the patient/group in
     // the config, since those IDs drive which persona context is loaded.
+    // Voice must also be enabled for the persona and group: the SPA hides the
+    // microphone when staff turn voice off, but this is the server-side gate.
     const sessionId = config.session_id;
     const novaAuthz = await authorizeSessionRequest(
       {
@@ -534,7 +536,8 @@ io.on("connection", (socket) => {
         patientId: config.patient_id,
         simulationGroupId: config.simulation_group_id,
       },
-      verifySessionScope,
+      (sid, personaId, groupId, email) =>
+        verifySessionScope(sid, personaId, groupId, email, { requireVoiceEnabled: true }),
     );
     if (!novaAuthz.allowed) {
       logger.warn("Session authorization denied for start-nova-sonic", {

@@ -248,19 +248,33 @@ async function verifySessionOwnership(sessionId, userEmail) {
  * Binding all three IDs stops a caller pairing their own session with another
  * group's persona, whose prompts and context would otherwise be loaded.
  *
+ * With `requireVoiceEnabled`, the staff voice switches are also enforced:
+ * the persona's `voice_enabled` and the group's `instructor_voice_enabled`
+ * must not be false (NULL counts as enabled, matching the column defaults and
+ * GET /student/voice_enabled). The browser hides the microphone when voice is
+ * off, but only this check stops a client emitting start-nova-sonic directly.
+ * `simulation_groups.admin_voice_enabled` is not checked because that column
+ * does not exist in the schema yet; add it here once its migration ships.
+ *
  * @param {string} sessionId - The chat_id
  * @param {string} personaId - The persona_id the chat must belong to
  * @param {string} simulationGroupId - The simulation_group_id the chat must belong to
  * @param {string} userEmail - The authenticated user's email
- * @returns {Promise<{authorized: boolean}>}
+ * @param {{requireVoiceEnabled?: boolean}} [options]
+ * @returns {Promise<{authorized: boolean, reason?: "voice_disabled"}>}
  */
-async function verifySessionScope(sessionId, personaId, simulationGroupId, userEmail) {
+async function verifySessionScope(sessionId, personaId, simulationGroupId, userEmail, options = {}) {
+  const requireVoiceEnabled = options.requireVoiceEnabled === true;
+  // LEFT JOINs: the voice flags are read for every caller, but only voice
+  // sessions act on them, so text sessions keep their existing behaviour.
   const runQuery = (sql) => sql`
-    SELECT 1
+    SELECT p.voice_enabled, sg.instructor_voice_enabled
     FROM chats c
     JOIN student_interactions si ON si.student_interaction_id = c.student_interaction_id
     JOIN enrollments e ON e.enrollment_id = si.enrollment_id
     JOIN users u ON u.user_id = e.user_id
+    LEFT JOIN personas p ON p.persona_id = si.persona_id
+    LEFT JOIN simulation_groups sg ON sg.simulation_group_id = e.simulation_group_id
     WHERE c.chat_id = ${sessionId}
       AND si.persona_id = ${personaId}
       AND e.simulation_group_id = ${simulationGroupId}
@@ -269,7 +283,14 @@ async function verifySessionScope(sessionId, personaId, simulationGroupId, userE
 
   try {
     const result = await runWithAuthRetry(runQuery, "session scope check");
-    return { authorized: result.length > 0 };
+    if (result.length === 0) return { authorized: false };
+    if (requireVoiceEnabled) {
+      const { voice_enabled, instructor_voice_enabled } = result[0];
+      if (voice_enabled === false || instructor_voice_enabled === false) {
+        return { authorized: false, reason: "voice_disabled" };
+      }
+    }
+    return { authorized: true };
   } catch (error) {
     logger.error("Session scope verification error", {
       component: "session-auth",

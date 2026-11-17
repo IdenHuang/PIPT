@@ -15,7 +15,11 @@
  *   - The caller must own the chat, and the chat must belong to that patient
  *     and group.
  *   - Any error from the scope check → deny.
+ *   - A voice-disabled denial (reason "voice_disabled") gets its own message
+ *     so the student isn't told they don't own their own session.
  */
+
+const VOICE_DISABLED_ERROR = "Voice mode is disabled for this patient";
 
 const REQUIRED_FIELDS = ["sessionId", "patientId", "simulationGroupId"];
 
@@ -29,7 +33,7 @@ function isNonEmptyString(value) {
  * @param {string} [params.sessionId] - Client-supplied chat_id
  * @param {string} [params.patientId] - Client-supplied persona_id
  * @param {string} [params.simulationGroupId] - Client-supplied simulation_group_id
- * @param {(sessionId: string, personaId: string, groupId: string, email: string) => Promise<{authorized: boolean}>} verifyScope
+ * @param {(sessionId: string, personaId: string, groupId: string, email: string) => Promise<{authorized: boolean, reason?: string}>} verifyScope
  * @returns {Promise<{allowed: true} | {allowed: false, error: string}>}
  */
 async function authorizeSessionRequest(params, verifyScope) {
@@ -49,10 +53,13 @@ async function authorizeSessionRequest(params, verifyScope) {
     if (result && result.authorized === true) {
       return { allowed: true };
     }
+    if (result && result.reason === "voice_disabled") {
+      return { allowed: false, error: VOICE_DISABLED_ERROR };
+    }
   } catch {
     // fall through to deny
   }
   return { allowed: false, error: "Access denied: you do not own this session" };
 }
 
-module.exports = { authorizeSessionRequest };
+module.exports = { authorizeSessionRequest, VOICE_DISABLED_ERROR };
