@@ -51,6 +51,22 @@ describe("validatePersonaMediaUrl", () => {
     expect(validatePersonaMediaUrl(value).ok).toBe(false);
   });
 
+  // Finding f-279ac83c: one iframe only, and its host must be allowlisted.
+  test.each([
+    '<iframe src="https://www.youtube.com/embed/x"></iframe><iframe src="https://attacker.example/phish" style="position:absolute;inset:0"></iframe>',
+    '<iframe src="https://www.youtube.com/embed/a"></iframe><iframe src="https://player.vimeo.com/video/1"></iframe>',
+    '<iframe src="https://attacker.example/"></iframe>',
+    '<iframe src="https://youtube.com.attacker.example/embed/x"></iframe>',
+    '<iframe src="https://www.youtube.com@attacker.example/"></iframe>',
+  ])("rejects multi-iframe or non-allowlisted embed code %s", (value) => {
+    expect(validatePersonaMediaUrl(value).ok).toBe(false);
+  });
+
+  test("accepts an allowlisted subdomain in embed code", () => {
+    const value = '<iframe src="https://ubc.ca.panopto.com/Panopto/Pages/Embed.aspx?id=1"></iframe>';
+    expect(validatePersonaMediaUrl(value)).toEqual({ ok: true, value });
+  });
+
   test("rejects non-string and oversized values", () => {
     expect(validatePersonaMediaUrl(42).ok).toBe(false);
     expect(validatePersonaMediaUrl({ href: "https://x.example" }).ok).toBe(false);
