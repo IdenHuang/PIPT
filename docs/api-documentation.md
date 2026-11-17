@@ -3679,7 +3679,13 @@ curl -X POST "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/elev
 
 ### Lower Instructor
 
-Revoke instructor role and convert user back to student. Deletes all instructor enrollments.
+Revoke instructor role and convert user back to student. In the same transaction it removes every way the user could still act as a group instructor:
+
+- deletes all `enrollments` rows with `enrollment_type = 'instructor'`;
+- deletes all `group_instructors` rows for the user;
+- reassigns `simulation_groups.created_by` to the acting admin for every group the user created, writing one `lower_instructor` row per group to `role_audit_log` with `simulation_group_id` set.
+
+Without this, a demoted user would keep answer-key access and instructor-only LLM modes on the `/student/*` routes for groups they created, because those routes check group ownership rather than `users.roles`.
 
 **Endpoint:** `POST /admin/lower_instructor`
 
@@ -3691,7 +3697,7 @@ Revoke instructor role and convert user back to student. Deletes all instructor 
 
 ```json
 {
-  "message": "User role updated to student for user@example.com"
+  "message": "User role updated to student for user@example.com. Instructor access to all simulation groups was removed."
 }
 ```
 
