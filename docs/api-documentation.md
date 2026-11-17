@@ -1351,37 +1351,6 @@ curl -X GET "https://api-id.execute-api.us-east-1.amazonaws.com/prod/instructor/
 
 ---
 
-### Get Student Group (Legacy)
-
-Get groups for a specific student.
-
-**Endpoint:** `GET /instructor/student_group`
-
-**Query Parameters:**
-
-- `email` (string, optional): Email of the instructor (must match token email if provided; token email used if omitted)
-
-**Response:**
-
-```json
-[
-  {
-    "simulation_group_id": "uuid",
-    "group_name": "Pharmacy 101",
-    "group_description": "Introductory simulation"
-  }
-]
-```
-
-**Example (cURL):**
-
-```bash
-curl -X GET "https://api-id.execute-api.us-east-1.amazonaws.com/prod/instructor/student_group?email=instructor@example.com" \
-  -H "Authorization: eyJraWQiOiJ..."
-```
-
----
-
 ### Create Simulation Group
 
 Create a new simulation group.

@@ -68,7 +68,6 @@ const CALLER_SCOPED = Object.freeze([]);
  */
 const INSTRUCTOR_ROUTE_POLICY = Object.freeze({
   // ── Caller-scoped / static ────────────────────────────────────────────────
-  "GET /instructor/student_group": CALLER_SCOPED,
   "GET /instructor/groups": CALLER_SCOPED,
   "POST /instructor/create_simulation_group": CALLER_SCOPED,
   "GET /instructor/get_default_debrief_prompt": CALLER_SCOPED,
