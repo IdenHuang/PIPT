@@ -95,7 +95,7 @@ The API WAF (`cdk/lib/api-service-stack.ts`) runs the managed `SizeRestrictions_
 
 ### Frontend Security Headers
 
-The Amplify app sends HSTS, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy` and a Content Security Policy (`cdk/lib/security-headers.ts`). By default the CSP is sent as `Content-Security-Policy-Report-Only`. Once the browser checks in `cdk/scripts/smoke-security-defaults.ps1` show no violations, deploy the Amplify stack with `-c CspEnforce=true` to enforce it. If you add a new embed provider to `ALLOWED_IFRAME_DOMAINS` in `frontend/src/lib/embedSafety.ts`, add it to `FRONTEND_IFRAME_DOMAINS` in `security-headers.ts` too. A unit test fails if the two lists differ.
+The Amplify app sends HSTS, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy` and a Content Security Policy (`cdk/lib/security-headers.ts`). The CSP is enforced by default. To debug a violation without blocking it, deploy the Amplify stack with `-c CspEnforce=false`, which sends it as `Content-Security-Policy-Report-Only`; `cdk/scripts/smoke-security-defaults.ps1` fails while that mode is on. If you add a new embed provider to `ALLOWED_IFRAME_DOMAINS` in `frontend/src/lib/embedSafety.ts`, add it to `FRONTEND_IFRAME_DOMAINS` in `security-headers.ts` too. A unit test fails if the two lists differ.
 
 ### Shared Endpoints
 

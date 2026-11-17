@@ -80,6 +80,7 @@ $csp = if ($enforced) { $enforced } else { $reportOnly }
 Check 'CSP header present' ([bool] $csp)
 if ($csp) {
   Write-Host ("      mode: " + $(if ($enforced) { 'ENFORCED' } else { 'REPORT-ONLY' }))
+  Check 'CSP is enforced (not Report-Only)' ([bool] $enforced) 'only Content-Security-Policy-Report-Only is sent; redeploy without -c CspEnforce=false'
   Check "CSP script-src is 'self' blob: only" ($csp -match "script-src 'self' blob:;")
   Check "CSP object-src 'none'" ($csp -match "object-src 'none'")
   Check "CSP frame-ancestors 'none'" ($csp -match "frame-ancestors 'none'")
@@ -152,8 +153,9 @@ else { Write-Host "$script:failures check(s) failed." -ForegroundColor Red }
 
 Write-Host @'
 
-Manual browser checks (DevTools console open; with Report-Only, look for
-"[Report Only] Refused to ..." messages, which must be zero before enforcing):
+Manual browser checks (DevTools console open; look for "Refused to ..." CSP
+messages, which must be zero. To see every violation without blocking, deploy
+the Amplify stack with -c CspEnforce=false and look for "[Report Only]" ones):
   1. Log in (Cognito) and log out.
   2. Student: open a patient, send text chat messages, see the streamed reply (AppSync).
   3. Student: start a voice session (microphone prompt, AudioWorklet, socket).
@@ -164,8 +166,8 @@ Manual browser checks (DevTools console open; with Report-Only, look for
   8. Instructor: save a long system prompt (~20-60 KB must save; >64 KB returns 403).
   9. Export a PDF report (jsPDF/html2canvas).
  10. Prompt Playground: voice preview.
-When clean, redeploy the Amplify stack with -c CspEnforce=true, rerun this
-script (CSP mode should read ENFORCED) and repeat the browser checks.
+If you debugged in Report-Only mode, redeploy without -c CspEnforce=false,
+rerun this script (CSP mode must read ENFORCED) and repeat the browser checks.
 '@
 
 exit $script:failures

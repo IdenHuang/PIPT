@@ -79,7 +79,7 @@ describe('Content-Security-Policy', () => {
 });
 
 describe('Amplify custom headers', () => {
-  test('report-only by default, enforcing when asked, with YAML-escaped quotes', () => {
+  test('report-only or enforcing as asked, with YAML-escaped quotes', () => {
     const reportOnly = buildAmplifyCustomHeaders("default-src 'self'", false);
     expect(reportOnly).toContain("key: 'Content-Security-Policy-Report-Only'");
     expect(reportOnly).toContain("value: 'default-src ''self'''");
@@ -95,6 +95,11 @@ describe('Amplify custom headers', () => {
   test('the Amplify app is wired to the headers', () => {
     const stack = read('lib', 'amplify-stack.ts');
     expect(stack).toContain('customHeaders: buildAmplifyCustomHeaders(contentSecurityPolicy, enforceCsp)');
+  });
+
+  test('the CSP is enforced unless CspEnforce=false is passed', () => {
+    const stack = read('lib', 'amplify-stack.ts');
+    expect(stack).toContain('String(this.node.tryGetContext("CspEnforce") ?? "true") !== "false"');
   });
 });
 

@@ -23,10 +23,10 @@ export class AmplifyStack extends cdk.Stack {
     // Context values
     const githubRepoName = this.node.tryGetContext("githubRepo");
 
-    // Security headers for every page. The CSP ships as Report-Only until it has been
-    // checked in a browser (cdk/scripts/smoke-security-defaults.ps1 lists the checks); then deploy
-    // with -c CspEnforce=true to make it blocking.
-    const enforceCsp = String(this.node.tryGetContext("CspEnforce") ?? "false") === "true";
+    // Security headers for every page. The CSP is enforced by default. To debug a
+    // violation without blocking it, deploy with -c CspEnforce=false (Report-Only);
+    // cdk/scripts/smoke-security-defaults.ps1 fails while the CSP is Report-Only.
+    const enforceCsp = String(this.node.tryGetContext("CspEnforce") ?? "true") !== "false";
     const contentSecurityPolicy = buildContentSecurityPolicy({
       region: apiStack.region,
       apiHost: apiStack.getApiHost(),
