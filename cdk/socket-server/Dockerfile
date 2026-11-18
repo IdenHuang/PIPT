@@ -3,8 +3,10 @@ FROM ${REGISTRY}node:22-alpine
 
 WORKDIR /app
 
-# Install Python and pip
-RUN apk add --no-cache python3 py3-pip
+# Upgrade base-image packages first so OS-level fixes published after the
+# node:22-alpine tag was built (e.g. zlib, CVE-2026-4738) reach the image and
+# pass the ECR scan gate. Then install Python and pip.
+RUN apk upgrade --no-cache && apk add --no-cache python3 py3-pip
 
 # Install Node.js dependencies
 COPY package.json package-lock.json ./
