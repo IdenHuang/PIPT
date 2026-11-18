@@ -5,7 +5,7 @@ const { Server } = require("socket.io");
 const { spawn } = require("child_process");
 const WebSocket = require("ws");
 const { verifyToken, hydrateVerifier } = require("./auth");
-const { verifySessionScope } = require("./session-auth");
+const { verifySessionScope, isSessionConcluded } = require("./session-auth");
 const { authorizeSessionRequest } = require("./session-guard");
 const { resolveRelayToken } = require("./relay-token");
 const { fetchPatientContext } = require("./patient-context");
@@ -278,24 +278,6 @@ app.post("/stream-callback", (req, res) => {
   res.status(200).json({ ok: true });
 });
 
-// ─── TURN Credential Generation (RFC 5389) ───────────────────────────────────
-// NOTE: Currently unused — retained for future TURN server integration.
-/**
- * Generate time-limited TURN credentials using HMAC-SHA1.
- * @param {string} username — unique identifier (e.g. socket.userId)
- * @param {string} sharedSecret — TURN shared secret
- * @param {number} ttlSeconds — credential lifetime (max 24 hours)
- * @returns {{ username: string, credential: string }}
- */
-function generateTurnCredentials(username, sharedSecret, ttlSeconds = 86400) { // eslint-disable-line no-unused-vars
-  const timestamp = Math.floor(Date.now() / 1000) + ttlSeconds;
-  const turnUsername = `${timestamp}:${username}`;
-  const hmac = crypto.createHmac("sha1", sharedSecret);
-  hmac.update(turnUsername);
-  const turnPassword = hmac.digest("base64");
-  return { username: turnUsername, credential: turnPassword };
-}
-
 // ─── Voice Preview & Connection Limits ────────────────────────────────────────
 // Keyed on the authenticated identity (not socket.id) so reconnecting or
 // opening parallel sockets does not reset the budget. State outlives the
@@ -544,6 +526,8 @@ io.on("connection", (socket) => {
     // ── Session authorization (fail closed; see session-guard.js) ─────────
     // The caller must own the chat and it must belong to the patient/group in
     // the config, since those IDs drive which persona context is loaded.
+    // Voice must also be enabled for the persona and group: the SPA hides the
+    // microphone when staff turn voice off, but this is the server-side gate.
     const sessionId = config.session_id;
     const novaAuthz = await authorizeSessionRequest(
       {
@@ -552,7 +536,8 @@ io.on("connection", (socket) => {
         patientId: config.patient_id,
         simulationGroupId: config.simulation_group_id,
       },
-      verifySessionScope,
+      (sid, personaId, groupId, email) =>
+        verifySessionScope(sid, personaId, groupId, email, { requireVoiceEnabled: true }),
     );
     if (!novaAuthz.allowed) {
       logger.warn("Session authorization denied for start-nova-sonic", {
@@ -565,6 +550,19 @@ io.on("connection", (socket) => {
       return;
     }
     if (isStale()) return;
+    // A concluded chat is final; voice must not reopen it.
+    const concluded = await isSessionConcluded(sessionId);
+    if (isStale()) return;
+    if (concluded) {
+      logger.warn("start-nova-sonic refused: chat is concluded", {
+        component: "server",
+        operation: "start-nova-sonic",
+        userEmail: socket.userEmail,
+        sessionId,
+      });
+      socket.emit("nova-error", { error: "This interaction has been concluded." });
+      return;
+    }
 
     // ── Caller's ID token for upstream calls (required) ────────────────────
     // The client sends a fresh token with each start. It is verified and bound

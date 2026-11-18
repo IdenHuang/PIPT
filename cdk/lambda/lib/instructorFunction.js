@@ -122,47 +122,6 @@ exports.handler = async (event, context) => {
 
   try {
     switch (pathData) {
-      case "GET /instructor/student_group":
-        {
-          const email = userEmailAttribute || (event.queryStringParameters && event.queryStringParameters.email);
-          if (email) {
-            try {
-              // First, get the user_id for the given email
-              const userResult = await sqlConnection`
-                SELECT user_id FROM "users" WHERE user_email = ${email};
-              `;
-
-              if (userResult.length === 0) {
-                response.statusCode = 404;
-                response.body = JSON.stringify({ error: "User not found" });
-                break;
-              }
-
-              const userId = userResult[0].user_id;
-
-              // Now, fetch the simulation groups for that user_id
-              const data = await sqlConnection`
-                SELECT sg.*
-                FROM "enrollments" e
-                JOIN "simulation_groups" sg 
-                ON e.simulation_group_id = sg.simulation_group_id
-                WHERE e.user_id = ${userId}
-                ORDER BY sg.group_name, sg.simulation_group_id;
-              `;
-
-              response.statusCode = 200;
-              response.body = JSON.stringify(data);
-            } catch (err) {
-              response.statusCode = 500;
-              logger.error("Operation failed", { error: err.message, stack: err.stack });
-              response.body = JSON.stringify({ error: "Internal server error" });
-            }
-          } else {
-            response.statusCode = 400;
-            response.body = JSON.stringify({ error: "Invalid value" });
-          }
-        }
-        break;
       case "GET /instructor/groups":
         {
           const instructorEmail = userEmailAttribute || (event.queryStringParameters && event.queryStringParameters.email);

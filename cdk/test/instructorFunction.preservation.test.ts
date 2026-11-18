@@ -8,7 +8,6 @@
  *
  * These endpoints use CORRECT naming and should continue working after the fix:
  * - GET /instructor/groups
- * - GET /instructor/student_group
  * - GET /instructor/view_students
  * - DELETE /instructor/delete_student
  * - GET /instructor/get_prompt
@@ -63,22 +62,6 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
       expect(code).toContain('user_id');
       expect(code).toContain('simulation_group_id');
       expect(code).toContain('enrollment_type');
-
-      expect(code).not.toContain('"sessions"');
-    });
-  });
-
-  describe('GET /instructor/student_group - correct table/column naming (Req 3.1, 3.2)', () => {
-    test('queries users, enrollments, simulation_groups with correct columns', () => {
-      const code = getEndpointCode('GET /instructor/student_group');
-      expect(code).toBeTruthy();
-
-      expect(code).toContain('"users"');
-      expect(code).toContain('"enrollments"');
-      expect(code).toContain('"simulation_groups"');
-      expect(code).toContain('user_email');
-      expect(code).toContain('user_id');
-      expect(code).toContain('simulation_group_id');
 
       expect(code).not.toContain('"sessions"');
     });
@@ -304,7 +287,6 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
   describe('All preserved endpoints return proper HTTP status codes (Req 3.9)', () => {
     const preservedEndpoints = [
       'GET /instructor/groups',
-      'GET /instructor/student_group',
       'GET /instructor/view_students',
       'DELETE /instructor/delete_student',
       'GET /instructor/get_prompt',
@@ -336,7 +318,6 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
   describe('All preserved endpoints have error handling (Req 3.10)', () => {
     const preservedEndpoints = [
       'GET /instructor/groups',
-      'GET /instructor/student_group',
       'GET /instructor/view_students',
       'DELETE /instructor/delete_student',
       'GET /instructor/get_prompt',
@@ -370,7 +351,6 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
   describe('All preserved endpoints validate required parameters (Req 3.9)', () => {
     const preservedEndpoints = [
       'GET /instructor/groups',
-      'GET /instructor/student_group',
       'GET /instructor/view_students',
       'DELETE /instructor/delete_student',
       'GET /instructor/get_prompt',
@@ -402,7 +382,6 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
   describe('Property-Based: Preserved endpoints use only valid schema names', () => {
     const preservedEndpoints = [
       'GET /instructor/groups',
-      'GET /instructor/student_group',
       'GET /instructor/view_students',
       'DELETE /instructor/delete_student',
       'GET /instructor/get_prompt',
@@ -444,7 +423,7 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
             return tableRefs.every((table) => validTables.includes(table));
           },
         ),
-        { numRuns: 12 },
+        { numRuns: 11 },
       );
     });
 
@@ -476,7 +455,7 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
             );
           },
         ),
-        { numRuns: 12 },
+        { numRuns: 11 },
       );
     });
   });
@@ -484,7 +463,6 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
   describe('Property-Based: Preserved endpoints do not reference sessions table', () => {
     const preservedEndpoints = [
       'GET /instructor/groups',
-      'GET /instructor/student_group',
       'GET /instructor/view_students',
       'DELETE /instructor/delete_student',
       'GET /instructor/get_prompt',
@@ -511,7 +489,7 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
             return !hasSessionsTable;
           },
         ),
-        { numRuns: 14 },
+        { numRuns: 13 },
       );
     });
   });
@@ -519,7 +497,6 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
   describe('Property-Based: Preserved endpoints maintain response structure', () => {
     const preservedEndpoints = [
       'GET /instructor/groups',
-      'GET /instructor/student_group',
       'GET /instructor/view_students',
       'DELETE /instructor/delete_student',
       'GET /instructor/get_prompt',
@@ -545,7 +522,7 @@ describe('Preservation Property: Non-Buggy Database Operations', () => {
             return /response\.body\s*=\s*JSON\.stringify/.test(code);
           },
         ),
-        { numRuns: 14 },
+        { numRuns: 13 },
       );
     });
   });

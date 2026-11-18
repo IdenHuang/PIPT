@@ -648,7 +648,9 @@ def handler(event, context):
             DebriefClaimHeld,
             generate_debrief,
         )
-        patient_mode = query_params.get("patient_mode", "interview_practice")
+        # Any patient_mode query parameter is ignored: generate_debrief derives
+        # the grading scope from the group's assignments, so the graded
+        # student cannot narrow it (security finding f-5874e8aa).
         # Set by studentFunction.js on its async invokes. Any other value
         # (e.g. a direct API Gateway call) keeps the synchronous behaviour.
         trigger = query_params.get("debrief_trigger")
@@ -663,7 +665,6 @@ def handler(event, context):
                 llm=llm,
                 embeddings_model=embeddings,
                 ddb_table_name=TABLE_NAME,
-                patient_mode=patient_mode,
                 trigger=trigger,
             )
             return {

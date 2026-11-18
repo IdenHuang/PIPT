@@ -1920,40 +1920,6 @@ paths:
         httpMethod: "POST"
         type: "aws_proxy"
 
-  /instructor/student_group:
-    <<: *commonOptions
-    get:
-      tags:
-        - Instructor
-      summary: Get student groups for the authenticated instructor
-      operationId: instructor_student_group_GET
-      responses:
-        "200":
-          description: Groups retrieved successfully
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  presignedurl:
-                    type: string
-                    description: Presigned URL to upload document file to S3 Bucket
-        "400":
-          description: Bad Request
-        "401":
-          description: Unauthorized
-        "429":
-          description: Too Many Requests
-        "500":
-          description: Internal Server Error
-      security:
-        - instructorAuthorizer: []
-      x-amazon-apigateway-integration:
-        uri:
-          Fn::Sub: "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${instructorFunction.Arn}/invocations"
-        passthroughBehavior: "when_no_match"
-        httpMethod: "POST"
-        type: "aws_proxy"
   /instructor/generate_presigned_url:
     <<: *commonOptions
     get:
@@ -5392,7 +5358,7 @@ paths:
                 properties:
                   message:
                     type: string
-                    example: "User role updated to student for example@example.com"
+                    example: "User role updated to student for example@example.com. Instructor access to all simulation groups was removed."
         "400":
           description: Bad Request
           content:

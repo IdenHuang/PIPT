@@ -102,9 +102,10 @@ export function buildContentSecurityPolicy(hosts: CspHosts): string {
 }
 
 /**
- * Amplify customHeaders YAML. When `enforceCsp` is false the CSP is sent as
+ * Amplify customHeaders YAML. The CSP is enforced by default (see
+ * amplify-stack.ts); when `enforceCsp` is false it is sent as
  * Content-Security-Policy-Report-Only, so violations show in the browser
- * console without blocking anything.
+ * console without blocking anything. Use that only to debug a violation.
  */
 export function buildAmplifyCustomHeaders(csp: string, enforceCsp: boolean): string {
   const headers: [string, string][] = [

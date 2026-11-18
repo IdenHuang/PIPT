@@ -130,34 +130,63 @@ export function isEmbedCode(value: string): boolean {
 }
 
 /**
+ * Sandbox applied to every rendered media iframe. Matches the plain-URL
+ * iframes in PhysicalAssessmentContent.tsx and EditPatientPanel.tsx.
+ */
+export const EMBED_IFRAME_SANDBOX =
+  'allow-downloads allow-forms allow-same-origin allow-scripts allow-top-navigation allow-pointer-lock ' +
+  'allow-popups allow-modals allow-orientation-lock allow-popups-to-escape-sandbox allow-presentation ' +
+  'allow-top-navigation-by-user-activation';
+
+/**
+ * Attributes copied from the instructor's iframe onto the rebuilt one.
+ * `src` and `sandbox` are excluded: src is replaced with the normalized,
+ * allowlisted URL and sandbox is always EMBED_IFRAME_SANDBOX.
+ */
+const COPIED_IFRAME_ATTRS = [
+  'width',
+  'height',
+  'allow',
+  'allowfullscreen',
+  'frameborder',
+  'title',
+  'style',
+  'loading',
+  'referrerpolicy',
+] as const;
+
+/**
  * Sanitize embed HTML down to a single iframe with safe attributes and an
- * allowlisted https src. Returns '' when the embed can't be rendered safely.
+ * allowlisted https src. Returns '' when the embed can't be rendered safely,
+ * including when it contains more than one iframe (finding f-279ac83c).
+ *
+ * The returned HTML is a freshly built iframe, never the sanitizer's raw
+ * output, so nothing other than the one validated frame can reach the page.
  */
 export function sanitizeEmbedCode(html: string): string {
   const clean = DOMPurify.sanitize(html, {
     ALLOWED_TAGS: ['iframe'],
-    ALLOWED_ATTR: [
-      'src',
-      'width',
-      'height',
-      'allow',
-      'allowfullscreen',
-      'frameborder',
-      'title',
-      'style',
-      'loading',
-      'referrerpolicy',
-      'sandbox',
-    ],
+    ALLOWED_ATTR: ['src', ...COPIED_IFRAME_ATTRS],
     ADD_TAGS: ['iframe'],
     ADD_ATTR: ['allowfullscreen'],
   });
 
   const doc = new DOMParser().parseFromString(clean, 'text/html');
-  const iframe = doc.querySelector('iframe');
-  if (!iframe) return '';
+  const iframes = doc.querySelectorAll('iframe');
+  if (iframes.length !== 1) return '';
 
-  return toAllowedIframeSrc(iframe.getAttribute('src')) ? clean : '';
+  const source = iframes[0];
+  const src = toAllowedIframeSrc(source.getAttribute('src'));
+  if (!src) return '';
+
+  const iframe = doc.createElement('iframe');
+  iframe.setAttribute('src', src);
+  for (const name of COPIED_IFRAME_ATTRS) {
+    const value = source.getAttribute(name);
+    if (value !== null) iframe.setAttribute(name, value);
+  }
+  iframe.setAttribute('sandbox', EMBED_IFRAME_SANDBOX);
+  return iframe.outerHTML;
 }
 
 /**

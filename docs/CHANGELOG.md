@@ -7,6 +7,13 @@ All notable changes to the PIPT project are documented here.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+
+- The Amplify CSP is now enforced by default; `-c CspEnforce=false` switches it to Report-Only for debugging, and the security smoke test fails in that mode
+- The voice agent container runs as an unprivileged user (uid 10001) instead of root
+
 ## [2026-11-12]
 
 ### Added

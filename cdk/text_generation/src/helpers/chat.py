@@ -4154,6 +4154,54 @@ def debrief_exists(session_id: str) -> bool:
         raise RuntimeError("Could not determine debrief state") from e
 
 
+def patient_mode_from_counts(question_count: int, dtp_count: int, rec_count: int) -> str:
+    """Map assignment counts to a debrief scope. Mirrors getPatientMode in
+    cdk/lambda/lib/debriefGeneration.js; keep the two in step."""
+    if question_count == 0 and dtp_count == 0 and rec_count == 0:
+        return "conversation_only"
+    if dtp_count == 0 and rec_count == 0:
+        return "interview_practice"
+    return "full_assessment"
+
+
+def derive_patient_mode(simulation_group_id: str, persona_id: str) -> str:
+    """Derive the debrief scope from the group's DTP, recommendation and
+    key-question assignments for this persona.
+
+    The scope is never taken from the request: the graded student could
+    otherwise narrow their own grade (security finding f-5874e8aa).
+    Fails closed: a DB error raises, so the grader does not run with a
+    guessed scope.
+    """
+    try:
+        conn = _get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT
+                  (SELECT COUNT(*) FROM "simulation_group_questions"
+                     WHERE simulation_group_id = %(g)s
+                       AND (persona_id = %(p)s OR persona_id IS NULL)),
+                  (SELECT COUNT(*) FROM "simulation_group_dtps"
+                     WHERE simulation_group_id = %(g)s
+                       AND (persona_id = %(p)s OR persona_id IS NULL)),
+                  (SELECT COUNT(*) FROM "simulation_group_recommendations"
+                     WHERE simulation_group_id = %(g)s
+                       AND (persona_id = %(p)s OR persona_id IS NULL))
+                """,
+                {"g": simulation_group_id, "p": persona_id},
+            )
+            question_count, dtp_count, rec_count = cursor.fetchone()
+            cursor.close()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error deriving patient mode: {type(e).__name__}")
+        raise RuntimeError("Could not determine debrief scope") from e
+    return patient_mode_from_counts(int(question_count), int(dtp_count), int(rec_count))
+
+
 # Returned only when the DB confirms a debrief row exists for the chat.
 DEBRIEF_ALREADY_GENERATED = {"status": "already_generated"}
 # Returned when another run holds the claim and no result is known yet.
@@ -4350,10 +4398,11 @@ def generate_debrief(
     llm: ChatBedrock,
     embeddings_model=None,
     ddb_table_name: str = None,
-    patient_mode: str = "interview_practice",
     trigger: str | None = None,
 ) -> dict:
     """Generate the chat's debrief at most once (see _run_debrief_grader).
+    The grading scope (patient_mode) is derived here from the group's
+    assignments, never from the caller (f-5874e8aa).
 
     One debrief per chat. A repeat or concurrent call must not re-run the
     grader: it would re-read the answer key, re-publish the stream frames and
@@ -4400,6 +4449,8 @@ def generate_debrief(
         if debrief_exists(session_id):
             logger.info(f"📋 Debrief already exists for session={session_id} — skipping generation")
             return dict(DEBRIEF_ALREADY_GENERATED)
+        patient_mode = derive_patient_mode(simulation_group_id, persona_id)
+        logger.info(f"Derived patient_mode={patient_mode} for session={session_id}")
         return _run_debrief_grader(
             session_id=session_id,
             simulation_group_id=simulation_group_id,

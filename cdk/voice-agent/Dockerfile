@@ -11,7 +11,7 @@ FROM public.ecr.aws/amazonlinux/amazonlinux:2023
 # is needed to see newer patched packages.
 # https://docs.aws.amazon.com/linux/al2023/ug/deterministic-upgrades.html
 RUN dnf -y upgrade --releasever=latest \
-    && dnf -y install --releasever=latest python3.12 python3.12-pip \
+    && dnf -y install --releasever=latest python3.12 python3.12-pip shadow-utils \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
@@ -23,6 +23,11 @@ RUN python3.12 -m pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 ENV PYTHONUNBUFFERED=1
+
+# Run as an unprivileged user. Code and packages stay root-owned (read-only to
+# the app); port 8080 needs no extra privileges.
+RUN useradd --system --uid 10001 --create-home --shell /sbin/nologin app
+USER 10001
 
 # AgentCore expects /ping, /invocations, and /ws on port 8080
 EXPOSE 8080

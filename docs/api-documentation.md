@@ -95,7 +95,7 @@ The API WAF (`cdk/lib/api-service-stack.ts`) runs the managed `SizeRestrictions_
 
 ### Frontend Security Headers
 
-The Amplify app sends HSTS, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy` and a Content Security Policy (`cdk/lib/security-headers.ts`). By default the CSP is sent as `Content-Security-Policy-Report-Only`. Once the browser checks in `cdk/scripts/smoke-security-defaults.ps1` show no violations, deploy the Amplify stack with `-c CspEnforce=true` to enforce it. If you add a new embed provider to `ALLOWED_IFRAME_DOMAINS` in `frontend/src/lib/embedSafety.ts`, add it to `FRONTEND_IFRAME_DOMAINS` in `security-headers.ts` too. A unit test fails if the two lists differ.
+The Amplify app sends HSTS, `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy`, `Permissions-Policy` and a Content Security Policy (`cdk/lib/security-headers.ts`). The CSP is enforced by default. To debug a violation without blocking it, deploy the Amplify stack with `-c CspEnforce=false`, which sends it as `Content-Security-Policy-Report-Only`; `cdk/scripts/smoke-security-defaults.ps1` fails while that mode is on. If you add a new embed provider to `ALLOWED_IFRAME_DOMAINS` in `frontend/src/lib/embedSafety.ts`, add it to `FRONTEND_IFRAME_DOMAINS` in `security-headers.ts` too. A unit test fails if the two lists differ.
 
 ### Shared Endpoints
 
@@ -1346,37 +1346,6 @@ Get all simulation groups where the instructor is enrolled.
 
 ```bash
 curl -X GET "https://api-id.execute-api.us-east-1.amazonaws.com/prod/instructor/groups?email=instructor@example.com" \
-  -H "Authorization: eyJraWQiOiJ..."
-```
-
----
-
-### Get Student Group (Legacy)
-
-Get groups for a specific student.
-
-**Endpoint:** `GET /instructor/student_group`
-
-**Query Parameters:**
-
-- `email` (string, optional): Email of the instructor (must match token email if provided; token email used if omitted)
-
-**Response:**
-
-```json
-[
-  {
-    "simulation_group_id": "uuid",
-    "group_name": "Pharmacy 101",
-    "group_description": "Introductory simulation"
-  }
-]
-```
-
-**Example (cURL):**
-
-```bash
-curl -X GET "https://api-id.execute-api.us-east-1.amazonaws.com/prod/instructor/student_group?email=instructor@example.com" \
   -H "Authorization: eyJraWQiOiJ..."
 ```
 
@@ -3710,7 +3679,13 @@ curl -X POST "https://api-id.execute-api.us-east-1.amazonaws.com/prod/admin/elev
 
 ### Lower Instructor
 
-Revoke instructor role and convert user back to student. Deletes all instructor enrollments.
+Revoke instructor role and convert user back to student. In the same transaction it removes every way the user could still act as a group instructor:
+
+- deletes all `enrollments` rows with `enrollment_type = 'instructor'`;
+- deletes all `group_instructors` rows for the user;
+- reassigns `simulation_groups.created_by` to the acting admin for every group the user created, writing one `lower_instructor` row per group to `role_audit_log` with `simulation_group_id` set.
+
+Without this, a demoted user would keep answer-key access and instructor-only LLM modes on the `/student/*` routes for groups they created, because those routes check group ownership rather than `users.roles`.
 
 **Endpoint:** `POST /admin/lower_instructor`
 
@@ -3722,7 +3697,7 @@ Revoke instructor role and convert user back to student. Deletes all instructor 
 
 ```json
 {
-  "message": "User role updated to student for user@example.com"
+  "message": "User role updated to student for user@example.com. Instructor access to all simulation groups was removed."
 }
 ```
 

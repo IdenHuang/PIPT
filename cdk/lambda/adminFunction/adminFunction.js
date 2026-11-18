@@ -16,6 +16,7 @@ const DEFAULT_DEBRIEF_PROMPT = fs.readFileSync(path.join(__dirname, "defaultDebr
 const { seedPrompt } = require("./seedPrompt.js");
 const { generateAccessCode } = require("./accessCode.js");
 const { enrollInstructor } = require("./enrollInstructor.js");
+const { revokeGroupInstructorAccess } = require("./revokeGroupInstructorAccess.js");
 const DEFAULT_SYSTEM_PROMPT = fs.readFileSync(path.join(__dirname, "defaultSystemPrompt.txt"), "utf8").trim();
 
 // SQL conneciton from global variable at libadmin.js
@@ -709,25 +710,31 @@ exports.handler = async (event, context) => {
               .filter((role) => role !== "instructor")
               .concat("student");
 
-            // Update the roles, record the change, and delete all instructor
-            // enrollments in one transaction.
-            await applyRoleChange(sqlConnectionTableCreator, {
+            // Update the roles, record the change, and remove every
+            // group-instructor grant (instructor enrollments,
+            // group_instructors rows, created_by ownership) in one
+            // transaction. See revokeGroupInstructorAccess.js.
+            const change = {
               action: "lower_instructor",
               actor,
               targetUserId: userId,
               targetEmail: userEmail,
               oldRoles: userRoles,
               newRoles: updatedRoles,
-            }, async (tx) => {
-              await tx`
-                DELETE FROM "enrollments"
-                WHERE user_id = ${userId} AND enrollment_type = 'instructor';
-              `;
+            };
+            let reassignedGroupIds = [];
+            await applyRoleChange(sqlConnectionTableCreator, change, async (tx) => {
+              ({ reassignedGroupIds } = await revokeGroupInstructorAccess(tx, change));
+            });
+            logger.info("GROUP_OWNERSHIP_REASSIGNED", {
+              targetEmail: userEmail,
+              actorEmail: actor.email,
+              simulationGroupIds: reassignedGroupIds,
             });
 
             response.statusCode = 200;
             response.body = JSON.stringify({
-              message: `User role updated to student for ${userEmail} and all instructor enrolments deleted.`,
+              message: `User role updated to student for ${userEmail}. Instructor access to all simulation groups was removed.`,
             });
           } catch (err) {
             logger.error("Operation failed", { error: err.message, stack: err.stack });

@@ -11,7 +11,6 @@ import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import { VpcStack } from "./vpc-stack";
 import { DatabaseStack } from "./database-stack";
-import { TurnServerStack } from "./turn-server-stack";
 import { LogProtection } from "./log-protection";
 import { approvedImageTag } from "./approved-image";
 import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
@@ -49,7 +48,6 @@ export class EcsSocketStack extends Stack {
     db: DatabaseStack,
     apiServiceStack: any,
     socketServerRepo: ecr.IRepository,
-    turnServerStack: TurnServerStack,
     voiceAgentEndpoint: string | undefined,
     stackPrefix: string,
     dynamoTableName: string,
@@ -69,14 +67,10 @@ export class EcsSocketStack extends Stack {
     // 1) ECS cluster
     const cluster = new ecs.Cluster(this, "SocketCluster", { vpc });
 
-    // 2) Task role
+    // 2) Task role: what the socket server code itself calls at runtime.
+    // Image pull and log delivery are the execution role's job (below).
     const taskRole = new iam.Role(this, "SocketTaskRole", {
       assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName(
-          "service-role/AmazonECSTaskExecutionRolePolicy"
-        ),
-      ],
       inlinePolicies: {
         BedrockPolicy: new iam.PolicyDocument({
           statements: [
@@ -175,18 +169,22 @@ export class EcsSocketStack extends Stack {
       })
     );
 
-    // Grant ECS task role permission to read the TURN shared secret
-    turnServerStack.turnSecret.grantRead(taskRole);
 
-    // REVIEW: The task role is also used as the execution role. These should be separate:
-    // - Task role: permissions the application code needs at runtime (Bedrock, DynamoDB, etc.)
-    // - Execution role: permissions ECS needs to pull images and write logs
-    // Sharing them means the ECS agent has access to Bedrock, DynamoDB, etc., which violates least privilege.
+    // Execution role: used by the ECS agent, not the app, to pull the image and
+    // ship container logs. CDK adds the ECR pull grant (fromEcrRepository) and
+    // the write grant on the awslogs log group to this role. It holds none of
+    // the task role's Bedrock, DynamoDB or Secrets Manager permissions. If
+    // container `secrets` are ever added, grant GetSecretValue on those here.
+    // https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html
+    const executionRole = new iam.Role(this, "SocketExecutionRole", {
+      assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+    });
+
     const taskDef = new ecs.FargateTaskDefinition(this, "SocketTaskDef", {
       cpu: 1024,
       memoryLimitMiB: 2048,
       taskRole,
-      executionRole: taskRole, // ← should be a separate, minimal execution role
+      executionRole,
     });
 
     // 3) Network Load Balancer on TCP 80
@@ -257,8 +255,6 @@ export class EcsSocketStack extends Stack {
         TEXT_GENERATION_ENDPOINT: apiServiceStack.getEndpointUrl(),
         APPSYNC_GRAPHQL_URL: apiServiceStack.appSyncApi.graphqlUrl,
         SOCKET_EXECUTION_ROLE_ARN: taskRole.roleArn,
-        TURN_SERVER_URL: turnServerStack.turnServerUrl,
-        STUN_SERVER_URL: turnServerStack.stunServerUrl,
         BEDROCK_GUARDRAIL_ID: apiServiceStack.getGuardrailId(),
         // Guardrail IDs are regional; the guardrail lives in the Api stack's region.
         BEDROCK_GUARDRAIL_REGION: apiServiceStack.region,
@@ -266,9 +262,6 @@ export class EcsSocketStack extends Stack {
         SM_STREAM_CALLBACK_SECRET: apiServiceStack.streamCallbackSecret.secretName,
         ALLOWED_ORIGINS: apiServiceStack.getAllowedOriginsEnv(),
         ...(resolvedVoiceAgentEndpoint ? { VOICE_AGENT_ENDPOINT: resolvedVoiceAgentEndpoint } : {}),
-      },
-      secrets: {
-        TURN_SHARED_SECRET: ecs.Secret.fromSecretsManager(turnServerStack.turnSecret),
       },
     });
 
@@ -337,7 +330,8 @@ export class EcsSocketStack extends Stack {
           }),
           new iam.PolicyStatement({
             actions: ["iam:PassRole"],
-            resources: [taskRole.roleArn],
+            // register-task-definition passes both roles.
+            resources: [taskRole.roleArn, executionRole.roleArn],
             conditions: {
               StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
             },
