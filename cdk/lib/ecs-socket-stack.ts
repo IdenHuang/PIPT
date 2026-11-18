@@ -67,14 +67,10 @@ export class EcsSocketStack extends Stack {
     // 1) ECS cluster
     const cluster = new ecs.Cluster(this, "SocketCluster", { vpc });
 
-    // 2) Task role
+    // 2) Task role: what the socket server code itself calls at runtime.
+    // Image pull and log delivery are the execution role's job (below).
     const taskRole = new iam.Role(this, "SocketTaskRole", {
       assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName(
-          "service-role/AmazonECSTaskExecutionRolePolicy"
-        ),
-      ],
       inlinePolicies: {
         BedrockPolicy: new iam.PolicyDocument({
           statements: [
@@ -174,15 +170,21 @@ export class EcsSocketStack extends Stack {
     );
 
 
-    // REVIEW: The task role is also used as the execution role. These should be separate:
-    // - Task role: permissions the application code needs at runtime (Bedrock, DynamoDB, etc.)
-    // - Execution role: permissions ECS needs to pull images and write logs
-    // Sharing them means the ECS agent has access to Bedrock, DynamoDB, etc., which violates least privilege.
+    // Execution role: used by the ECS agent, not the app, to pull the image and
+    // ship container logs. CDK adds the ECR pull grant (fromEcrRepository) and
+    // the write grant on the awslogs log group to this role. It holds none of
+    // the task role's Bedrock, DynamoDB or Secrets Manager permissions. If
+    // container `secrets` are ever added, grant GetSecretValue on those here.
+    // https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html
+    const executionRole = new iam.Role(this, "SocketExecutionRole", {
+      assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
+    });
+
     const taskDef = new ecs.FargateTaskDefinition(this, "SocketTaskDef", {
       cpu: 1024,
       memoryLimitMiB: 2048,
       taskRole,
-      executionRole: taskRole, // ← should be a separate, minimal execution role
+      executionRole,
     });
 
     // 3) Network Load Balancer on TCP 80
@@ -328,7 +330,8 @@ export class EcsSocketStack extends Stack {
           }),
           new iam.PolicyStatement({
             actions: ["iam:PassRole"],
-            resources: [taskRole.roleArn],
+            // register-task-definition passes both roles.
+            resources: [taskRole.roleArn, executionRole.roleArn],
             conditions: {
               StringEquals: { "iam:PassedToService": "ecs-tasks.amazonaws.com" },
             },

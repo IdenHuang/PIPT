@@ -608,76 +608,88 @@ export class ApiServiceStack extends cdk.Stack {
       }
     );
 
-    // REVIEW: A single lambdaRole is shared across student, instructor, authorizer and
-    // timeout-handler Lambda functions (admin has its own adminLambdaRole). This means every function has the union of all permissions. Create separate
-    // roles per function group (studentRole, instructorRole, adminRole, fileOpsRole) to follow
-    // least privilege. The EC2 network interface permissions (required for VPC Lambdas) can be
-    // shared via a managed policy.
-    const lambdaRole = new iam.Role(
-      this,
-      `${id}-postgresLambdaRole-${this.region}`,
-      {
-        roleName: `${id}-postgresLambdaRole-${this.region}`,
+    // Student, instructor, authorizer and timeout-handler Lambdas each get their own
+    // role so a compromise of one (e.g. the student surface) doesn't inherit the
+    // others' permissions. Common grants live in managed policies, attached only
+    // where needed. The admin function has its own adminLambdaRole (below).
+
+    // CloudWatch Logs, needed by every function.
+    const lambdaLogsPolicy = new iam.ManagedPolicy(this, `${id}-lambdaLogsPolicy`, {
+      statements: [
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: [
+            "logs:CreateLogGroup",
+            "logs:CreateLogStream",
+            "logs:PutLogEvents",
+          ],
+          resources: ["arn:aws:logs:*:*:*"],
+        }),
+      ],
+    });
+
+    // VPC network interfaces, needed only by VPC-attached functions.
+    const lambdaVpcEniPolicy = new iam.ManagedPolicy(this, `${id}-lambdaVpcEniPolicy`, {
+      statements: [
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: [
+            "ec2:CreateNetworkInterface",
+            "ec2:DescribeNetworkInterfaces",
+            "ec2:DeleteNetworkInterface",
+            "ec2:AssignPrivateIpAddresses",
+            "ec2:UnassignPrivateIpAddresses",
+          ],
+          resources: ["*"], // must be *
+        }),
+      ],
+    });
+
+    // app_rw database access: the credential plus RDS Proxy connect. Attached only
+    // to roles whose function sets SM_DB_CREDENTIALS to db.secretPathUser. Never
+    // holds app_tc (the DDL-capable credential), which is on adminLambdaRole only.
+    const appRwDbAccessPolicy = new iam.ManagedPolicy(this, `${id}-appRwDbAccessPolicy`, {
+      statements: [
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ["secretsmanager:GetSecretValue"],
+          resources: [db.secretPathUser.secretArn],
+        }),
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ["rds-db:connect"],
+          resources: [
+            `arn:aws:rds-db:${this.region}:${this.account}:dbuser:*/applicationUsername`,
+          ],
+        }),
+      ],
+    });
+
+    const newApiLambdaRole = (name: string, managedPolicies: iam.IManagedPolicy[]) =>
+      new iam.Role(this, `${id}-${name}-${this.region}`, {
+        roleName: `${id}-${name}-${this.region}`,
         assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
-      }
-    );
+        managedPolicies,
+      });
 
-    // Secrets Manager: student, instructor and timeout-handler functions read only
-    // the app_rw credential. The instructor and admin JWT authorizers also read
-    // app_rw to look up users.roles; the student authorizer reads no secrets. The admin
-    // function needs app_tc, so it runs on its own adminLambdaRole (below) and
-    // this shared role never holds the DDL-capable credential.
-    lambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: ["secretsmanager:GetSecretValue"],
-        resources: [db.secretPathUser.secretArn],
-      })
-    );
+    const vpcDbLambdaPolicies = [lambdaLogsPolicy, lambdaVpcEniPolicy, appRwDbAccessPolicy];
 
-    // Grant access to EC2
-    lambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: [
-          "ec2:CreateNetworkInterface",
-          "ec2:DescribeNetworkInterfaces",
-          "ec2:DeleteNetworkInterface",
-          "ec2:AssignPrivateIpAddresses",
-          "ec2:UnassignPrivateIpAddresses",
-        ],
-        resources: ["*"], // must be *
-      })
-    );
-
-    // Grant access to log
-    lambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: [
-          //Logs
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-        ],
-        resources: ["arn:aws:logs:*:*:*"],
-      })
-    );
-
-    // Grant access to RDS proxy
-    lambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: ["rds-db:connect"],
-        resources: [
-          `arn:aws:rds-db:${this.region}:${this.account}:dbuser:*/applicationUsername`,
-        ],
-      })
-    );
+    // Student handler. Also receives textGenLambdaDockerFunc.grantInvoke() below.
+    const studentLambdaRole = newApiLambdaRole("studentFnRole", vpcDbLambdaPolicies);
+    // Instructor handler.
+    const instructorLambdaRole = newApiLambdaRole("instructorFnRole", vpcDbLambdaPolicies);
+    // Student JWT authorizer: verifies the token against the JWKS only. It runs
+    // outside the VPC and reads no secrets, so it gets logs only.
+    const studentAuthorizerRole = newApiLambdaRole("studentAuthzRole", [lambdaLogsPolicy]);
+    // Instructor and admin JWT authorizers: same code, both look up users.roles
+    // with app_rw.
+    const roleAuthorizerRole = newApiLambdaRole("roleAuthzRole", vpcDbLambdaPolicies);
+    // Ingestion timeout handler: marks stuck rows as errored with app_rw.
+    const timeoutHandlerRole = newApiLambdaRole("timeoutFnRole", vpcDbLambdaPolicies);
 
     // Dedicated role for the admin function. It is the only API function that
     // reads the app_tc (table-creator) credential, so that secret is granted
-    // here and not on the shared lambdaRole. S3 grants made later via
+    // here and not on appRwDbAccessPolicy. S3 grants made later via
     // lambdaAdminFunction.grant*() land on this role too.
     const adminLambdaRole = new iam.Role(
       this,
@@ -796,7 +808,7 @@ export class ApiServiceStack extends cdk.Stack {
         functionName: `${id}-studentFunction`,
         memorySize: 256,
         layers: [postgres],
-        role: lambdaRole,
+        role: studentLambdaRole,
         logGroup: logProtection.lambdaLogGroup(`${id}-studentFunction`),
       }
     );
@@ -830,7 +842,7 @@ export class ApiServiceStack extends cdk.Stack {
         functionName: `${id}-instructorFunction`,
         memorySize: 256,
         layers: [postgres],
-        role: lambdaRole,
+        role: instructorLambdaRole,
         logGroup: logProtection.lambdaLogGroup(`${id}-instructorFunction`),
       }
     );
@@ -1111,7 +1123,7 @@ export class ApiServiceStack extends cdk.Stack {
         functionName: `${id}-studentLambdaAuthorizer`,
         memorySize: 128,
         layers: [joseLayer],
-        role: lambdaRole,
+        role: studentAuthorizerRole,
         logGroup: logProtection.lambdaLogGroup(`${id}-studentLambdaAuthorizer`),
       }
     );
@@ -1158,7 +1170,7 @@ export class ApiServiceStack extends cdk.Stack {
         functionName: `${id}-instructorLambdaAuthorizer`,
         memorySize: 128,
         layers: [joseLayer, postgres],
-        role: lambdaRole,
+        role: roleAuthorizerRole,
         logGroup: logProtection.lambdaLogGroup(`${id}-instructorLambdaAuthorizer`),
       }
     );
@@ -1205,7 +1217,7 @@ export class ApiServiceStack extends cdk.Stack {
         functionName: `${id}-adminLambdaAuthorizer`,
         memorySize: 128,
         layers: [joseLayer, postgres],
-        role: lambdaRole,
+        role: roleAuthorizerRole,
         logGroup: logProtection.lambdaLogGroup(`${id}-adminLambdaAuthorizer`),
       }
     );
@@ -2557,7 +2569,7 @@ export class ApiServiceStack extends cdk.Stack {
         },
         functionName: `${id}-TimeoutHandlerLambda`,
         layers: [psycopgLayer, powertoolsLayer],
-        role: lambdaRole,
+        role: timeoutHandlerRole,
         logGroup: logProtection.lambdaLogGroup(`${id}-TimeoutHandlerLambda`),
       }
     );
