@@ -163,6 +163,7 @@ def test_generate_debrief_skips_all_work_when_debrief_exists(monkeypatch):
 def test_generate_debrief_proceeds_when_no_debrief(monkeypatch):
     lock = _hold_lock(monkeypatch)
     monkeypatch.setattr(chat, "debrief_exists", lambda session_id: False)
+    monkeypatch.setattr(chat, "derive_patient_mode", lambda group_id, persona_id: "full_assessment")
 
     class _Reached(Exception):
         pass
@@ -238,6 +239,7 @@ def test_generate_debrief_fails_closed_when_existence_check_errors(monkeypatch):
 def test_generate_debrief_discards_run_when_debrief_already_saved(monkeypatch):
     lock = _hold_lock(monkeypatch)
     monkeypatch.setattr(chat, "debrief_exists", lambda session_id: False)
+    monkeypatch.setattr(chat, "derive_patient_mode", lambda group_id, persona_id: "full_assessment")
 
     def lost_race(**kwargs):
         raise chat.DebriefAlreadySaved(SESSION)
