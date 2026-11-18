@@ -1,12 +1,20 @@
 ARG REGISTRY=""
-FROM ${REGISTRY}node:22-alpine
+# Debian trixie, not Alpine: Alpine's vulnerability data flags its zlib for
+# CVE-2026-4738 with no fixed package, which fails the ECR scan gate. Debian
+# attributes that CVE only to gdal, which this image doesn't include.
+# https://security-tracker.debian.org/tracker/CVE-2026-4738
+# Trixie (not the bookworm default of "slim") ships Python 3.13;
+# aws_sdk_bedrock_runtime requires Python >= 3.12.
+FROM ${REGISTRY}node:22-trixie-slim
 
 WORKDIR /app
 
-# Upgrade base-image packages first so OS-level fixes published after the
-# node:22-alpine tag was built (e.g. zlib, CVE-2026-4738) reach the image and
-# pass the ECR scan gate. Then install Python and pip.
-RUN apk upgrade --no-cache && apk add --no-cache python3 py3-pip
+# Install Python, pip and the CA bundle; upgrade base packages so security
+# fixes published after the base image was built are included.
+RUN apt-get update \
+  && apt-get upgrade -y \
+  && apt-get install -y --no-install-recommends python3 python3-pip ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js dependencies
 COPY package.json package-lock.json ./
@@ -33,7 +41,7 @@ COPY event-guard.js ./
 
 ENV AWS_DEFAULT_REGION=us-east-1
 
-# Alpine's CA bundle (ca-certificates-bundle, in the base image). The Python DB
+# Debian's CA bundle (ca-certificates package, installed above). The Python DB
 # clients verify the RDS Proxy certificate against it (sslmode=verify-full).
 ENV PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt
 
