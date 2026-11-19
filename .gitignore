@@ -2,6 +2,7 @@
 # Kiro
 .kiro
 .agents/
+.workflows/
 
 # Environment variables
 .env
@@ -28,6 +29,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
 
 # CDK
 cdk.out/
