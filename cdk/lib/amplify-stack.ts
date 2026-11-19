@@ -76,10 +76,6 @@ export class AmplifyStack extends cdk.Stack {
       name: `${id}-amplify`,
       repository: `https://github.com/${githubOwner}/${githubRepoName}`,
       accessToken: githubToken.unsafeUnwrap(), // TEMPORARY: Using PAT instead of CodeStar Connection
-      // Role the Amplify build runs under. Without one, GitHub App (TOKEN)
-      // builds fail at start with "Unable to assume specified IAM Role" in
-      // accounts that have no Amplify service-linked role.
-      iamServiceRole: this.createBuildServiceRole(id).roleArn,
       platform: "WEB",
       environmentVariables: [
         { name: "VITE_AWS_REGION", value: this.region },
@@ -207,17 +203,4 @@ applications:
   //   );
   //   return role;
   // }
-
-  /**
-   * Service role the Amplify build runs under. The build is frontend-only
-   * (npm ci && npm run build, no Amplify backend), so the role needs no AWS
-   * permissions; Amplify only has to be able to assume it.
-   * https://docs.aws.amazon.com/amplify/latest/userguide/amplify-service-role.html
-   */
-  private createBuildServiceRole(id: string): cdk.aws_iam.Role {
-    return new cdk.aws_iam.Role(this, `${id}-AmplifyBuildRole`, {
-      assumedBy: new cdk.aws_iam.ServicePrincipal("amplify.amazonaws.com"),
-      description: "Amplify Hosting build role (frontend-only build; no AWS permissions)",
-    });
-  }
 }
