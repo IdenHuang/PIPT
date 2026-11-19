@@ -151,6 +151,11 @@ export class ApiServiceStack extends cdk.Stack {
     const allowedOrigins = [
       "https://main.d3uv171xv91wfq.amplifyapp.com", 
       "https://main.d3sunerinpg5un.amplifyapp.com",
+      // TEMPORARY: trusts every Amplify app on the shared amplifyapp.com
+      // domain, including other tenants' apps, so that recreated Amplify apps
+      // work without redeploying this stack. Replace with exact origins (or a
+      // custom domain via SesVerifiedDomain) once the app ID is stable.
+      "https://*.amplifyapp.com",
       //"https://genrx.pharmsci.ubc.ca",
       ...extraAllowedOrigins,
       ...(allowLocalhostOrigins ? ["http://localhost:5173", "http://localhost:5174"] : []),
@@ -2191,7 +2196,10 @@ export class ApiServiceStack extends cdk.Stack {
           accessControlAllowCredentials: false,
           accessControlAllowHeaders: ["*"],
           accessControlAllowMethods: ["GET", "HEAD"],
-          accessControlAllowOrigins: allowedOrigins,
+          // CloudFront documents exact origins or "*" only, not subdomain
+          // patterns, so "https://*.amplifyapp.com" is left out here.
+          // https://docs.aws.amazon.com/cloudfront/latest/APIReference/API_ResponseHeadersPolicyAccessControlAllowOrigins.html
+          accessControlAllowOrigins: allowedOrigins.filter((origin) => !origin.includes("*")),
           accessControlMaxAge: cdk.Duration.seconds(3600),
           originOverride: true,
         },
